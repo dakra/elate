@@ -80,9 +80,19 @@ def pid_alive(pid: int | None, identity: str | None = None,
     suite) becomes a zombie child when it exits; plain kill(pid, 0)
     would keep reporting it alive, so the process state is checked too.
     With IDENTITY (as recorded by `proc_identity` at spawn) the current
-    identity must match exactly; otherwise, with COMM_HINT, the command
-    name must contain it -- both guard against pid reuse. When ps cannot
-    be consulted the verdict falls back to "exists".
+    start time must match exactly; the command must match too, except
+    that a changed command with the SAME start time and a COMM_HINT
+    match is accepted -- some Emacs launchers exec a differently-named
+    child (e.g. the emacsformacosx.com binary execs a per-arch
+    `emacs-arm64-NN`), which renames the command mid-startup while
+    keeping pid and start time. Pid-reuse protection is near-intact
+    rather than absolute: a recycled pid virtually always has a
+    different start time (lstart has 1-second granularity), but the
+    exec-chain tolerance does admit the theoretical case of a
+    same-second recycle into a process whose command contains
+    COMM_HINT (e.g. "emacs" also matches `emacsclient`). Without
+    IDENTITY, COMM_HINT alone requires the command name to contain it.
+    When ps cannot be consulted the verdict falls back to "exists".
     """
     if not pid or pid <= 0:
         return False
@@ -107,10 +117,19 @@ def pid_alive(pid: int | None, identity: str | None = None,
         _reap_spawned(pid)
         return False
     if len(parts) >= 7:
+        comm = parts[6]
         if identity is not None:
-            return " ".join(parts[1:6]) + "|" + parts[6] == identity
+            lstart, _, recorded_comm = identity.partition("|")
+            if " ".join(parts[1:6]) != lstart:
+                return False  # different start time: the pid was recycled
+            if comm == recorded_comm:
+                return True
+            # Same pid AND same start time but a renamed command: an
+            # exec chain (see docstring), not pid reuse. Accept it when
+            # the command still looks like ours.
+            return comm_hint is not None and comm_hint.lower() in comm.lower()
         if comm_hint is not None:
-            return comm_hint.lower() in parts[6].lower()
+            return comm_hint.lower() in comm.lower()
     return True
 
 

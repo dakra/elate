@@ -29,16 +29,20 @@ from elate import screenshot as shot
 from elate import session as S
 from elate.errors import ElateError, RpcError
 
+from _gui_probe import GUI_UNAVAILABLE_REASON
+
 HAVE_DEPS = bool(shutil.which("emacs") and shutil.which("emacsclient"))
-HAVE_GUI = HAVE_DEPS and (
-    sys.platform == "darwin"
-    or (sys.platform.startswith("linux") and os.environ.get("DISPLAY"))
-)
+
+# One skip gate, probed once per run: tool availability plus a working
+# window server (see _gui_probe; e.g. an SSH login on macOS has none and
+# GUI Emacs would die at startup -- skip honestly instead).
+GUI_SKIP_REASON = (
+    None if HAVE_DEPS else "GUI tests need emacs/emacsclient on PATH"
+) or GUI_UNAVAILABLE_REASON
 
 pytestmark = pytest.mark.skipif(
-    not HAVE_GUI,
-    reason="GUI tests need emacs/emacsclient and a display "
-           "(macOS, or Linux with $DISPLAY)",
+    GUI_SKIP_REASON is not None,
+    reason=str(GUI_SKIP_REASON),
 )
 
 NAME = f"g{os.getpid()}"

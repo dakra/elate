@@ -14,7 +14,6 @@ import json
 import os
 import shutil
 import signal
-import sys
 import tempfile
 import time
 from collections.abc import Iterator
@@ -22,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from _gui_probe import GUI_UNAVAILABLE_REASON
 from elate import cli
 from elate import gui
 from elate import record as R
@@ -861,9 +861,8 @@ def test_snap_write_failure_ends_series_cleanly(
 
 
 @pytest.mark.skipif(
-    not (sys.platform == "darwin"
-         or (sys.platform.startswith("linux") and os.environ.get("DISPLAY"))),
-    reason="GUI snap needs a display",
+    GUI_UNAVAILABLE_REASON is not None,
+    reason=f"GUI snap: {GUI_UNAVAILABLE_REASON}",
 )
 def test_snap_series_gui(elate_home: str,
                          capsys: pytest.CaptureFixture[str]) -> None:

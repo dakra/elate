@@ -224,9 +224,15 @@ jobs:
       - name: Install project
         run: uv sync --frozen
 
-      # Screen-Recording-gated tests (PNG screenshots, GUI snap) skip on
-      # runners without the permission — by design, the denial path is
-      # itself under test.
+      # GUI tests run for real here: the first CI run (27443364384)
+      # proved GitHub's macOS runners have a window-server session and
+      # the cask Emacs opens NS frames fine (the failures seen there
+      # were an elate identity bug, not a display problem). Should a
+      # future runner image lose the window server, the suite's
+      # session-level probe (tests/_gui_probe.py) turns the GUI tests
+      # into honest skips instead of failures. Screen-Recording-gated
+      # tests (PNG screenshots, GUI snap) skip on runners without the
+      # permission — by design, the denial path is itself under test.
       - name: Run full test suite
         run: uv run --no-sync pytest -q
 

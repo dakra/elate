@@ -109,6 +109,28 @@ BROKENPKG = """\
 ;;; brokenpkg.el ends here
 """
 
+# Genuinely lacks the lexical-binding cookie: on Emacs >= 30 the byte
+# compiler warns about the installed copy, and that REAL warning must
+# survive elate's spurious-warning filter (REVIEW-CI1 finding 1).
+CKLPKG = """\
+;;; cklpkg.el --- elate cookie-less fixture
+
+;; Author: elate <elate@example.com>
+;; Version: 0.1
+
+;;; Commentary:
+;; Deliberately has no lexical-binding cookie on its first line.
+
+;;; Code:
+
+(defun cklpkg-go ()
+  "Return a marker string."
+  "cklpkg here")
+
+(provide 'cklpkg)
+;;; cklpkg.el ends here
+"""
+
 # No Version header: package-buffer-info rejects it outright.
 MALFORMEDPKG = """\
 ;;; malformedpkg.el --- elate malformed fixture -*- lexical-binding: t; -*-
@@ -216,10 +238,12 @@ def fixtures(elate_home: str) -> Iterator[dict[str, Path]]:
         "malformed": tmp / "malformedpkg.el",
         "future": tmp / "futurepkg.el",
         "noreq": tmp / "noreqpkg.el",
+        "cookieless": tmp / "cklpkg.el",
         "pkgdir": tmp / "dirpkg",
     }
     paths["elpkg"].write_text(ELPKG, encoding="utf-8")
     paths["warnpkg"].write_text(WARNPKG, encoding="utf-8")
+    paths["cookieless"].write_text(CKLPKG, encoding="utf-8")
     paths["broken"].write_text(BROKENPKG, encoding="utf-8")
     paths["malformed"].write_text(MALFORMEDPKG, encoding="utf-8")
     paths["future"].write_text(FUTUREPKG, encoding="utf-8")
@@ -330,9 +354,20 @@ def test_profile_start_stop_report_cycle(sess: S.Session) -> None:
     # function need not appear: interpreted bodies push a frame per
     # form, and the profiler truncates backtraces at 16 frames -- same
     # as the stock profiler-report UI.)
-    make_list = next(f for f in final["mem"]["functions"]
-                     if f["name"] == "make-list")
-    assert make_list["self"] > 1_000_000  # 400 x 1000-cons lists
+    if int((sess.emacs_version or "30").split(".")[0]) >= 30:
+        make_list = next(f for f in final["mem"]["functions"]
+                         if f["name"] == "make-list")
+        assert make_list["self"] > 1_000_000  # 400 x 1000-cons lists
+    else:
+        # Emacs 29's get_backtrace (eval.c) starts at the SECOND
+        # backtrace frame, so the innermost frame -- the allocating
+        # primitive itself -- is never recorded (the stock
+        # profiler-report UI on 29 misses it the same way; Emacs 30
+        # fixed the off-by-one). The dominant self entry is then
+        # make-list's direct caller; assert the profile still names a
+        # dominant allocator without pinning which frame survived.
+        top = final["mem"]["functions"][0]
+        assert top["self"] > 1_000_000, top
     # Stopping again is a no-op, not an error.
     again = S.profile_stop(sess)
     assert again["stopped"] is False
@@ -596,6 +631,45 @@ def test_clean_install_happy_path(elate_home: str,
     # info works on the stopped session as well (file-based).
     info = S.session_info(name)
     assert any(p["name"] == "elpkg" for p in info["installed"])
+
+
+def test_clean_install_real_cookie_warning_survives_filter(
+        elate_home: str, fixtures: dict[str, Path]) -> None:
+    # REVIEW-CI1 finding 1: the spurious-lexical-warning filter used to
+    # fund its removal budget from files on disk (the generated
+    # NAME-pkg.el) instead of from whether THIS Emacs emits the spurious
+    # warning. On Emacs >= 31 the -pkg.el produces no warning (bytecomp
+    # checks no-byte-compile first), so the budget ate the package's
+    # own genuine, file-context-free missing-cookie warning. The budget
+    # is now gated to Emacs 30.x, the only major with the
+    # warn-before-no-byte-compile ordering.
+    name = f"{NAME}ckl"
+    sess = S.start_session(name, config="clean-install",
+                           loads=[str(fixtures["cookieless"])],
+                           cols=90, rows=24)
+    try:
+        assert sess.init_error() is None
+        # The package installs and works regardless of the warning.
+        assert sess.semantic().eval_form(
+            "(progn (require 'cklpkg) (cklpkg-go))")["value"] \
+            == '"cklpkg here"'
+        installed = {p["name"]: p
+                     for p in S.session_info(name)["installed"]}
+        cookie_warns = [w for w in installed["cklpkg"]["warnings"]
+                        if "lexical-binding" in w]
+        major = int((sess.emacs_version or "30").split(".")[0])
+        if major >= 30:
+            # 30.x: the real warning AND the spurious -pkg.el one both
+            # arrive; the filter removes exactly the spurious one.
+            # >= 31: only the real warning arrives (no-byte-compile is
+            # checked first) and the budget must not be funded.
+            # Either way exactly the genuine warning survives.
+            assert len(cookie_warns) == 1, installed["cklpkg"]["warnings"]
+        else:
+            # Emacs 29's bytecomp has no missing-cookie warning at all.
+            assert cookie_warns == [], installed["cklpkg"]["warnings"]
+    finally:
+        S.stop_session(name)
 
 
 def test_clean_install_directory_package(elate_home: str,

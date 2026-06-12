@@ -975,6 +975,39 @@ ERT represents both `should' failures and signalled errors as
                      (or (ert-test-result-messages result) "")
                      elate--ert-max-messages))))
 
+(defun elate--ert-contain-quit (orig info)
+  "Run ORIG on INFO; record a quit inside the test body as its result.
+Emacs 29 compatibility shim (installed as :around advice on
+`ert--run-test-internal' only when `emacs-major-version' < 30).
+
+Emacs 29's ERT catches in-test quits through the `debugger' variable
+plus `debug-on-quit', but eval.c's signal_or_quit only consults the
+debugger when no enclosing handler matches the signal -- and inside an
+elate RPC, server.el's request machinery always provides one, so a
+quit (keyboard-quit in a test body, or raw C-g hitting a running test)
+sailed past ERT, past `elate-rpc' (whose handler matches `error', not
+`quit'), and surfaced as an \"*ERROR*: Quit\" emacsclient reply that
+killed the whole run.  Emacs >= 30's ERT catches the signal with
+`handler-bind', which runs unconditionally; this advice gives 29 the
+same contract: the quit becomes the test's result (status \"quit\",
+counted unexpected) and the run continues.
+
+Known, unavoidable difference from 30+: this `condition-case' handler
+runs AFTER the stack has unwound, so the recorded result carries
+:backtrace nil / :infos nil -- unlike 30's `handler-bind' capture,
+which records a real backtrace and `ert-info' context for quits.
+Status/expected-p/run-continuation (the actual contract) are
+identical; only the per-test backtrace/condition payload is poorer."
+  (condition-case err
+      (funcall orig info)
+    (quit
+     (setf (ert--test-execution-info-result info)
+           (make-ert-test-quit :condition err :backtrace nil :infos nil))
+     nil)))
+
+(when (< emacs-major-version 30)
+  (advice-add 'ert--run-test-internal :around #'elate--ert-contain-quit))
+
 (defun elate--rpc-load-file (path)
   "Load the elisp file at PATH into the session.
 Used to bring a test file in before an ERT run.  A load error is
@@ -1249,14 +1282,37 @@ anonymous closures/byte-code objects go through
   "Move pending live profiler samples into profiler.el's log variables.
 Unlike stock `profiler-report' (which replaces the variables, silently
 discarding samples retrieved by an earlier report), live samples are
-MERGED in, so repeated reports while profiling keep accumulating."
-  (when (and (fboundp 'profiler-cpu-running-p) (profiler-cpu-running-p))
-    (setq profiler-cpu-log
-          (elate--profiler-merge-log profiler-cpu-log (profiler-cpu-log))))
-  (when (profiler-memory-running-p)
-    (setq profiler-memory-log
-          (elate--profiler-merge-log profiler-memory-log
-                                     (profiler-memory-log)))))
+MERGED in, so repeated reports while profiling keep accumulating.
+
+Emacs 29 quirk (profiler.c): `profiler-cpu-log'/`profiler-memory-log'
+allocate the replacement log -- a pre-filled Lisp hash table of
+profiler-log-size key vectors, ~2-3 MB -- BEFORE detaching the old
+one, so reading a log while the *memory* profiler is running records
+those megabytes as self-samples (attributed to profiler-memory-log)
+into the very log being returned.  Emacs >= 30 stops the profiler
+around the export in C (and its replacement log is raw C memory,
+invisible to malloc_probe).  Mimic that here: on 29, pause the memory
+profiler across the reads.  No samples are lost -- the reads drain
+everything collected so far, and sampling resumes right after."
+  (let ((pause (and (< emacs-major-version 30)
+                    (profiler-memory-running-p))))
+    (when pause (profiler-memory-stop))
+    ;; unwind-protect: a signal/quit between the stop above and the
+    ;; restart (merge error, memory-full, C-g hitting the RPC) must not
+    ;; leave the memory profiler silently stopped for the rest of the
+    ;; profile window.
+    (unwind-protect
+        (progn
+          (when (and (fboundp 'profiler-cpu-running-p)
+                     (profiler-cpu-running-p))
+            (setq profiler-cpu-log
+                  (elate--profiler-merge-log profiler-cpu-log
+                                             (profiler-cpu-log))))
+          (when (or pause (profiler-memory-running-p))
+            (setq profiler-memory-log
+                  (elate--profiler-merge-log profiler-memory-log
+                                             (profiler-memory-log)))))
+      (when pause (profiler-memory-start)))))
 
 (defun elate--profiler-log-total (log)
   "Sum of all sample counts in LOG."
@@ -1410,6 +1466,27 @@ session for authoritative numbers."
        (when (and (memq mode '(cpu cpu+mem))
                   (not (fboundp 'profiler-cpu-start)))
          (error "elate: this Emacs lacks the SIGPROF cpu profiler; use --mem"))
+       ;; Emacs 29: a stopped profiler's C-side log persists and is
+       ;; REUSED by the next start (profiler.c only allocates when the
+       ;; log is nil), so samples recorded between the last drain and
+       ;; the stop would leak into the new window.  Reading the log
+       ;; discards it (29 nils the variable when not running).  Do NOT
+       ;; do this on 30.x: its export_log frees the C log and lacks
+       ;; 31's NULL guard, so a second read while stopped segfaults.
+       ;; The ignore-errors absorbs 29's `profiler-cpu-log' puthash on
+       ;; nil when there was no cpu log at all.
+       ;; Deliberate asymmetry: on 30.x, samples recorded between the
+       ;; drain's read and `profiler-*-stop' stay in the C log, and
+       ;; `profiler-*-start' reuses a non-NULL log there -- a sub-ms
+       ;; stale-sample window that can leak into the next profile.
+       ;; 29 discards; 30 can't (the segfault above), and the window
+       ;; is invisible to the empty-window assertion.
+       (when (< emacs-major-version 30)
+         (when (and (fboundp 'profiler-cpu-log)
+                    (not (profiler-running-p 'cpu)))
+           (ignore-errors (profiler-cpu-log)))
+         (unless (profiler-memory-running-p)
+           (ignore-errors (profiler-memory-log))))
        (setq profiler-cpu-log nil
              profiler-memory-log nil)
        (when (memq mode '(cpu cpu+mem))
@@ -1589,6 +1666,78 @@ this Emacs meets."
                   missing)))))
     (nreverse missing)))
 
+(defconst elate--lexical-cookie-warning-re
+  "file has no .lexical-binding. directive on its first line"
+  "The byte compiler's missing-cookie warning, quote-style agnostic.
+The message text passes through `text-quoting-style' rendering, so the
+grave quotes in bytecomp.el's source may arrive as curly ones.")
+
+(defun elate--prop-line-no-byte-compile-p (line)
+  "Non-nil when LINE's -*- ... -*- section sets `no-byte-compile' to t.
+LINE is a file's first line; only the file-local-variable prop line is
+consulted (a mere mention of \"no-byte-compile: t\" in a comment or
+docstring elsewhere must not count)."
+  (when (string-match "-\\*-\\(.*?\\)-\\*-" line)
+    (string-match-p
+     "\\(?:\\`\\|;\\)[ \t]*no-byte-compile:[ \t]*t[ \t]*\\(?:;\\|\\'\\)"
+     (match-string 1 line))))
+
+(defun elate--noncompiled-cookieless-files (dir)
+  "Basenames of .el files in DIR that are `no-byte-compile' and cookie-less.
+These are the files for which Emacs 30.x emits a spurious
+missing-lexical-binding warning: bytecomp.el warns BEFORE checking
+`no-byte-compile' (Emacs 31 reordered the checks; Emacs 29 has no such
+warning), so `package--compile's byte-recompile-directory pass warns
+about generated files it then refuses to compile -- notably the
+NAME-pkg.el that package.el itself writes, whose first line carries
+only \"-*- no-byte-compile: t -*-\".  That prop line is the only
+legitimate source, so only the first-line -*- ... -*- section is
+parsed (a file merely mentioning no-byte-compile elsewhere is not
+exempt from compilation and must not fund the filter's budget)."
+  (when (and dir (file-directory-p dir))
+    (let (out)
+      (dolist (file (directory-files dir t "\\.el\\'"))
+        (with-temp-buffer
+          (insert-file-contents file nil 0 4096)
+          (let ((first (buffer-substring (point-min) (line-end-position))))
+            (when (and (not (string-match-p "lexical-binding" first))
+                       (elate--prop-line-no-byte-compile-p first))
+              (push (file-name-nondirectory file) out)))))
+      out)))
+
+(defun elate--drop-spurious-lexical-warnings (warnings dir)
+  "WARNINGS without the bogus missing-cookie entries for DIR's generated files.
+For every never-compiled cookie-less file in DIR (see
+`elate--noncompiled-cookieless-files') at most ONE matching warning is
+removed; a warning that names a different file (the post-init
+Compile-Log shape carries \"file.el:LINE:COL:\") or exceeds that
+budget -- i.e. a real missing-cookie warning about the package's own
+code -- is kept.  Init-time installs collect warnings from
+`delayed-warnings-list', which has no file context; the budget keeps
+the removal honest there.
+
+The budget is funded ONLY on Emacs 30.x: the warn-before-checking-
+`no-byte-compile' ordering exists only there.  Emacs 29's bytecomp has
+no missing-cookie warning at all, and Emacs 31+ checks
+`no-byte-compile' first, so neither emits the spurious warning -- on
+those majors a matching warning is always genuine (the package's own
+cookie-less code) and funding the budget from files on disk would eat
+it (REVIEW-CI1 finding 1, verified live on 31.0.90)."
+  (let* ((spurious (and (= emacs-major-version 30)
+                        (elate--noncompiled-cookieless-files dir)))
+         (budget (length spurious)))
+    (if (zerop budget)
+        warnings
+      (seq-remove
+       (lambda (w)
+         (and (> budget 0)
+              (string-match-p elate--lexical-cookie-warning-re w)
+              (or (not (string-match "\\`\\([^ :]+\\.el\\):" w))
+                  (member (file-name-nondirectory (match-string 1 w))
+                          spurious))
+              (setq budget (1- budget))))
+       warnings))))
+
 (defun elate-clean-install (path)
   "Install the package at PATH for real, into the sandbox `package-user-dir'.
 PATH is an .el file, a package tar, or a package directory; the
@@ -1644,7 +1793,11 @@ to <session>/clean-install.json for `elate info'."
                                     (package-desc-version desc))
                           :dir (elate--jnull
                                 (and installed (package-desc-dir installed)))
-                          :warnings (vconcat (nreverse warnings)))))
+                          :warnings (vconcat
+                                     (elate--drop-spurious-lexical-warnings
+                                      (nreverse warnings)
+                                      (and installed
+                                           (package-desc-dir installed)))))))
         (push entry elate--clean-installed)
         (elate--write-clean-install-file)
         entry))))

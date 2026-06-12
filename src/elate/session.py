@@ -443,9 +443,12 @@ def _boot_gui(sess: Session, emacs_args: list[str]) -> None:
         ) from None
 
     pid = int(info.get("pid") or 0) or sess.emacs_pid
-    if pid != sess.emacs_pid:  # wrapper forked: the agent's pid is the real one
-        sess.emacs_pid = pid
-        sess.emacs_identity = gui.proc_identity(pid)
+    sess.emacs_pid = pid  # wrapper forked: the agent's pid is the real one
+    # Re-record the identity now that startup is over: an exec-chain
+    # launcher (e.g. the emacsformacosx.com binary execs a per-arch
+    # child) renames the command between spawn and here while keeping
+    # the pid, so the spawn-time comm would mismatch forever after.
+    sess.emacs_identity = gui.proc_identity(pid) or sess.emacs_identity
     sess.emacs_version = info.get("version")
 
 

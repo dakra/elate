@@ -79,6 +79,13 @@ def test_versions_are_in_sync():
     assert entry["version"] == pyproject_version, (
         f"marketplace.json version {entry['version']!r} != pyproject "
         f"{pyproject_version!r}")
+    # The runtime string must track the same version (it is derived from
+    # the installed distribution metadata; a hardcoded literal regressed
+    # to 0.1.0 in the 0.2.0 release).
+    import elate
+    assert elate.__version__ == pyproject_version, (
+        f"elate.__version__ {elate.__version__!r} != pyproject "
+        f"{pyproject_version!r} (run `uv sync` if pyproject was just bumped)")
 
 
 def _marketplace_entry() -> dict:
