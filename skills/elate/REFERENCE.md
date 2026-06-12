@@ -168,7 +168,7 @@ Byte-compile + checkdoc each FILE inside the live session, against its load-path
 
 drive Emacs's native profiler (start/stop/report, or one-shot 'run FORM')
 
-Drive Emacs's native sampling profiler. 'start' begins sampling (--cpu default, --mem allocations, --both), resetting earlier logs; 'stop' ends it; 'report' renders the collected samples as top functions + a depth-limited calltree (works while profiling and after stop; --cpu/--mem select which collected section to show). 'profile run FORM' does start -> eval FORM (normal eval discipline incl. timeout + backtraces) -> stop -> report in one call. Profiles depend on session history (everything the session ran is in the samples) -- profile in a fresh throwaway session for authoritative numbers, like lint.
+Drive Emacs's native sampling profiler. 'start' begins sampling (--cpu default, --mem allocations, --both), resetting earlier logs and running a GC first (pre-existing garbage is never charged to the window); 'stop' ends it; 'report' renders the collected samples as top functions + a depth-limited calltree (works while profiling and after stop; --cpu/--mem select which collected section to show). 'profile run FORM' does start -> eval FORM (normal eval discipline incl. timeout + backtraces) -> stop -> report in one call. Profiles depend on session history (everything the session ran is in the samples) -- profile in a fresh throwaway session for authoritative numbers, like lint.
 
 - `{start,stop,report,run}`
 - `[form]` -- for 'run': the elisp form to profile

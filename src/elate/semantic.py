@@ -20,7 +20,68 @@ from .errors import EvalTimeout, RpcError, TransportError
 
 _B64_REPLY = re.compile(r'^"([A-Za-z0-9+/=]*)"$')
 
+# emacsclient < 31 mangles --eval replies that span several server
+# messages (server.el splits long prints into 1024-byte `-print` /
+# `-print-nonl` lines): its answer loop processes each recv() buffer as
+# if it always held complete lines, so a recv() boundary falling inside
+# a message makes it (a) print the first part of the line immediately
+# and (b) treat the rest, arriving with the next recv(), as an unknown
+# command, printing it wrapped in `\n*ERROR*: Unknown message: ...\n`
+# (lib-src/emacsclient.c; fixed on master/31 by real line buffering).
+# No payload bytes are lost -- they are interleaved with that wrapper
+# (and, when the split lands inside the 7-12 char protocol prefix
+# itself, with prefix remnants).  _unmangle_reply undoes exactly that.
+_CLIENT_MANGLE = re.compile(r"\n?\*ERROR\*: Unknown message: ([^\n]*)\n?")
+
 DEFAULT_TIMEOUT = 15.0
+
+
+def _unmangle_reply(out: str) -> str:
+    """Undo emacsclient<31's partial-recv mangling of a long reply.
+
+    Every agent reply is `"<base64>"`, so the payload alphabet never
+    contains `-`, space, or newline; anything of that shape inside a
+    mangled fragment is a protocol-prefix remnant, not payload:
+
+    - fragment with a space (e.g. "-nonl eyJ..." or "nl eyJ..."): a
+      tail of a split `-print`/`-print-nonl` prefix glued to payload --
+      keep what follows the space (a pre-space head matching
+      `-emacs-pid` instead means the rest is the pid value: all noise);
+    - fragment starting with "-" and no space (e.g. "-print-no"): the
+      head of a split protocol prefix -- pure noise, dropped;
+    - anything else is pure payload, spliced back after unquoting
+      (unlike `-print`, the unknown-command branch never ran the
+      fragment through unquote_argument, so server.el's &-escapes --
+      e.g. "&n" for the trailing newline `pp` adds -- are still there).
+
+    The result still has to pass the strict reply regex plus base64 and
+    JSON decoding, so a wrong reconstruction can never be mistaken for
+    a valid reply -- it falls through to the normal transport error.
+    """
+    def splice(m: re.Match[str]) -> str:
+        frag = m.group(1)
+        if " " in frag:
+            head, frag = frag.split(" ", 1)
+            if head and "-emacs-pid".endswith(head):
+                # remnant of a split "-emacs-pid NNN" line: what follows
+                # the space is the pid value, not payload
+                return ""
+            if not ("-print".endswith(head)
+                    or "-print-nonl".endswith(head)):
+                # not a recognizable prefix remnant, and payload never
+                # contains a space: drop the fragment -- the strict
+                # regex/decode below rejects any resulting wrong
+                # reconstruction
+                return ""
+        elif frag.startswith("-"):
+            return ""
+        # unquote_argument: "&_" -> " ", "&n" -> "\n", "&C" -> "C".
+        return re.sub(r"&(.)",
+                      lambda q: {"_": " ", "n": "\n"}.get(q.group(1),
+                                                          q.group(1)),
+                      frag)
+
+    return _CLIENT_MANGLE.sub(splice, out).strip()
 
 
 def _client_env() -> dict[str, str]:
@@ -98,15 +159,23 @@ class SemanticChannel:
             " ".join([elisp_string(fn), *(elisp_value(a) for a in args)])
         )
         out = self.eval_raw(form, timeout=timeout)
+        # Error snippets always show the ORIGINAL output, never the
+        # unmangled reconstruction.
+        snippet = out if len(out) <= 200 else out[:130] + "..." + out[-60:]
         m = _B64_REPLY.match(out)
         if not m:
+            # A reply that does not look like `"base64"` may be a long
+            # reply mangled by emacsclient < 31 (see _CLIENT_MANGLE);
+            # reassemble before giving up.  The decode below validates.
+            m = _B64_REPLY.match(_unmangle_reply(out))
+        if not m:
             raise TransportError(
-                f"unexpected reply from agent (is elate-agent.el loaded?): {out[:200]!r}"
+                f"unexpected reply from agent (is elate-agent.el loaded?): {snippet!r}"
             )
         try:
             payload = json.loads(base64.b64decode(m.group(1)).decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
-            raise TransportError(f"undecodable reply from agent: {out[:200]!r}") from exc
+            raise TransportError(f"undecodable reply from agent: {snippet!r}") from exc
         if not isinstance(payload, dict) or not payload.get("ok"):
             error = "unknown agent error"
             backtrace = None

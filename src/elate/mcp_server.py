@@ -602,9 +602,10 @@ def elate_profile(
     ('cpu' in samples, 'mem' in bytes) you get 'total', a 'functions'
     list (name, self/total counts and percentages, sorted by self
     time), and a depth-limited 'tree' (profiler.el's unified calltree)
-    with truncation flags. 'start' resets earlier logs, so a profile
-    covers exactly one start..stop window; report after stop keeps
-    working until the next start. IMPORTANT: profiles are
+    with truncation flags. 'start' resets earlier logs and runs a GC
+    first (pre-existing garbage is never charged to the window), so a
+    profile covers exactly one start..stop window; report after stop
+    keeps working until the next start. IMPORTANT: profiles are
     session-history dependent -- every piece of code the session runs
     (including elate's own request servicing) lands in the samples, so
     profile in a fresh throwaway session for authoritative numbers,

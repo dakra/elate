@@ -182,7 +182,9 @@ def build_parser() -> argparse.ArgumentParser:
              "one-shot 'run FORM')",
         description="Drive Emacs's native sampling profiler. 'start' "
                     "begins sampling (--cpu default, --mem allocations, "
-                    "--both), resetting earlier logs; 'stop' ends it; "
+                    "--both), resetting earlier logs and running a GC "
+                    "first (pre-existing garbage is never charged to "
+                    "the window); 'stop' ends it; "
                     "'report' renders the collected samples as top "
                     "functions + a depth-limited calltree (works while "
                     "profiling and after stop; --cpu/--mem select which "

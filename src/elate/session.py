@@ -785,8 +785,9 @@ def _check_profile_depth(depth: int) -> int:
 def profile_start(sess: Session, mode: str = "cpu") -> dict[str, Any]:
     """Start Emacs's native profiler ('cpu, 'mem, or 'cpu+mem).
 
-    Starting resets previously collected logs, so a profile covers
-    exactly one start..stop window. Errors if already running.
+    Starting resets previously collected logs and runs a GC first (so
+    pre-existing garbage is never charged to the window); a profile
+    covers exactly one start..stop window. Errors if already running.
     """
     return sess.semantic().rpc("profiler", "start", _check_profile_mode(mode))
 

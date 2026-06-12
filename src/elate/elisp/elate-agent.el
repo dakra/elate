@@ -1445,9 +1445,11 @@ signalled when there is none.  DEPTH limits the rendered calltree."
 (defun elate--rpc-profiler (action &optional mode depth)
   "Drive Emacs's native profiler: ACTION is start/stop/report.
 For \"start\", MODE is \"cpu\" (default), \"mem\", or \"cpu+mem\";
-starting resets any previously collected logs, so a profile covers
-exactly one start..stop window.  \"stop\" drains the pending samples
-into profiler.el's log variables and stops the samplers.  \"report\"
+starting resets any previously collected logs and garbage-collects
+first (so garbage predating the window is never charged to it); a
+profile covers exactly one start..stop window.  \"stop\" drains the
+pending samples into profiler.el's log variables and stops the
+samplers.  \"report\"
 \(optionally depth-limited to DEPTH) renders the accumulated logs --
 it works both while profiling and after \"stop\".  NOTE: profiles are
 session-history dependent (everything the session ran is in the
@@ -1489,6 +1491,18 @@ session for authoritative numbers."
            (ignore-errors (profiler-memory-log))))
        (setq profiler-cpu-log nil
              profiler-memory-log nil)
+       ;; Flush garbage that predates this profile window.  At the end
+       ;; of every GC, alloc.c (29-31 alike) reports the bytes that GC
+       ;; freed to a RUNNING memory profiler as one malloc_probe sample
+       ;; attributed to whatever code happened to trigger the GC.  The
+       ;; logs discarded just above are ~1.8 MB of live hash/vector
+       ;; objects per log on Emacs 29 (where logs are Lisp data), so
+       ;; without this sweep the new window's first GC would charge the
+       ;; PREVIOUS profile's freed logs -- plus any other pre-window
+       ;; garbage -- to the fresh window (observed: an empty start..stop
+       ;; window "allocating" 1.79 MB on 29.4, exactly one C-side log).
+       ;; With the profilers still off, this GC itself records nothing.
+       (garbage-collect)
        (when (memq mode '(cpu cpu+mem))
          (profiler-cpu-start profiler-sampling-interval))
        (when (memq mode '(mem cpu+mem))
