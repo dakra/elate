@@ -1,0 +1,1086 @@
+"""MCP stdio server: a thin adapter over the elate session layer.
+
+Every tool returns structured JSON as text content with an "ok" flag.
+Error responses ({"ok": false, ...}) embed a compact state snapshot
+(window layout, prompt, echo area, screen tail) whenever a session is
+available, so the model can see *why* something failed in the same
+round-trip.
+
+Tool invocations are transcript-logged into the session's JSONL exactly
+like CLI commands, tagged with via="mcp".
+"""
+
+from __future__ import annotations
+
+import functools
+import json
+import re
+import sys
+import time
+import traceback
+from typing import Annotated, Any, Literal
+
+import anyio.to_thread
+from mcp.server.fastmcp import FastMCP, Image
+from mcp.types import ToolAnnotations
+from pydantic import Field
+
+from . import session as S
+from .errors import ElateError, RpcError, SessionNotFound, WaitTimeout
+
+INSTRUCTIONS = """\
+elate spawns disposable, sandboxed Emacs sessions (fresh fake $HOME,
+generated init) and lets you drive them like a user would: send keys,
+click the mouse, evaluate elisp, observe the rendered screen and the
+editor state. Use it to test-drive Emacs packages interactively.
+
+Sessions are TTY (default; tmux-hosted terminal Emacs, text screenshots,
+raw-keys escape hatch) or GUI (windowed Emacs; PNG screenshots via
+elate_screenshot; no raw channel -- keys/type/mouse go through the
+semantic channel).
+
+Workflow: elate_start -> act (elate_keys / elate_type / elate_mouse /
+elate_eval) -> elate_wait for the effect -> elate_state to see the full
+scene. Prefer elate_wait over polling; prefer elate_state over piecing
+together buffer/echo/messages calls. All responses are JSON; responses
+with "ok": false carry an "error" and usually a "state" snapshot
+explaining the situation.
+
+Sessions persist across MCP reconnects; always elate_stop sessions you
+started when you are done (GUI sessions own a visible desktop window).
+"""
+
+server = FastMCP("elate", instructions=INSTRUCTIONS)
+
+_SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
+
+# Annotation shorthands. Everything is local (openWorldHint=False).
+_READONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+_MUTATING = ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                            openWorldHint=False)
+
+
+def _threaded(fn):
+    """Run a sync tool body in a worker thread (anyio.to_thread).
+
+    FastMCP calls plain sync tools on the event loop thread, which would
+    freeze the whole server (pings included) for the duration of e.g. an
+    elate_wait. The wrapper keeps the sync signature visible to FastMCP's
+    schema generation (functools.wraps -> __wrapped__) while the actual
+    body runs off-loop. abandon_on_cancel lets a cancelled request (or a
+    client disconnect) return immediately instead of zombie-ing the server
+    until an in-flight wait's deadline; the abandoned worker thread is a
+    daemon and dies with the process.
+    """
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        return await anyio.to_thread.run_sync(
+            functools.partial(fn, *args, **kwargs), abandon_on_cancel=True
+        )
+    return wrapper
+
+
+def _json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _ok(payload: dict[str, Any]) -> str:
+    return _json({"ok": True, **payload})
+
+
+def _fail(exc: Exception, sess: S.Session | None = None) -> str:
+    """Structured error; embeds a compact state snapshot when possible.
+
+    Every exception -- not just ElateError -- is converted to the
+    {"ok": false, ...} shape so the model always gets the documented
+    contract; unexpected ones additionally log their traceback to stderr.
+    """
+    if isinstance(exc, ElateError):
+        message = str(exc)
+    else:
+        traceback.print_exc(file=sys.stderr)
+        message = f"{type(exc).__name__}: {exc}"
+    payload: dict[str, Any] = {"ok": False, "error": message}
+    if isinstance(exc, RpcError) and exc.backtrace:
+        payload["backtrace"] = exc.backtrace
+    # State dumps are {"state": ..., "screen_tail": ...}; spread them so
+    # "state" in the error payload is the actual snapshot (not state.state).
+    if isinstance(exc, WaitTimeout):
+        payload.update(exc.state)
+    elif isinstance(exc, SessionNotFound):
+        payload["known_sessions"] = [s["name"] for s in S.list_sessions()]
+    elif sess is not None:
+        try:
+            payload.update(S.state_dump(sess))
+        except Exception:  # diagnostics must never mask the real error
+            pass
+    return _json(payload)
+
+
+def _load(session: str, require_alive: bool = True) -> S.Session:
+    sess = S.load_session(session)
+    if require_alive:
+        sess.require_alive()
+    return sess
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+
+@server.tool(annotations=ToolAnnotations(readOnlyHint=False,
+                                         destructiveHint=False,
+                                         openWorldHint=False))
+@_threaded
+def elate_start(
+    name: Annotated[str, Field(description=(
+        "Session name (letters, digits, . _ -). Used as the 'session' "
+        "argument of every other tool."))],
+    ui: Annotated[Literal["tty", "gui"], Field(description=(
+        "Session UI. 'tty' (default): tmux-hosted terminal Emacs -- text "
+        "screenshots, raw-keys escape hatch, works everywhere. 'gui': a "
+        "windowed Emacs on the desktop -- PNG screenshots (elate_screenshot "
+        "returns an image), real GUI rendering; input must go through the "
+        "semantic channel (no delivery='raw')."))] = "tty",
+    headless: Annotated[bool, Field(description=(
+        "GUI only: run under a private Xvfb display (Linux/CI). Not "
+        "available on macOS."))] = False,
+    emacs_path: Annotated[str | None, Field(description=(
+        "Emacs binary to use (default: 'emacs' on PATH). Use for version-"
+        "matrix testing."))] = None,
+    config: Annotated[Literal["minimal", "bare", "init-file", "clean-install"],
+                      Field(description=(
+        "Sandbox config: 'minimal' (default; no startup screen, "
+        "debug-on-error, deterministic test settings), 'bare' (emacs -Q "
+        "plus the agent only), 'init-file' (load init_file), "
+        "'clean-install' (minimal defaults, then INSTALL the load_paths "
+        "package(s) for real via package-install-file into a "
+        "sandbox-local package-user-dir -- verifies autoload cookies, "
+        "Package-Requires, and byte-compilation of the installed copy, "
+        "which load-path injection cannot; the sandbox has no network, "
+        "so a dependency that is not built in fails with a clear "
+        "init_error naming it; the response's 'installed' field reports "
+        "name/version/install dir/compile warnings)."))] = "minimal",
+    init_file: Annotated[str | None, Field(description=(
+        "Path to a user init file; implies config='init-file', and is a "
+        "loud error combined with config='bare'/'clean-install'. Still "
+        "sandboxed (fake $HOME)."))] = None,
+    load_paths: Annotated[list[str] | None, Field(description=(
+        "Files/directories to put on load-path at startup; .el files are "
+        "also loaded. Point this at the package under test. With "
+        "config='clean-install' these are the install targets instead "
+        "(.el file, package tar, or package directory) and at least one "
+        "is required."))] = None,
+    eval_forms: Annotated[list[str] | None, Field(description=(
+        "Elisp forms evaluated at startup, after load_paths. Errors are "
+        "caught and reported as init_error instead of killing the "
+        "session."))] = None,
+    size: Annotated[str, Field(description=(
+        "Terminal size as COLSxROWS, e.g. '120x36'."))] = "120x36",
+) -> str:
+    """Start a new sandboxed Emacs session (TTY or GUI).
+
+    Creates a throwaway sandbox (fake $HOME, generated init, private
+    emacsclient socket), boots Emacs inside it (tmux-hosted -nw for
+    ui='tty'; a desktop window for ui='gui'), and waits for the in-Emacs
+    agent to answer. Returns session info incl. emacs_version and the
+    sandbox path. If startup elisp signalled an error the session still
+    runs and the response carries it as "init_error" -- check it. Fails
+    if a session of that name is already running. After starting, drive
+    it with elate_keys/elate_type/elate_mouse/elate_eval, observe with
+    elate_state (or elate_screenshot for pixels), and elate_stop it when
+    done. 'size' is COLSxROWS characters for both UIs (the GUI frame is
+    measured in characters too).
+    """
+    try:
+        m = _SIZE_RE.match(size)
+        if not m:
+            raise ElateError(f"size must be COLSxROWS, got {size!r}")
+        sess = S.start_session(
+            name,
+            emacs=emacs_path,
+            config=config,
+            init_file=init_file,
+            loads=load_paths or [],
+            evals=eval_forms or [],
+            cols=int(m.group(1)),
+            rows=int(m.group(2)),
+            ui=ui,
+            headless=headless,
+        )
+        sess.log("mcp-start", name=name, via="mcp")
+        return _ok(S.session_info(sess.name))
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool(annotations=ToolAnnotations(readOnlyHint=False,
+                                         destructiveHint=True,
+                                         idempotentHint=True,
+                                         openWorldHint=False))
+@_threaded
+def elate_stop(
+    session: Annotated[str, Field(description="Session name to stop.")],
+) -> str:
+    """Stop a session: kill its Emacs (and, for TTY sessions, the tmux
+    server hosting it), keep the sandbox.
+
+    The transcript and logs stay on disk (path was in elate_start's
+    response). Safe to call on an already-dead session. Always stop the
+    sessions you started.
+    """
+    try:
+        return _ok(S.stop_session(session, via="mcp"))
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool(annotations=_READONLY)
+@_threaded
+def elate_list() -> str:
+    """List all known elate sessions with status (running/dead/stopped).
+
+    Sessions survive MCP reconnects -- use this to rediscover a session
+    you started earlier, or to find leftovers to elate_stop. Summary
+    fields only; elate_info has the full details (incl. init_error).
+    """
+    try:
+        return _ok({"sessions": S.list_sessions()})
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool(annotations=_READONLY)
+@_threaded
+def elate_info(
+    session: Annotated[str, Field(description="Session name.")],
+) -> str:
+    """Full details for one session, alive or not.
+
+    Returns status, pid, emacs binary + version, config mode, terminal
+    size, sandbox path, tmux socket, uptime, and init_error (an error
+    signalled by startup elisp -- re-check it after a reconnect, it is
+    otherwise only reported in the elate_start response). Works on dead
+    and stopped sessions too.
+    """
+    try:
+        return _ok(S.session_info(session))
+    except Exception as exc:
+        return _fail(exc)
+
+
+# ---------------------------------------------------------------------------
+# Input
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_keys(
+    session: Annotated[str, Field(description="Session name.")],
+    keys: Annotated[str, Field(description=(
+        "Key sequence in Emacs kbd notation, e.g. 'C-x C-f', "
+        "'M-x my-mode RET', 'a b RET', 'SPC', '<down>'."))],
+    delivery: Annotated[Literal["semantic", "events", "raw"], Field(description=(
+        "How to deliver the keys. 'semantic' (default): execute-kbd-macro "
+        "inside Emacs -- synchronous and precise, but a sequence that ends "
+        "with an open prompt does NOT hold it open (a bare 'M-x' errors). "
+        "'events': queue on unread-command-events -- asynchronous; USE THIS "
+        "to open a minibuffer prompt and leave it open for inspection or "
+        "follow-up keys. 'raw': real terminal bytes via tmux -- the escape "
+        "hatch that works even when Emacs is busy/wedged (e.g. send 'C-g' "
+        "raw to unblock); cannot encode every chord (e.g. C-%), and is "
+        "TTY-only (GUI sessions have no raw channel)."))] = "semantic",
+    timeout: Annotated[float, Field(gt=0, le=120, description=(
+        "Seconds before a semantic delivery is declared blocked "
+        "(0 < timeout <= 120)."))] = 15.0,
+) -> str:
+    """Send a key sequence to the session.
+
+    After sending, elate_wait (condition='prompt' if you opened one, else
+    'idle') and then elate_state to observe the effect. If a semantic
+    delivery times out, the keys probably left Emacs reading input --
+    retry with delivery='events' or 'raw'.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        sess.log("keys", keys=keys, channel="raw" if delivery == "raw" else "semantic",
+                 method="events" if delivery == "events" else "macro", via="mcp")
+        if delivery == "raw":
+            sess.raw().send_kbd(keys)
+            return _ok({"keys": keys, "channel": "raw"})
+        method = "events" if delivery == "events" else "macro"
+        data = sess.semantic().rpc("keys", keys, method, timeout=timeout)
+        return _ok({"keys": keys, "channel": "semantic", **data})
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_type(
+    session: Annotated[str, Field(description="Session name.")],
+    text: Annotated[str, Field(description=(
+        "Literal text to type -- no kbd parsing, every character is sent "
+        "as-is. Avoid ESC and other control characters: ESC acts as Meta "
+        "and an undefined escape sequence can drop the session into the "
+        "elisp debugger (use elate_keys for chords/named keys). Newlines "
+        "press RET, so auto-indent and minibuffer submission happen as "
+        f"if typed. GUI sessions accept at most {S.GUI_TYPE_LIMIT} "
+        "characters: GUI typing is per-character through the command "
+        "loop, so large text means a long-busy session -- use elate_eval "
+        "with insert for bulk text."))],
+) -> str:
+    """Type literal text into the session as if at the keyboard.
+
+    TTY sessions: raw terminal bytes via tmux (works even when Emacs is
+    wedged). GUI sessions: queued on unread-command-events through the
+    semantic channel -- same typing semantics, but needs a responsive
+    Emacs, is delivered in chunks (each waited on, keeping the session
+    observable), and is capped because per-character command-loop
+    delivery makes large text slow. Use for filling in prompts or
+    buffers with arbitrary text (including text that would be awkward
+    in kbd notation). For key chords or named keys use elate_keys. For
+    bulk text setup, an elate_eval insert is faster and does not go
+    through the command loop.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        sess.log("type", text=text, via="mcp",
+                 channel="raw" if sess.ui == "tty" else "events")
+        return _ok(S.deliver_type(sess, text))
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_mouse(
+    session: Annotated[str, Field(description="Session name.")],
+    action: Annotated[Literal["click", "double", "drag", "wheel"], Field(
+        description=(
+            "'click'/'double': press the given button at the target. "
+            "'drag': button down at the target, drag event to "
+            "to_pos/to_line (selects a region with button 1). 'wheel': "
+            "scroll 'count' notches in 'direction' over the target."))],
+    button: Annotated[int, Field(ge=1, le=3, description=(
+        "Mouse button: 1 (left; follows links/buttons via follow-link), "
+        "2 (middle; push-button on widgets), 3 (right/context). Ignored "
+        "for wheel."))] = 1,
+    buffer: Annotated[str | None, Field(description=(
+        "Target the window displaying this buffer (it must be visible "
+        "in a window). Default: the selected window."))] = None,
+    pos: Annotated[int | None, Field(ge=1, description=(
+        "Buffer position to click (must be visible in the window; "
+        "out-of-range values clamp to the buffer bounds). Default: the "
+        "window's point."))] = None,
+    line: Annotated[int | None, Field(ge=1, description=(
+        "Buffer line (1-based, counted within the accessible/narrowed "
+        "region; clamps to the last line) to click, alternative to "
+        "pos."))] = None,
+    col: Annotated[int | None, Field(ge=0, description=(
+        "Column (0-based; clamps to end of line): with 'line', the "
+        "buffer column; with part='mode-line', the character offset "
+        "into the mode line."))] = None,
+    part: Annotated[Literal["text", "mode-line"], Field(description=(
+        "'text' (default): buffer text. 'mode-line': the window's mode "
+        "line (e.g. mouse-1 selects that window). Caveat: double-click "
+        "on a real mode line is faithful Emacs and runs "
+        "mouse-delete-other-windows -- your window layout will "
+        "change."))] = "text",
+    to_pos: Annotated[int | None, Field(ge=1, description=(
+        "For drag: end buffer position."))] = None,
+    to_line: Annotated[int | None, Field(ge=1, description=(
+        "For drag: end line (with to_col)."))] = None,
+    to_col: Annotated[int | None, Field(ge=0, description=(
+        "For drag: end column."))] = None,
+    direction: Annotated[Literal["up", "down"], Field(description=(
+        "For wheel: scroll direction ('down' moves text up)."))] = "down",
+    count: Annotated[int, Field(ge=1, le=50, description=(
+        "For wheel: number of wheel notches."))] = 1,
+    delivery: Annotated[Literal["macro", "events"], Field(description=(
+        "'macro' (default): dispatch synchronously and return when the "
+        "triggered command finished. 'events': queue on "
+        "unread-command-events -- use when the triggered command itself "
+        "reads input (menus, prompts)."))] = "macro",
+    timeout: Annotated[float, Field(gt=0, le=120, description=(
+        "Seconds before a synchronous dispatch is declared blocked."))] = 15.0,
+) -> str:
+    """Synthesize a mouse interaction at a buffer position or mode line.
+
+    Works for both TTY and GUI sessions and needs no OS permissions: a
+    real posn is built at the target inside Emacs and a complete event
+    sequence (down + click, drag, or wheel) is dispatched through the
+    command loop, so exactly the bindings a human click would trigger
+    fire here (buttons, mouse-1 follow-link, mode-line maps, mwheel
+    scrolling, region-by-drag). The target must be visible in a window.
+    After 'events' delivery, elate_wait condition='idle' then elate_state
+    to observe the effect. Caveat (config='bare' only): stock Emacs
+    silently ignores a mouse-2 click within 0.35s of a wheel scroll
+    (mouse-wheel-inhibit-click-time); the default 'minimal' config
+    disables that for deterministic runs.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        kwargs = dict(action=action, button=button, buffer=buffer, pos=pos,
+                      line=line, col=col, part=part, to_pos=to_pos,
+                      to_line=to_line, to_col=to_col, direction=direction,
+                      count=count, delivery=delivery)
+        sess.log("mouse", via="mcp", **kwargs)
+        return _ok(S.mouse_event(sess, timeout=timeout, **kwargs))
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_eval(
+    session: Annotated[str, Field(description="Session name.")],
+    form: Annotated[str, Field(description=(
+        "Elisp source: one or more forms, evaluated as (progn ...)."))],
+    timeout: Annotated[float, Field(gt=0, le=600, description=(
+        "Hard timeout in seconds (0 < timeout <= 600). A blocking form is "
+        "interrupted (or, if truly wedged, reported as busy)."))] = 15.0,
+) -> str:
+    """Evaluate elisp in the session; the precision instrument.
+
+    Returns the printed value, the *Messages* delta it produced, and on
+    failure "error" + a full "backtrace" plus a state snapshot. Values
+    longer than 64 KiB come back with truncated=true and the full
+    value-length -- narrow your form instead of re-fetching. The form runs
+    in the live interactive Emacs (not batch), so UI side effects are real.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        sess.log("eval", form=form, timeout=timeout, via="mcp")
+        data = sess.semantic().eval_form(form, timeout=timeout)
+        sess.log("eval-result", **data)
+        if data.get("error"):
+            payload: dict[str, Any] = {"ok": False, **data}
+            try:
+                payload.update(S.state_dump(sess))
+            except Exception:
+                pass
+            return _json(payload)
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+# ---------------------------------------------------------------------------
+# Testing & lint
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_test(
+    session: Annotated[str, Field(description="Session name.")],
+    selector: Annotated[str, Field(description=(
+        "ERT selector: 't' (all tests, default), a test name, a name "
+        "regexp (e.g. 'my-pkg-'), '(tag NAME)', '(not \"slow\")', "
+        "':failed', ':new', or any compound selector."))] = "t",
+    load_files: Annotated[list[str] | None, Field(description=(
+        "Elisp test files to load (by path) before the run. Tests must "
+        "be loaded -- via this, elate_start load_paths, or elate_eval -- "
+        "before a selector can match them. A load error fails the call "
+        "with a backtrace."))] = None,
+    timeout: Annotated[float, Field(gt=0, le=600, description=(
+        "In-Emacs timeout for the whole run in seconds (0 < timeout <= "
+        "600). A test stuck in a timer-servicing wait is interrupted; "
+        "the response then carries timed-out=true, the partial results, "
+        "and the interrupted test (its name in 'interrupted', its entry "
+        "in 'tests' with status 'aborted')."))] = 60.0,
+) -> str:
+    """Run ERT tests interactively inside the live session.
+
+    Unlike batch ERT, tests run in the real interactive Emacs (live
+    redisplay, real window/frame state, working minibuffer), so UI bugs
+    that `emacs --batch' cannot see are caught. Results are structural
+    (collected from ERT's result objects, never scraped from the *ert*
+    buffer): counts (total/passed/failed/errors/skipped/unexpected,
+    duration) plus per-test name, status, duration, captured *Messages*
+    output, and -- for failures/errors -- the condition and a trimmed
+    backtrace. Test failures are data, not tool errors: the response
+    stays ok=true; check "unexpected" (and "timed-out") to judge the
+    run. A test that signals quit (keyboard-quit, or a raw C-g hitting
+    its body) is recorded with status "quit" and the run simply moves
+    on -- no prompt, no hang. ok=false means infrastructure trouble
+    (load error, dead session, hard timeout).
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        sess.log("test", selector=selector, load_files=load_files,
+                 timeout=timeout, via="mcp")
+        data = S.run_ert(sess, selector=selector,
+                         load_files=load_files or [], timeout=timeout)
+        sess.log("test-result", total=data.get("total"),
+                 unexpected=data.get("unexpected"),
+                 timed_out=data.get("timed-out"))
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_lint(
+    session: Annotated[str, Field(description="Session name.")],
+    files: Annotated[list[str], Field(description=(
+        "Elisp files to lint, as paths (the agent reads them in-session; "
+        "file contents never travel over the transport)."))],
+    timeout: Annotated[float, Field(gt=0, le=120, description=(
+        "Per-file in-Emacs timeout in seconds (0 < timeout <= 120); a "
+        "lint whose compile-time code hangs is interrupted and reported "
+        "as a clean error, leaving no residue."))] = 60.0,
+) -> str:
+    """Lint elisp files inside the session: byte-compile + checkdoc.
+
+    WARNING: byte-compilation runs IN the live session, so each file's
+    compile-time code (eval-when-compile, macro expansion, top-level
+    requires) is EXECUTED there and can mutate session state -- that is
+    inherent to in-session linting against the session's load-path (it
+    is also why the package under test resolves). Lint untrusted code
+    in a throwaway session you stop afterwards. Results can likewise
+    depend on session history (functions defined by an earlier load or
+    by an earlier lint's eval-when-compile/require code silence
+    undefined-function warnings a fresh session would emit).
+
+    Returns "items": a list of {file, tool, line, col, severity,
+    message} ('tool' is byte-compile or checkdoc; line/col may be null
+    for file-level findings), plus "clean" (true when there are none).
+    The byte-compilation writes its .elc into the sandbox and deletes
+    it -- never next to the source. native-comp warnings and
+    package-lint are not run; "notes" says why.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        sess.log("lint", files=files, timeout=timeout, via="mcp")
+        data = S.lint_files(sess, files, timeout=timeout)
+        sess.log("lint-result", files=len(data["files"]),
+                 items=len(data["items"]))
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+# ---------------------------------------------------------------------------
+# Profiler & benchmark (Phase 6)
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_profile(
+    session: Annotated[str, Field(description="Session name.")],
+    action: Annotated[Literal["start", "stop", "report", "run"], Field(
+        description=(
+            "'run' (recommended): start -> evaluate 'form' -> stop -> "
+            "report, one structured result. 'start'/'stop' bracket a "
+            "manual window (e.g. around keys/mouse interactions); "
+            "'report' renders what was collected -- it works while "
+            "profiling and after stop."))],
+    mode: Annotated[Literal["cpu", "mem", "both"], Field(description=(
+        "What to sample (for start/run): 'cpu' (default; periodic SIGPROF "
+        "samples), 'mem' (a sample at every allocation, counts are "
+        "bytes), or 'both'."))] = "cpu",
+    form: Annotated[str | None, Field(description=(
+        "For action='run': the elisp to profile, evaluated like "
+        "elate_eval. Its value/error/backtrace come back under 'eval'; "
+        "a form that signalled keeps ok=true (check eval.error) -- the "
+        "profile up to the error is still reported."))] = None,
+    depth: Annotated[int, Field(ge=1, le=20, description=(
+        "Calltree depth limit for report/run (default 6). The tree is "
+        "also capped in total nodes; truncation is flagged per "
+        "node ('children-truncated') and per tree ('tree-truncated')."))] = 6,
+    timeout: Annotated[float, Field(gt=0, le=600, description=(
+        "For action='run': eval timeout in seconds (0 < timeout <= "
+        "600)."))] = 15.0,
+) -> str:
+    """Profile elisp with Emacs's native sampling profiler.
+
+    Reports are structured, not the profiler-report UI buffer: per mode
+    ('cpu' in samples, 'mem' in bytes) you get 'total', a 'functions'
+    list (name, self/total counts and percentages, sorted by self
+    time), and a depth-limited 'tree' (profiler.el's unified calltree)
+    with truncation flags. 'start' resets earlier logs, so a profile
+    covers exactly one start..stop window; report after stop keeps
+    working until the next start. IMPORTANT: profiles are
+    session-history dependent -- every piece of code the session runs
+    (including elate's own request servicing) lands in the samples, so
+    profile in a fresh throwaway session for authoritative numbers,
+    the same advice as elate_lint.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        if action == "run":
+            if not form:
+                raise ElateError("action='run' needs a 'form' to profile")
+            sess.log("profile", action="run", mode=mode, form=form,
+                     timeout=timeout, depth=depth, via="mcp")
+            return _ok(S.profile_run(sess, form, mode=mode,
+                                     timeout=timeout, depth=depth))
+        if form is not None:
+            raise ElateError(
+                f"action='{action}' takes no 'form' (only 'run' does)")
+        sess.log("profile", action=action, mode=mode, via="mcp")
+        if action == "start":
+            return _ok(S.profile_start(sess, mode))
+        if action == "stop":
+            return _ok(S.profile_stop(sess))
+        return _ok(S.profile_report(sess, depth=depth))
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_bench(
+    session: Annotated[str, Field(description="Session name.")],
+    form: Annotated[str, Field(description=(
+        "Elisp to benchmark: one or more forms, wrapped in a lambda and "
+        "byte-compiled before timing (the benchmark-run-compiled "
+        "mechanism); when compilation fails the interpreted closure is "
+        "timed instead and 'compiled'/'compile-error' say so."))],
+    repetitions: Annotated[int, Field(ge=1, le=1_000_000, description=(
+        "How many times to call the form (default 1). Use enough "
+        "repetitions that 'elapsed' is well above timer resolution; "
+        "'mean' is elapsed/repetitions."))] = 1,
+    timeout: Annotated[float, Field(gt=0, le=600, description=(
+        "In-Emacs timeout for the whole run in seconds (0 < timeout <= "
+        "600); like eval it fires at timer-servicing points, a tight "
+        "loop falls to the hard subprocess timeout just above it."))] = 60.0,
+) -> str:
+    """Benchmark an elisp form: elapsed/mean time, GC and allocation cost.
+
+    Returns 'elapsed' (total seconds), 'mean' (per repetition), GC
+    activity during the run ('gc-runs', 'gc-elapsed', plus
+    gcs-done/gc-elapsed deltas), and 'memory-deltas': the
+    memory-use-counts deltas (conses, floats, vector-cells, symbols,
+    string-chars, intervals, strings allocated) -- the allocation
+    profile of the form. Errors signalled by the form come back with a
+    backtrace, like elate_eval. IMPORTANT: numbers depend on session
+    history (loaded code, GC state) -- benchmark in a fresh throwaway
+    session for authoritative results, the same advice as elate_lint.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        sess.log("bench", form=form, repetitions=repetitions,
+                 timeout=timeout, via="mcp")
+        data = S.bench_form(sess, form, repetitions=repetitions,
+                            timeout=timeout)
+        if data.get("error"):
+            payload: dict[str, Any] = {"ok": False, **data}
+            try:
+                payload.update(S.state_dump(sess))
+            except Exception:
+                pass
+            return _json(payload)
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+# ---------------------------------------------------------------------------
+# Scenario scripts & recording (Phase 5)
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_run_script(
+    script: Annotated[str, Field(description=(
+        "Path to a JSON scenario file (see the README's 'Scenario "
+        "scripts' section): {\"name\": ..., \"session\": {ui, size, "
+        "config, load, eval}, \"steps\": [...]}. Steps mirror the other "
+        "tools (keys/type/eval/wait/mouse/test/lint/screenshot/resize) "
+        "plus \"assert\" steps (buffer_contains, buffer_matches, state, "
+        "messages_match, popup, tests, lint_clean, eval). Pass a file "
+        "path -- the server reads the file; relative paths inside the "
+        "script resolve against the script's directory. NOTE: a "
+        "\"screenshot\" step with an output path creates/overwrites the "
+        "file wherever that path points."))],
+    keep_on_failure: Annotated[bool, Field(description=(
+        "Keep the fresh session running when the script fails, so you "
+        "can inspect it (elate_state / elate_screenshot) -- then "
+        "elate_stop it yourself; the response's 'session' field has its "
+        "name. On success the session is always torn down."))] = False,
+    timeout: Annotated[float, Field(gt=0, le=600, description=(
+        "Overall wall-clock budget for the whole run in seconds "
+        "(0 < timeout <= 600). Steps not started by the deadline fail; "
+        "each step additionally honors its own timeout."))] = 300.0,
+    emacs: Annotated[str | None, Field(description=(
+        "Override the script's emacs binary: an absolute path or a bare "
+        "PATH name. Call once per installed Emacs to version-matrix a "
+        "script (the CLI's 'matrix' verb wraps exactly this)."))] = None,
+) -> str:
+    """Execute a whole scenario script in one call: fresh session, steps,
+    assertions, teardown.
+
+    The script runs in a fresh throwaway session built from its
+    "session" config (deliberate: lint executes compile-time code and
+    lint/test results depend on session history, so only a fresh session
+    gives reproducible verdicts), executes the steps in order, and stops
+    at the first failure. Script failures are data, not tool errors: the
+    response stays ok=true -- judge the run by "success" and the
+    per-step "steps" list (a failed step embeds the error and a state
+    snapshot; later steps are recorded as not-run). A run whose session
+    startup eval signalled an error fails with no steps run (set
+    "allow_init_error": true in the script's "session" block to run
+    anyway). ok=false means the script could not run at all
+    (unreadable/invalid script file, session boot failure). Use this
+    instead of many single-step calls when a scenario is already written
+    down -- one round-trip runs it all.
+    """
+    try:
+        from . import script as SC
+
+        sc, base = SC.load_script(script)
+        result = SC.run_script(sc, base_dir=base, emacs=emacs,
+                               keep_on_failure=keep_on_failure,
+                               deadline=time.monotonic() + timeout,
+                               origin="mcp")
+        return _ok(result)
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_record(
+    session: Annotated[str, Field(description="Session name.")],
+    action: Annotated[Literal["start", "stop", "status"], Field(description=(
+        "'start': begin recording the session's terminal output. "
+        "'stop': finish the recording and report the file, event count, "
+        "and duration. 'status': inspect the active recording without "
+        "changing it."))],
+    output: Annotated[str | None, Field(description=(
+        "For 'start': the .cast output path -- the file is created or "
+        "OVERWRITTEN wherever this points (default: "
+        "<session>/log/<name>-<time>.cast; the default response always "
+        "tells you the path)."))] = None,
+) -> str:
+    """Record a TTY session's terminal output as an asciicast v2 file.
+
+    Captures everything the session's tmux pane outputs (keystrokes'
+    effects, redisplay, colors) with timestamps; the first event replays
+    the screen as it looked at start, so playback begins from the
+    correct picture. Play the file with `asciinema play`, render a GIF
+    with `agg` -- useful as a package demo generator. One recording per
+    session at a time; recording survives this MCP connection (it is
+    attached to the tmux pane) until 'stop'. If the session's Emacs dies
+    mid-recording, 'status' reports stale=true and 'stop' finalizes the
+    cast with everything up to the crash. TTY sessions only: GUI
+    sessions have no terminal byte stream (use elate_screenshot, or the
+    CLI's 'snap' series, instead).
+    """
+    sess = None
+    try:
+        from . import record as R
+
+        sess = _load(session, require_alive=False)
+        if action == "start":
+            return _ok(R.start_recording(sess, output=output))
+        if output is not None:
+            raise ElateError("'output' applies to action='start' only")
+        if action == "stop":
+            return _ok(R.stop_recording(sess))
+        return _ok(R.recording_status(sess))
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+# ---------------------------------------------------------------------------
+# Observation
+
+@server.tool(annotations=_READONLY)
+@_threaded
+def elate_state(
+    session: Annotated[str, Field(description="Session name.")],
+) -> str:
+    """Full scene snapshot in one round-trip -- the main observation tool.
+
+    Returns: current buffer (name, major/minor modes, point line:column,
+    mark/region, narrowing); the window layout tree ("windows": leaves are
+    windows with buffer, size, point, mode-line string, and the visible
+    text between window-start and window-end; inner nodes have split:
+    'vertical' = stacked top-to-bottom, 'horizontal' = side by side);
+    echo-area contents; the active minibuffer (prompt, current input,
+    completion candidates when a completion session is active, depth);
+    input-pending/unread flags; last-command; "popups" (the kinds of
+    popup currently visible -- which-key/transient/child frames/...;
+    non-empty means elate_popups has something to show you); and the
+    last ~10 lines of *Messages* as messages-tail. Call this after every
+    action whose effect you need to see. Visible text is capped per
+    window; use elate_buffer for full buffer contents.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        data = sess.semantic().rpc("state")
+        sess.log("state", buffer=data.get("buffer"), via="mcp")
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_READONLY, structured_output=False)
+@_threaded
+def elate_screenshot(
+    session: Annotated[str, Field(description="Session name.")],
+    ansi: Annotated[bool, Field(description=(
+        "TTY only: include ANSI color escape sequences (verify "
+        "faces/themes rendered in the terminal)."))] = False,
+) -> str | list[str | Image]:
+    """Capture the rendered screen (what a human would see).
+
+    TTY sessions: the screen as text in the JSON response ("screen"),
+    optionally ANSI-colored; works even after Emacs crashed (the dead
+    pane is kept for post-mortem capture), making this the right tool to
+    inspect a session that died. GUI sessions: a PNG of the Emacs window,
+    returned as actual image content alongside a JSON text block with
+    the saved path and pixel dimensions; needs a live session, and on
+    macOS the Screen Recording permission (a missing permission comes
+    back as an actionable error). For structured facts prefer
+    elate_state; use the screenshot to check actual rendering, faces,
+    layout glitches, or a wedged Emacs.
+    """
+    sess = None
+    try:
+        sess = _load(session, require_alive=False)
+        if sess.ui == "gui":
+            import datetime as _dt
+
+            from . import screenshot as shot
+
+            if ansi:
+                raise ElateError("ansi applies to TTY text screenshots only")
+            sess.require_alive()
+            stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            out = sess.dir / "log" / f"screenshot-{stamp}.png"
+            result = shot.capture_gui(sess, out)
+            sess.log("screenshot", via="mcp", output=result["path"],
+                     width=result["width"], height=result["height"])
+            return [_ok(result), Image(path=result["path"])]
+        if sess.raw().pane_info() is None:
+            raise ElateError(
+                f"session {session!r} has no tmux pane left to capture "
+                f"(status: {sess.computed_status()})"
+            )
+        screen = sess.raw().capture_pane(ansi=ansi)
+        sess.log("screenshot", ansi=ansi, via="mcp")
+        return _ok({"screen": screen, "ansi": ansi})
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_READONLY)
+@_threaded
+def elate_buffer(
+    session: Annotated[str, Field(description="Session name.")],
+    buffer: Annotated[str | None, Field(description=(
+        "Buffer name, e.g. '*scratch*' or '*Messages*'. Default: the "
+        "current (selected window's) buffer."))] = None,
+    from_line: Annotated[int | None, Field(description=(
+        "First line to include (1-based, inclusive)."))] = None,
+    to_line: Annotated[int | None, Field(description=(
+        "Last line to include (1-based, inclusive)."))] = None,
+    props: Annotated[bool, Field(description=(
+        "Also return run-length-encoded face/text-property runs and the "
+        "overlays for the range. Each run: start/end/line/text plus face "
+        "(named faces, face lists, and anonymous plist faces), "
+        "display/invisible/field values, and button/keymap presence. "
+        "Each overlay: start/end plus face, invisible, display, "
+        "before-string, after-string, priority. font-lock is ensured on "
+        "the range first. Use this to verify font-lock, themes, and "
+        "overlay-based UI (hl-line, company, ...). For a single position "
+        "query, pass from_line=to_line."))] = False,
+) -> str:
+    """Read a buffer's text (full or a line range), plus total-lines.
+
+    Reads the real buffer contents regardless of what is visible on
+    screen. For big buffers pass from_line/to_line and use total-lines to
+    page. With props=true, additionally dumps faces/text properties
+    (run-length encoded) and overlays -- the way to check rendering
+    facts structurally instead of eyeballing a screenshot. Errors if the
+    buffer does not exist (elate_wait with condition='text' polls a
+    not-yet-existing buffer instead).
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        data = sess.semantic().rpc("buffer", buffer, from_line, to_line,
+                                   True if props else None)
+        sess.log("buffer", name=buffer, from_line=from_line, to_line=to_line,
+                 props=bool(props), bytes=len(data.get("text") or ""),
+                 via="mcp")
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_READONLY)
+@_threaded
+def elate_popups(
+    session: Annotated[str, Field(description="Session name.")],
+) -> str:
+    """Capture currently visible popups as text.
+
+    Detects the common popup mechanisms -- which-key, transient, hydra's
+    lv window, corfu/company completion popups, completion-preview, and
+    any child frame (posframe & friends) -- and returns
+    {"popups": [{kind, buffer?, text}]}; an empty list means no popup is
+    showing. Mechanisms not installed in the session simply never match.
+    elate_state's "popups" field lists the active kinds, so you know
+    when calling this is worthwhile.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        data = sess.semantic().rpc("popups")
+        sess.log("popups", via="mcp",
+                 kinds=[p.get("kind") for p in data.get("popups") or []])
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_READONLY)
+@_threaded
+def elate_messages(
+    session: Annotated[str, Field(description="Session name.")],
+) -> str:
+    """New *Messages* output since the last elate_messages call (cursor-based).
+
+    The cursor is persisted per session and shared with the CLI: each call
+    returns only what arrived since the previous call and advances the
+    cursor, so calling twice in a row returns nothing new the second time.
+    The first call returns the whole backlog. For just the last few lines
+    without consuming the cursor, use elate_state's messages-tail.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        data = S.messages_delta(sess)
+        sess.log("messages", cursor=data.get("cursor"),
+                 bytes=len(data.get("text") or ""), via="mcp")
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_READONLY)
+@_threaded
+def elate_echo(
+    session: Annotated[str, Field(description="Session name.")],
+) -> str:
+    """Current echo area message and active minibuffer (prompt + input).
+
+    A cheap targeted read; elate_state returns the same fields plus the
+    full scene.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        data = sess.semantic().rpc("echo")
+        result = {"echo": data.get("echo"), "minibuffer": data.get("minibuffer")}
+        sess.log("echo", echo=result["echo"], minibuffer=result["minibuffer"],
+                 via="mcp")
+        return _ok(result)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+# ---------------------------------------------------------------------------
+# Synchronization
+
+@server.tool(annotations=_READONLY)
+@_threaded
+def elate_wait(
+    session: Annotated[str, Field(description="Session name.")],
+    condition: Annotated[Literal["idle", "text", "prompt"], Field(description=(
+        "'idle': Emacs answers promptly, no pending input, idle >= "
+        "min_idle seconds -- use after keys/eval to let effects settle. "
+        "'text': pattern appeared in a buffer -- use to await output. "
+        "'prompt': a minibuffer prompt became active -- use after keys "
+        "that should ask a question."))],
+    pattern: Annotated[str | None, Field(description=(
+        "For condition='text': a PYTHON regular expression (not elisp "
+        "syntax) matched against the buffer text."))] = None,
+    buffer: Annotated[str | None, Field(description=(
+        "For condition='text': buffer to search (default: current). May "
+        "not exist yet -- it is polled until the deadline."))] = None,
+    timeout: Annotated[float, Field(gt=0, le=120, description=(
+        "Overall deadline in seconds (0 < timeout <= 120). Prefer several "
+        "short waits over one long one."))] = 10.0,
+    min_idle: Annotated[float, Field(ge=0, le=60, description=(
+        "For condition='idle': minimum idle time in seconds."))] = 0.2,
+) -> str:
+    """Wait for a condition instead of sleep-and-poll.
+
+    Returns what matched (idle time / matched text + position / prompt
+    string + current input). On timeout, ok=false with a "state" snapshot
+    embedded so you can see what Emacs was doing instead -- read it before
+    retrying.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        # min_idle must be logged or the transcript->script exporter
+        # would silently lose it from replayed idle waits.
+        sess.log("wait", condition=condition, pattern=pattern, buffer=buffer,
+                 min_idle=min_idle, timeout=timeout, via="mcp")
+        if condition == "idle":
+            data = S.wait_idle(sess, min_idle=min_idle, timeout=timeout)
+        elif condition == "text":
+            if not pattern:
+                raise ElateError("condition='text' needs a pattern")
+            data = S.wait_text(sess, pattern, buffer=buffer, timeout=timeout)
+        else:
+            data = S.wait_prompt(sess, timeout=timeout)
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+# ---------------------------------------------------------------------------
+# Docs / bindings
+
+@server.tool(annotations=_READONLY)
+@_threaded
+def elate_describe(
+    session: Annotated[str, Field(description="Session name.")],
+    kind: Annotated[Literal["key", "function", "variable", "mode"], Field(
+        description=(
+            "'key': resolve a key sequence to its command in the current "
+            "context (like describe-key). 'function'/'variable'/'mode': "
+            "look up a symbol."))],
+    name: Annotated[str, Field(description=(
+        "For 'key': a kbd string like 'C-x C-f'. Otherwise the symbol "
+        "name, e.g. 'find-file', 'fill-column', 'org-mode'."))],
+) -> str:
+    """Structured docs/binding lookup inside the session's Emacs.
+
+    Key lookups return the bound command (or 'prefix keymap'), its
+    docstring, arglist, file of definition, and the keys it is on.
+    Functions/variables/modes return docstring + definition file;
+    functions also obsolescence info, and autoloaded=true with
+    arglist=null when the definition is not loaded yet; variables also
+    their current (buffer-local) value; modes whether they are enabled in
+    the current buffer (enabled=null means the mode's state could not be
+    determined -- not 'disabled'). Unknown symbols return defined=false
+    rather than an error. Resolution happens in the live session, so it
+    sees the package under test.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        data = sess.semantic().rpc("describe", kind, name)
+        sess.log("describe", kind=kind, name=name, via="mcp")
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+def run_stdio() -> None:
+    """Run the MCP server over stdio (blocking until the client hangs up)."""
+    server.run("stdio")

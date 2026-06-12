@@ -1,0 +1,995 @@
+"""Phase 5 integration tests: scenario scripts / `elate run`,
+transcript export, asciicast recording, snap series, and the
+version-matrix helper.
+
+Same conventions as the other integration suites: a real Emacs in a
+real tmux; one module-scoped session for the per-session features
+(record/snap/export); `elate run` and `matrix` create their own fresh
+sessions by design.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import signal
+import sys
+import tempfile
+import time
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
+from elate import cli
+from elate import gui
+from elate import record as R
+from elate import script as SC
+from elate import session as S
+from elate.errors import ElateError
+
+HAVE_DEPS = bool(
+    shutil.which("emacs") and shutil.which("tmux") and shutil.which("emacsclient")
+)
+
+pytestmark = pytest.mark.skipif(
+    not HAVE_DEPS, reason="emacs, emacsclient, and tmux are required"
+)
+
+NAME = f"rc{os.getpid()}"
+
+
+@pytest.fixture(scope="module")
+def elate_home() -> Iterator[str]:
+    tmp = tempfile.mkdtemp(prefix="elrec-")
+    old = os.environ.get("ELATE_HOME")
+    os.environ["ELATE_HOME"] = tmp
+    try:
+        yield tmp
+    finally:
+        if old is None:
+            os.environ.pop("ELATE_HOME", None)
+        else:
+            os.environ["ELATE_HOME"] = old
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@pytest.fixture(scope="module")
+def sess(elate_home: str) -> Iterator[S.Session]:
+    session = S.start_session(NAME, config="bare", cols=80, rows=24)
+    try:
+        yield session
+    finally:
+        try:
+            S.stop_session(NAME)
+        except Exception:
+            session.raw().kill_server()
+
+
+def write_script(tmp_path: Path, script: dict, name: str = "scenario.json") -> str:
+    path = tmp_path / name
+    path.write_text(json.dumps(script, indent=2), encoding="utf-8")
+    return str(path)
+
+
+def running_run_sessions() -> list[str]:
+    return [s["name"] for s in S.list_sessions()
+            if s["name"].startswith("run-") and s["status"] == "running"]
+
+
+PASS_SCRIPT = {
+    "name": "phase5 smoke",
+    "session": {"config": "bare", "size": "80x24"},
+    "steps": [
+        {"eval": '(progn (switch-to-buffer "*scratch*") (erase-buffer))'},
+        {"keys": "h i RET"},
+        {"type": "typed!"},
+        {"wait": "text", "pattern": "typ.d!", "buffer": "*scratch*",
+         "timeout": 10},
+        {"assert": {"buffer_contains": "hi", "buffer": "*scratch*"}},
+        {"assert": {"buffer_matches": "^typ.d!$", "buffer": "*scratch*"}},
+        {"assert": {"state": {"buffer": "*scratch*"}}},
+        {"eval": '(message "script-marker-77")'},
+        {"assert": {"messages_match": "script-marker-7[0-9]"}},
+        {"comment": "a pure comment step is recorded as skipped"},
+        {"assert": {"eval": "(= (+ 1 2) 3)"}, "skip": True,
+         "comment": "explicitly skipped"},
+        {"assert": {"eval": "(= (* 6 7) 42)"}},
+    ],
+}
+
+
+# -- script validation (no Emacs needed beyond the module skip) ---------------
+
+def test_load_script_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(ElateError, match="does not exist"):
+        SC.load_script(tmp_path / "nope.json")
+
+
+def test_load_script_invalid_json(tmp_path: Path) -> None:
+    p = tmp_path / "bad.json"
+    p.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ElateError, match="cannot read script"):
+        SC.load_script(p)
+
+
+def test_validate_script_errors() -> None:
+    cases = [
+        ({"steps": "x"}, "steps"),
+        ({"steps": [{"keys": "a", "eval": "b"}]}, "exactly one action"),
+        ({"steps": [{"frobnicate": 1}]}, "no action key"),
+        ({"steps": [{"keys": "a", "speling": 1}]}, "unknown key"),
+        ({"steps": [{"keys": "a", "delivery": "psychic"}]}, "delivery"),
+        ({"steps": [{"wait": "text"}]}, "pattern"),
+        ({"steps": [{"wait": "forever"}]}, "wait"),
+        ({"steps": [{"eval": "1", "timeout": -3}]}, "timeout"),
+        ({"steps": [{"eval": "1", "timeout": 9999}]}, "timeout"),
+        ({"steps": [{"lint": []}]}, "non-empty"),
+        ({"steps": [{"resize": "big"}]}, "COLSxROWS"),
+        ({"steps": [{"assert": {"buffer_matches": "("}}]}, "invalid regexp"),
+        ({"steps": [{"assert": {"state": {}}}]}, "non-empty"),
+        ({"steps": [{"assert": {"popup": 3}}]}, "popup"),
+        ({"steps": [{"assert": {"buffer_contains": "x", "pos": 1}}]},
+         "unknown key"),
+        ({"steps": [], "session": {"ui": "vr"}}, "ui"),
+        ({"steps": [], "session": {"size": "huge"}}, "COLSxROWS"),
+        ({"steps": [], "session": {"config": "weird"}}, "config"),
+        ({"steps": [], "session": {"frob": 1}}, "unknown session config"),
+        # Wrong-TYPED option values are validation errors up front, not
+        # mid-run int()/float() crashes (REVIEW-phase5 bug 1).
+        ({"steps": [{"mouse": "click", "button": "left"}]}, "button"),
+        ({"steps": [{"mouse": "click", "button": True}]}, "button"),
+        ({"steps": [{"mouse": "click", "button": 4}]}, "button"),
+        ({"steps": [{"mouse": "wheel", "count": "many"}]}, "count"),
+        ({"steps": [{"mouse": "wheel", "count": 0}]}, "count"),
+        ({"steps": [{"mouse": "click", "pos": "here"}]}, "pos"),
+        ({"steps": [{"mouse": "click", "line": 0}]}, "line"),
+        ({"steps": [{"mouse": "click", "col": -1}]}, "col"),
+        ({"steps": [{"mouse": "click", "delivery": "psychic"}]}, "delivery"),
+        ({"steps": [{"mouse": "click", "part": "fringe"}]}, "part"),
+        ({"steps": [{"mouse": "wheel", "direction": "left"}]}, "direction"),
+        ({"steps": [{"mouse": "click", "buffer": 7}]}, "buffer"),
+        ({"steps": [{"wait": "idle", "min_idle": "fast"}]}, "min_idle"),
+        ({"steps": [{"wait": "idle", "min_idle": -1}]}, "min_idle"),
+        ({"steps": [{"wait": "text", "pattern": "x", "buffer": 9}]}, "buffer"),
+        ({"steps": [{"assert": {"eval": "t", "timeout": "soon"}}]}, "timeout"),
+        ({"steps": [{"assert": {"buffer_contains": "x", "buffer": 1}}]},
+         "buffer"),
+        ({"steps": [{"eval": "1", "skip": "yes"}]}, "skip"),
+        ({"steps": [{"test": "t", "allow_unexpected": 1}]}, "allow_unexpected"),
+        ({"steps": [{"lint": ["f.el"], "allow_findings": "no"}]},
+         "allow_findings"),
+        ({"steps": [{"screenshot": None, "ansi": "yes"}]}, "ansi"),
+        # Options on the wrong wait kind are loud, not silently ignored.
+        ({"steps": [{"wait": "prompt", "pattern": "x"}]}, "not apply"),
+        ({"steps": [{"wait": "idle", "buffer": "*scratch*"}]}, "not apply"),
+        ({"steps": [{"wait": "text", "pattern": "x", "min_idle": 1}]},
+         "not apply"),
+        # An invalid wait regexp fails at load time, like buffer_matches.
+        ({"steps": [{"wait": "text", "pattern": "("}]}, "invalid regexp"),
+        # Empty scripts cannot pass vacuously (REVIEW-phase5 R3).
+        ({"steps": []}, "empty"),
+        # Implausible sizes are rejected before tmux sees them (R4).
+        ({"steps": [{"eval": "1"}], "session": {"size": "0x0"}}, "implausible"),
+        ({"steps": [{"resize": "0x0"}]}, "implausible"),
+        ({"steps": [{"eval": "1"}],
+          "session": {"allow_init_error": "yes"}}, "allow_init_error"),
+    ]
+    for script, needle in cases:
+        with pytest.raises(ElateError, match=needle):
+            SC.validate_script(script)
+
+
+def test_run_script_bad_types_clean_cli_error(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    """REVIEW-phase5 bug 1 repros: a wrong-typed option value must be a
+    structured validation error (valid --json, exit 1), never a raw
+    int()/float() traceback -- and no session is booted for it."""
+    for step in ({"mouse": "click", "button": "left"},
+                 {"wait": "idle", "min_idle": "fast"},
+                 {"assert": {"eval": "t", "timeout": "soon"}}):
+        path = write_script(tmp_path, {"steps": [step]})
+        code = cli.main(["--json", "run", path])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 1, step
+        assert out["ok"] is False and "must be" in out["error"]
+    assert running_run_sessions() == []
+
+
+def test_event_step_wait_shapes() -> None:
+    """Pin the exported wait-step fields for both producer shapes
+    (REVIEW-phase5 bug 3: buffer/min_idle must survive the round trip)."""
+    # CLI shape: positional args list + the (now logged) buffer field.
+    assert SC._event_step({"event": "wait", "condition": "text",
+                           "args": ["pat"], "buffer": "*Messages*",
+                           "timeout": 5.0}) == {
+        "wait": "text", "pattern": "pat", "buffer": "*Messages*",
+        "timeout": 5.0}
+    assert SC._event_step({"event": "wait", "condition": "idle",
+                           "args": ["1.5"], "timeout": 10.0}) == {
+        "wait": "idle", "min_idle": 1.5}
+    # MCP/script shape: named min_idle field.
+    assert SC._event_step({"event": "wait", "condition": "idle",
+                           "min_idle": 1.0, "timeout": 10.0,
+                           "via": "mcp"}) == {"wait": "idle", "min_idle": 1.0}
+    # Defaults are omitted so exported scripts stay minimal.
+    assert SC._event_step({"event": "wait", "condition": "idle",
+                           "min_idle": 0.2, "timeout": 10.0}) == {"wait": "idle"}
+    # buffer never leaks onto non-text waits (it would not validate).
+    assert SC._event_step({"event": "wait", "condition": "prompt",
+                           "buffer": "*scratch*", "timeout": 10.0}) == {
+        "wait": "prompt"}
+
+
+# -- elate run ----------------------------------------------------------------
+
+def test_run_script_passes_and_tears_down(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    path = write_script(tmp_path, PASS_SCRIPT)
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert out["ok"] is True and out["success"] is True
+    assert out["fresh_session"] is True and out["kept"] is False
+    assert out["emacs_version"]
+    assert out["passed"] == 10 and out["failed"] == 0
+    assert out["skipped"] == 2 and out["not_run"] == 0
+    statuses = [s["status"] for s in out["steps"]]
+    assert statuses.count("skipped") == 2
+    assert all(s["status"] in ("ok", "skipped") for s in out["steps"])
+    # Fresh session torn down: nothing left running.
+    assert running_run_sessions() == []
+    # The sandbox (with its transcript) is kept on disk for forensics.
+    assert os.path.isdir(out["session_dir"])
+
+
+def test_run_script_failing_assertion(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    script = {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"type": "present"},
+            {"wait": "text", "pattern": "present", "buffer": "*scratch*"},
+            {"assert": {"buffer_contains": "absent-xyzzy"}},
+            {"eval": "(never-runs)"},
+        ],
+    }
+    path = write_script(tmp_path, script)
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert out["ok"] is True  # the run executed; the script failed
+    assert out["success"] is False
+    failed = out["steps"][2]
+    assert failed["status"] == "failed"
+    assert "absent-xyzzy" in failed["error"]
+    # The failed step embeds the state snapshot (existing convention).
+    assert "state" in failed or "screen_tail" in failed
+    assert failed["detail"]["buffer_tail"]
+    assert out["steps"][3]["status"] == "not-run"
+    assert running_run_sessions() == []
+
+
+def test_run_script_failing_step_elisp_error(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"eval": '(error "step boom")'}],
+    })
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["success"] is False
+    failed = out["steps"][0]
+    assert "step boom" in failed["error"]
+    assert failed["detail"]["backtrace"]
+
+
+def test_run_script_keep_and_keep_on_failure(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # --keep on success.
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"eval": "(+ 1 1)"}],
+    }, "keep.json")
+    code = cli.main(["--json", "run", path, "--keep"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["kept"] is True
+    name = out["session"]
+    assert S.load_session(name).is_alive()
+    assert cli.main(["--json", "stop", name]) == 0
+    capsys.readouterr()
+    # --keep-on-failure keeps only failing runs.
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"assert": {"eval": "nil"}}],
+    }, "keepfail.json")
+    code = cli.main(["--json", "run", path, "--keep-on-failure"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["kept"] is True
+    name = out["session"]
+    assert S.load_session(name).is_alive()
+    assert cli.main(["--json", "stop", name]) == 0
+    capsys.readouterr()
+
+
+def test_run_script_against_existing_session(
+        sess: S.Session, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    path = write_script(tmp_path, {
+        # The session config is ignored when -s targets an existing session.
+        "session": {"config": "minimal", "size": "100x44"},
+        "steps": [
+            {"eval": '(progn (switch-to-buffer "*scratch*") (erase-buffer))'},
+            {"type": "in-existing"},
+            {"wait": "text", "pattern": "in-existing", "buffer": "*scratch*"},
+        ],
+    }, "existing.json")
+    code = cli.main(["--json", "-s", NAME, "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["success"] is True
+    assert out["fresh_session"] is False and out["session"] == NAME
+    # Nothing torn down: the session is still ours and alive.
+    assert sess.is_alive()
+    assert [sess.cols, sess.rows] == [80, 24]  # config block was ignored
+
+
+def test_run_script_test_and_lint_steps(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    fixture = tmp_path / "rcfix-tests.el"
+    fixture.write_text(
+        ";;; rcfix-tests.el --- fixture -*- lexical-binding: t; -*-\n"
+        "(require 'ert)\n"
+        "(ert-deftest rcfix-pass () (should t))\n"
+        "(ert-deftest rcfix-fail () (should (= 1 2)))\n"
+        "(provide 'rcfix-tests)\n;;; rcfix-tests.el ends here\n",
+        encoding="utf-8")
+    lint_dirty = tmp_path / "rcdirty.el"
+    lint_dirty.write_text(
+        ";;; rcdirty.el --- fixture -*- lexical-binding: t; -*-\n"
+        "(defun rcdirty-f () (setq rcdirty-free 1))\n",
+        encoding="utf-8")
+    # Relative paths resolve against the script's directory.
+    script = {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"test": "rcfix-", "load_files": ["rcfix-tests.el"],
+             "allow_unexpected": True},
+            {"assert": {"tests": {"total": 2, "passed": 1, "unexpected": 1,
+                                  "timed-out": False}}},
+            {"lint": ["rcdirty.el"], "allow_findings": True},
+            {"assert": {"lint_clean": False}},
+        ],
+    }
+    path = write_script(tmp_path, script, "quality.json")
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    assert out["success"] is True
+    # Without allow_unexpected, the failing test fails the step.
+    script["steps"] = [{"test": "rcfix-", "load_files": ["rcfix-tests.el"]}]
+    path = write_script(tmp_path, script, "quality-fail.json")
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert "unexpected" in out["steps"][0]["error"]
+    assert out["steps"][0]["detail"]["tests"]["total"] == 2
+
+
+def test_run_script_setup_eval_error_fails_run(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    """REVIEW-phase5 bug 5: a failed session.eval setup form fails the
+    run (exit 1) -- the package under test may not even be loaded."""
+    script = {
+        "session": {"config": "bare", "size": "80x24",
+                    "eval": ['(error "setup exploded")']},
+        "steps": [{"eval": "(+ 1 1)"}],
+    }
+    path = write_script(tmp_path, script, "initerr.json")
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert out["ok"] is True  # the run executed; the script failed
+    assert out["success"] is False
+    assert "setup exploded" in out["error"]
+    assert "setup exploded" in out["init_error"]
+    assert out["steps"][0]["status"] == "not-run"
+    assert running_run_sessions() == []
+    # allow_init_error is the documented escape hatch.
+    script["session"]["allow_init_error"] = True
+    path = write_script(tmp_path, script, "initerr-allowed.json")
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["success"] is True
+    assert "setup exploded" in out["init_error"]
+    assert running_run_sessions() == []
+
+
+def test_run_script_internal_error_keeps_records(
+        sess: S.Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Safety net behind the typed validation: an unexpected controller
+    exception mid-run becomes a failed step (records kept, failures are
+    data) instead of a raw traceback that discards the run."""
+    def boom(*args: object, **kwargs: object) -> None:
+        raise ValueError("synthetic controller bug")
+
+    monkeypatch.setattr(SC.S, "wait_idle", boom)
+    result = SC.run_script(
+        {"steps": [{"eval": "(+ 1 1)"}, {"wait": "idle"},
+                   {"eval": "(+ 2 2)"}]},
+        session=sess)
+    assert result["success"] is False
+    assert result["steps"][0]["status"] == "ok"
+    assert result["steps"][1]["status"] == "failed"
+    assert "internal error" in result["steps"][1]["error"]
+    assert "synthetic controller bug" in result["steps"][1]["error"]
+    assert result["steps"][2]["status"] == "not-run"
+
+
+def test_run_emacs_with_existing_session_is_loud(
+        sess: S.Session, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    path = write_script(tmp_path, {"steps": [{"eval": "(+ 1 1)"}]},
+                        "emacs-vs-s.json")
+    code = cli.main(["--json", "-s", NAME, "run", path,
+                     "--emacs", "/some/emacs"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert "--emacs" in out["error"] and "existing session" in out["error"]
+
+
+def test_run_human_output_streams_steps(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"eval": "(+ 1 1)"},
+                  {"assert": {"eval": "nil"}}],
+    }, "human.json")
+    code = cli.main(["run", path])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "[1/2] eval" in out and "... ok" in out
+    assert "[2/2] assert eval" in out and "FAIL" in out
+    assert "FAIL: 1 passed, 1 failed" in out
+
+
+def test_run_script_deadline(elate_home: str, tmp_path: Path) -> None:
+    script = {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"eval": "(+ 1 1)"}],
+    }
+    result = SC.run_script(script, base_dir=tmp_path,
+                           deadline=time.monotonic() - 1.0)
+    assert result["success"] is False
+    assert "deadline" in result["steps"][0]["error"]
+    assert running_run_sessions() == []
+
+
+# -- export-script --------------------------------------------------------------
+
+def test_export_script_roundtrip(elate_home: str, tmp_path: Path,
+                                 capsys: pytest.CaptureFixture[str]) -> None:
+    name = f"{NAME}exp"
+    assert cli.main(["--json", "start", "--name", name, "--config", "bare",
+                     "--size", "80x24"]) == 0
+    capsys.readouterr()
+    try:
+        for argv in (
+            ["-s", name, "eval",
+             '(progn (switch-to-buffer "*scratch*") (erase-buffer))'],
+            ["-s", name, "keys", "r t RET"],
+            ["-s", name, "type", "exported"],
+            # Switch the current buffer away before the buffer-targeted
+            # wait: on replay, the wait passes only if its --buffer arg
+            # survived the export (REVIEW-phase5 bug 3 -- no more
+            # passing by current-buffer coincidence).
+            ["-s", name, "eval",
+             '(switch-to-buffer (get-buffer-create "elsewhere"))'],
+            ["-s", name, "wait", "text", "exported", "--buffer", "*scratch*"],
+            ["-s", name, "state"],          # observation -> skipped stub
+            ["-s", name, "messages"],       # observation -> skipped stub
+        ):
+            assert cli.main(argv) == 0, argv
+            capsys.readouterr()
+    finally:
+        assert cli.main(["--json", "stop", name]) == 0
+        capsys.readouterr()
+
+    exported = tmp_path / "exported.json"
+    assert cli.main(["-s", name, "export-script", "-o", str(exported)]) == 0
+    human = capsys.readouterr().out
+    assert "Best-effort" in human
+
+    script = json.loads(exported.read_text(encoding="utf-8"))
+    assert script["session"]["config"] == "bare"
+    assert script["session"]["size"] == "80x24"
+    verbs = [next((v for v in SC.VERBS if v in s), None) for s in script["steps"]]
+    assert verbs[:5] == ["eval", "keys", "type", "eval", "wait"]
+    # The wait step's fields survived the export verbatim (bug 3).
+    wait_step = script["steps"][4]
+    assert wait_step["pattern"] == "exported"
+    assert wait_step["buffer"] == "*scratch*"
+    # Observations became skipped assertion stubs.
+    stubs = [s for s in script["steps"] if s.get("skip")]
+    assert len(stubs) == 2
+    assert all(s.get("comment") for s in stubs)
+    assert {"state"} <= set(stubs[0]["assert"])
+    # The exported script replays cleanly in a fresh session.
+    code = cli.main(["--json", "run", str(exported)])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    assert out["success"] is True
+    assert out["skipped"] == 2
+    assert running_run_sessions() == []
+
+
+def test_export_script_stdout_and_no_transcript(
+        elate_home: str, capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["--json", "export-script"])  # needs -s NAME
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "session" in out["error"]
+    code = cli.main(["--json", "-s", "no-such-rec-session", "export-script"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["ok"] is False
+
+
+# -- asciicast recording ----------------------------------------------------------
+
+def test_record_asciicast_end_to_end(sess: S.Session, tmp_path: Path,
+                                     capsys: pytest.CaptureFixture[str]) -> None:
+    cast = tmp_path / "demo.cast"
+    code = cli.main(["--json", "-s", NAME, "record", "start",
+                     "-o", str(cast)])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["recording"] is True
+    assert Path(out["path"]) == cast.resolve()
+    cast = Path(out["path"])
+    assert out["width"] == 80 and out["height"] == 24
+
+    # Double start is rejected while the pipe is open.
+    code = cli.main(["--json", "-s", NAME, "record", "start"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "already active" in out["error"]
+
+    # Drive some output through the pane.
+    sess.semantic().eval_form(
+        '(progn (switch-to-buffer "*scratch*") (erase-buffer))')
+    sess.raw().type_text("cast-marker-123")
+    S.wait_text(sess, "cast-marker-123", buffer="*scratch*", timeout=10.0)
+
+    code = cli.main(["--json", "-s", NAME, "record", "status"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["recording"] is True
+
+    # Let redisplay output drain through the pipe before stopping.
+    S.wait_idle(sess, timeout=5.0)
+    code = cli.main(["--json", "-s", NAME, "record", "stop"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["recording"] is False
+    assert out["events"] >= 2  # initial screen + at least one output chunk
+
+    # Validate the asciicast v2 file.
+    lines = cast.read_text(encoding="utf-8").splitlines()
+    header = json.loads(lines[0])
+    assert header["version"] == 2
+    assert header["width"] == 80 and header["height"] == 24
+    assert isinstance(header["timestamp"], int)
+    events = [json.loads(ln) for ln in lines[1:]]
+    assert events, "no events recorded"
+    times = [e[0] for e in events]
+    assert all(isinstance(t, (int, float)) for t in times)
+    assert times == sorted(times), "timestamps must be monotonic"
+    assert all(e[1] == "o" and isinstance(e[2], str) for e in events)
+    # The first event replays the initial screen (escape-coded).
+    assert events[0][0] == 0.0
+    assert "\x1b[" in events[0][2]
+    # The typed marker crossed the pane and was captured.
+    assert "cast-marker-123" in "".join(e[2] for e in events)
+
+    # Stop again: no active recording.
+    code = cli.main(["--json", "-s", NAME, "record", "stop"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "no recording" in out["error"]
+    # No stray state in the sandbox.
+    assert not (sess.dir / "record.json").exists()
+
+
+def test_record_rejects_gui_session(tmp_path: Path) -> None:
+    fake = S.Session(
+        name="recgui", session_dir=str(tmp_path / "recgui"), emacs="emacs",
+        emacsclient="emacsclient", config="bare", cols=80, rows=24,
+        created_at=0.0, ui="gui",
+    )
+    with pytest.raises(ElateError, match="snap"):
+        R.start_recording(fake)
+
+
+def test_record_output_flag_only_for_start(sess: S.Session,
+                                           capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["--json", "-s", NAME, "record", "stop", "-o", "x.cast"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "start" in out["error"]
+
+
+def test_record_unicode_output(sess: S.Session, tmp_path: Path,
+                               capsys: pytest.CaptureFixture[str]) -> None:
+    """Multibyte output through the pipe helper: the incremental decoder
+    must never produce U+FFFD even when redisplay floods the pipe."""
+    cast = tmp_path / "uni.cast"
+    assert cli.main(["--json", "-s", NAME, "record", "start",
+                     "-o", str(cast)]) == 0
+    capsys.readouterr()
+    sess.semantic().eval_form(
+        '(progn (switch-to-buffer "*scratch*") (erase-buffer)'
+        ' (dotimes (_ 20) (insert "\U0001f680 ünïcödé '
+        '☪︎ 你好\n")))')
+    S.wait_text(sess, "ünïcödé", buffer="*scratch*", timeout=10.0)
+    S.wait_idle(sess, timeout=5.0)
+    code = cli.main(["--json", "-s", NAME, "record", "stop"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["events"] >= 2
+    lines = cast.read_text(encoding="utf-8").splitlines()
+    events = [json.loads(ln) for ln in lines[1:]]  # strict parse
+    payload = "".join(e[2] for e in events)
+    assert "�" not in payload, "replacement char: decoder split a rune"
+    assert "\U0001f680" in payload  # a single codepoint cannot be split
+    times = [e[0] for e in events]
+    assert times == sorted(times)
+
+
+def test_record_stop_with_vanished_cast(sess: S.Session, tmp_path: Path,
+                                        capsys: pytest.CaptureFixture[str]) -> None:
+    """REVIEW-phase5 bug 4: a deleted cast file must not wedge stop with
+    the state file stuck -- stop degrades to events=0 plus a note."""
+    cast = tmp_path / "vanish.cast"
+    assert cli.main(["--json", "-s", NAME, "record", "start",
+                     "-o", str(cast)]) == 0
+    capsys.readouterr()
+    cast.unlink()
+    code = cli.main(["--json", "-s", NAME, "record", "stop"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["recording"] is False
+    assert out["events"] == 0
+    assert "cannot read cast file" in out["note"]
+    assert not (sess.dir / "record.json").exists()  # state cleared
+    # The session is fully recoverable: stop again says "no recording",
+    # and a fresh start/stop cycle works.
+    code = cli.main(["--json", "-s", NAME, "record", "stop"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "no recording" in out["error"]
+    assert cli.main(["--json", "-s", NAME, "record", "start"]) == 0
+    capsys.readouterr()
+    code = cli.main(["--json", "-s", NAME, "record", "stop"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and "note" not in out
+
+
+def _wait_pane_dead(sess: S.Session, timeout: float = 10.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline and sess.raw().is_pane_alive():
+        time.sleep(0.1)
+    assert not sess.raw().is_pane_alive()
+
+
+def _wait_helper_gone(pid: int, identity: str | None,
+                      timeout: float = 5.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline and gui.pid_alive(pid, identity, "python"):
+        time.sleep(0.1)
+    assert not gui.pid_alive(pid, identity, "python"), \
+        f"recorder helper {pid} is still running"
+
+
+def test_record_survives_emacs_crash(elate_home: str, tmp_path: Path,
+                                     capsys: pytest.CaptureFixture[str]) -> None:
+    """REVIEW-phase5 bug 2: a SIGKILLed Emacs leaves a dead-but-kept
+    pane with the pipe attached. status must report the recording as
+    over (stale), stop must reap the helper and finalize the cast."""
+    name = f"{NAME}crash"
+    crash = S.start_session(name, config="bare", cols=80, rows=24)
+    try:
+        cast = tmp_path / "crash.cast"
+        assert cli.main(["--json", "-s", name, "record", "start",
+                         "-o", str(cast)]) == 0
+        capsys.readouterr()
+        st = json.loads((crash.dir / "record.json").read_text())
+        assert st["helper_pid"], "helper pid must be recorded at start"
+        assert gui.pid_alive(st["helper_pid"], st["helper_identity"], "python")
+        crash.semantic().eval_form(
+            '(progn (switch-to-buffer "*scratch*") (erase-buffer))')
+        crash.raw().type_text("pre-crash-marker")
+        S.wait_text(crash, "pre-crash-marker", buffer="*scratch*", timeout=10.0)
+        S.wait_idle(crash, timeout=5.0)
+
+        os.kill(crash.emacs_pid, signal.SIGKILL)
+        _wait_pane_dead(crash)
+
+        # status: the dead pane means the recording is over, not active.
+        code = cli.main(["--json", "-s", name, "record", "status"])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 0
+        assert out["recording"] is False and out["stale"] is True
+        assert "died mid-recording" in out["note"]
+
+        # stop: finalizes the cast, clears the state, reaps the helper.
+        code = cli.main(["--json", "-s", name, "record", "stop"])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 0 and out["recording"] is False
+        assert out["events"] >= 1
+        assert not (crash.dir / "record.json").exists()
+        _wait_helper_gone(st["helper_pid"], st["helper_identity"])
+        # The cast holds everything up to the crash and stays valid.
+        text = cast.read_text(encoding="utf-8")
+        assert "pre-crash-marker" in text
+        assert json.loads(text.splitlines()[0])["version"] == 2
+    finally:
+        S.stop_session(name)
+
+
+def test_stop_session_reaps_orphan_recorder(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    """`elate stop` must uphold the no-stray-recorder guarantee even for
+    a recording orphaned by a crashed Emacs (REVIEW-phase5 bug 2)."""
+    name = f"{NAME}orph"
+    sess2 = S.start_session(name, config="bare", cols=80, rows=24)
+    try:
+        assert cli.main(["--json", "-s", name, "record", "start",
+                         "-o", str(tmp_path / "orphan.cast")]) == 0
+        capsys.readouterr()
+        st = json.loads((sess2.dir / "record.json").read_text())
+        assert st["helper_pid"]
+        os.kill(sess2.emacs_pid, signal.SIGKILL)
+        _wait_pane_dead(sess2)
+    finally:
+        S.stop_session(name)
+    _wait_helper_gone(st["helper_pid"], st["helper_identity"])
+
+
+# -- snap series ---------------------------------------------------------------
+
+def test_snap_series_tty(sess: S.Session,
+                         capsys: pytest.CaptureFixture[str]) -> None:
+    sess.semantic().eval_form(
+        '(progn (switch-to-buffer "*scratch*") (erase-buffer)'
+        ' (insert "snap-marker"))')
+    code = cli.main(["--json", "-s", NAME, "snap", "start",
+                     "--interval", "0.2"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["snapping"] is True
+    snap_dir = Path(out["dir"])
+    assert out["format"] == "txt"
+
+    # Second start is rejected while the snapper lives.
+    code = cli.main(["--json", "-s", NAME, "snap", "start"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "already running" in out["error"]
+
+    time.sleep(1.5)
+    code = cli.main(["--json", "-s", NAME, "snap", "status"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["snapping"] is True
+    assert out["frames"] >= 2
+
+    code = cli.main(["--json", "-s", NAME, "snap", "stop"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["stopped"] is True
+    frames = out["frames"]
+    assert frames >= 2
+
+    manifest = json.loads((snap_dir / "manifest.json").read_text())
+    assert manifest["session"] == NAME and manifest["format"] == "txt"
+    assert manifest["frames_total"] == len(manifest["frames"]) == frames
+    elapsed = [f["elapsed"] for f in manifest["frames"]]
+    assert elapsed == sorted(elapsed)
+    files = sorted(p.name for p in snap_dir.glob("frame-*.txt"))
+    assert files == [f["file"] for f in manifest["frames"]]
+    assert "snap-marker" in (snap_dir / files[0]).read_text(encoding="utf-8")
+
+    # Stop is idempotent (exit 0, structured "nothing to do").
+    code = cli.main(["--json", "-s", NAME, "snap", "stop"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["stopped"] is False
+    # No snapper process is left behind.
+    assert not (sess.dir / "snap.json").exists()
+
+
+def test_snap_ansi_frames(sess: S.Session, tmp_path: Path,
+                          capsys: pytest.CaptureFixture[str]) -> None:
+    out_dir = tmp_path / "ansi-frames"
+    code = cli.main(["--json", "-s", NAME, "snap", "start",
+                     "--interval", "0.2", "--ansi", "-o", str(out_dir)])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["format"] == "ansi"
+    time.sleep(0.7)
+    code = cli.main(["--json", "-s", NAME, "snap", "stop"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["frames"] >= 1
+    first = next(iter(sorted(out_dir.glob("frame-*.txt"))))
+    assert "\x1b[" in first.read_text(encoding="utf-8")
+
+
+def test_snap_interval_bounds(sess: S.Session,
+                              capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["--json", "-s", NAME, "snap", "start",
+                     "--interval", "0.001"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "interval" in out["error"]
+
+
+def test_snap_write_failure_ends_series_cleanly(
+        sess: S.Session, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    """REVIEW-phase5 R2: an OSError on a frame write (outdir made
+    unwritable mid-series) ends the series cleanly -- no traceback, no
+    crash-loop -- and stop stays idempotent."""
+    out_dir = tmp_path / "rofail"
+    code = cli.main(["--json", "-s", NAME, "snap", "start",
+                     "--interval", "0.2", "-o", str(out_dir)])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0
+    deadline = time.time() + 10.0
+    while time.time() < deadline and not list(out_dir.glob("frame-*.txt")):
+        time.sleep(0.1)
+    assert list(out_dir.glob("frame-*.txt")), "no frame ever appeared"
+    os.chmod(out_dir, 0o555)  # next frame write fails with EACCES
+    try:
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            code = cli.main(["--json", "-s", NAME, "snap", "status"])
+            status = json.loads(capsys.readouterr().out)
+            if not status["snapping"]:
+                break
+            time.sleep(0.2)
+        assert status["snapping"] is False and status["stale"] is True
+    finally:
+        os.chmod(out_dir, 0o755)
+    log = (out_dir / "snapper.log").read_text(encoding="utf-8")
+    assert "failed" in log
+    assert "Traceback" not in log, "snapper died with an unhandled OSError"
+    code = cli.main(["--json", "-s", NAME, "snap", "stop"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["stopped"] is True
+
+
+@pytest.mark.skipif(
+    not (sys.platform == "darwin"
+         or (sys.platform.startswith("linux") and os.environ.get("DISPLAY"))),
+    reason="GUI snap needs a display",
+)
+def test_snap_series_gui(elate_home: str,
+                         capsys: pytest.CaptureFixture[str]) -> None:
+    from elate import screenshot as shot
+
+    if shot.screen_recording_allowed() is False:
+        pytest.skip("Screen Recording permission not granted")
+    name = f"{NAME}g"
+    started = S.start_session(name, config="bare", cols=80, rows=24, ui="gui")
+    try:
+        code = cli.main(["--json", "-s", name, "snap", "start",
+                         "--interval", "0.3"])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 0 and out["format"] == "png"
+        snap_dir = Path(out["dir"])
+        time.sleep(1.5)
+        code = cli.main(["--json", "-s", name, "snap", "stop"])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 0 and out["frames"] >= 1
+        pngs = sorted(snap_dir.glob("frame-*.png"))
+        assert pngs
+        assert pngs[0].read_bytes()[:8] == shot.PNG_MAGIC
+    finally:
+        del started
+        S.stop_session(name)
+
+
+# -- matrix --------------------------------------------------------------------
+
+def test_matrix_of_one(elate_home: str, tmp_path: Path,
+                       capsys: pytest.CaptureFixture[str]) -> None:
+    emacs = shutil.which("emacs")
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"eval": "(emacs-version)"},
+            {"assert": {"eval": "(>= emacs-major-version 27)"}},
+        ],
+    }, "matrix.json")
+    code = cli.main(["--json", "matrix", "--emacs", emacs, "--", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    assert out["success"] is True
+    assert len(out["results"]) == 1
+    entry = out["results"][0]
+    assert entry["success"] is True
+    assert entry["version"]  # e.g. "31.0.90"
+    assert entry["passed"] == 2 and entry["failed"] == 0
+    assert running_run_sessions() == []
+    # Human output renders a summary table.
+    code = cli.main(["matrix", "--emacs", emacs, path])
+    human = capsys.readouterr().out
+    assert code == 0
+    assert "1/1 version(s) passed" in human
+
+
+def test_matrix_failure_and_bad_binary(elate_home: str, tmp_path: Path,
+                                       capsys: pytest.CaptureFixture[str]) -> None:
+    emacs = shutil.which("emacs")
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"assert": {"eval": "nil"}}],
+    }, "matrix-fail.json")
+    code = cli.main(["--json", "matrix", "--emacs", emacs, path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["success"] is False
+    assert out["results"][0]["failed_step"]
+    assert running_run_sessions() == []
+    # A non-executable --emacs fails fast, before any session boots.
+    code = cli.main(["--json", "matrix", "--emacs", "/no/such/emacs", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "not an executable" in out["error"]
+    # No binaries at all is a usage-style error.
+    code = cli.main(["--json", "matrix", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "--emacs" in out["error"]
+
+
+def test_matrix_bare_name_and_dedup(elate_home: str, tmp_path: Path,
+                                    capsys: pytest.CaptureFixture[str]) -> None:
+    """REVIEW-phase5 bug 6: bare PATH names ('emacs') must work like on
+    every other --emacs surface, and spellings of the same binary
+    dedup to one run."""
+    real = shutil.which("emacs")
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"assert": {"eval": "(stringp (emacs-version))"}}],
+    }, "bare-name.json")
+    code = cli.main(["--json", "matrix", "--emacs", f"emacs,{real}", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    assert out["success"] is True
+    assert len(out["results"]) == 1  # bare name and abs path dedup'd
+    assert out["results"][0]["emacs"] == real
+    assert out["results"][0]["version"]
+    assert running_run_sessions() == []
+
+
+def test_matrix_wrapper_binary_and_broken_binary(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    """Pin two claims that had no coverage: a wrapper binary actually
+    reaches the spawned session (override plumbing), and one broken
+    binary records a failed entry without aborting the rest."""
+    real = shutil.which("emacs")
+    wrapper = tmp_path / "emacs-wrapper"
+    wrapper.write_text(f'#!/bin/sh\nexec {real} "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
+    broken = tmp_path / "emacs-broken"
+    broken.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+    broken.chmod(0o755)
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"assert": {"eval": "(>= emacs-major-version 27)"}}],
+    }, "wrapper.json")
+    code = cli.main(["--json", "matrix",
+                     "--emacs", f"{broken},{wrapper}", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["success"] is False
+    assert len(out["results"]) == 2
+    broken_entry, wrapper_entry = out["results"]
+    assert broken_entry["emacs"] == str(broken)
+    assert broken_entry["success"] is False and broken_entry["error"]
+    # The broken binary did not abort the rest: the wrapper ran and the
+    # override reached the session (version reported through it).
+    assert wrapper_entry["emacs"] == str(wrapper)
+    assert wrapper_entry["success"] is True
+    assert wrapper_entry["version"]
+    assert running_run_sessions() == []

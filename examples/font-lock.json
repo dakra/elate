@@ -1,0 +1,15 @@
+{
+  "name": "verify font-lock faces",
+  "comment": "Fontify a fixture buffer and assert the faces structurally. Interactively, `elate -s N buffer demo.el --props` and `elate -s N faces-at LINE:COL --buffer demo.el` show the same facts.",
+  "session": {"config": "minimal", "size": "100x30"},
+  "steps": [
+    {"eval": "(with-current-buffer (get-buffer-create \"demo.el\") (erase-buffer) (emacs-lisp-mode) (insert \"(defun demo-add (x)\\n  \\\"Add one to X.\\\"\\n  (1+ x))\\n\") (font-lock-ensure) t)",
+     "comment": "fixture: a fontified elisp buffer (never displayed -- font-lock-ensure still fontifies it)"},
+    {"assert": {"eval": "(with-current-buffer \"demo.el\" (eq (get-text-property 2 'face) 'font-lock-keyword-face))"},
+     "comment": "'defun' wears the keyword face"},
+    {"assert": {"eval": "(with-current-buffer \"demo.el\" (eq (get-text-property 8 'face) 'font-lock-function-name-face))"},
+     "comment": "'demo-add' wears the function-name face"},
+    {"assert": {"eval": "(with-current-buffer \"demo.el\" (save-excursion (goto-char (point-min)) (forward-line 1) (memq (get-text-property (+ (point) 2) 'face) '(font-lock-doc-face font-lock-string-face))))"},
+     "comment": "the docstring wears a doc/string face"}
+  ]
+}

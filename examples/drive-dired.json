@@ -1,0 +1,21 @@
+{
+  "name": "drive dired interactively",
+  "comment": "The start -> act -> wait -> observe loop against a built-in package (works offline). $HOME is the sandbox's fake home, so the fixture files never touch the real one.",
+  "session": {"config": "minimal", "size": "100x30"},
+  "steps": [
+    {"eval": "(progn (make-directory \"~/demo\" t) (with-temp-file \"~/demo/notes.txt\" (insert \"remember the milk\")) (with-temp-file \"~/demo/todo.org\" (insert \"* TODO buy milk\")) t)",
+     "comment": "fixture files inside the sandbox home"},
+    {"eval": "(dired \"~/demo\")", "comment": "act: open dired"},
+    {"wait": "text", "pattern": "notes\\.txt", "comment": "wait: the listing rendered"},
+    {"assert": {"state": {"major-mode": "dired-mode"}}},
+    {"assert": {"buffer_contains": "todo.org"}},
+    {"keys": "C-x C-j", "skip": true,
+     "comment": "real keys work too; this script drives point with dired's own commands instead:"},
+    {"eval": "(dired-goto-file (expand-file-name \"~/demo/notes.txt\"))",
+     "comment": "act: move point onto the file"},
+    {"keys": "RET", "comment": "act: visit it, exactly like a user pressing RET"},
+    {"wait": "text", "pattern": "remember the milk", "buffer": "notes.txt"},
+    {"assert": {"state": {"buffer": "notes.txt"}},
+     "comment": "observe: dired visited the file"}
+  ]
+}

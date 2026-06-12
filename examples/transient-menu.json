@@ -1,0 +1,19 @@
+{
+  "name": "test a transient menu",
+  "comment": "Define a tiny transient, open it, see it as a popup, press a suffix key, assert the effect. transient ships with Emacs >= 28.",
+  "session": {"config": "minimal", "size": "100x30"},
+  "steps": [
+    {"eval": "(progn (require 'transient) (transient-define-prefix demo-transient () [\"Demo actions\" (\"u\" \"upcase word\" upcase-word) (\"k\" \"kill line\" kill-line)]) t)",
+     "comment": "define the menu under test"},
+    {"eval": "(progn (switch-to-buffer \"*scratch*\") (erase-buffer) (insert \"hello world\") (goto-char (point-min)) t)",
+     "comment": "fixture buffer; point at start of 'hello'"},
+    {"eval": "(demo-transient)", "comment": "open the menu"},
+    {"assert": {"popup": "transient"}, "comment": "the menu is visible"},
+    {"keys": "u", "comment": "trigger the 'upcase word' suffix"},
+    {"wait": "idle"},
+    {"assert": {"buffer_contains": "HELLO world"}},
+    {"assert": {"popup": true}, "skip": true,
+     "comment": "the menu closed itself after the suffix ran; asserting absence isn't a kind, so check via state instead:"},
+    {"assert": {"eval": "(not (and (boundp 'transient--window) transient--window (window-live-p transient--window)))"}}
+  ]
+}

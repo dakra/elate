@@ -1,0 +1,16 @@
+{
+  "name": "clean-install a package and verify its autoloads",
+  "comment": "config clean-install installs ./elpkg.el for real (package-install-file into a sandbox-local elpa/) instead of load-path injection -- autoload cookies, Package-Requires, and byte-compilation are exercised like a user install. Relative paths resolve against this script's directory.",
+  "session": {"config": "clean-install", "size": "90x24",
+              "load": ["./elpkg.el"]},
+  "steps": [
+    {"assert": {"eval": "(and (fboundp 'elpkg-greet) (commandp 'elpkg-greet) (autoloadp (symbol-function 'elpkg-greet)) (not (featurep 'elpkg)))"},
+     "comment": "the command exists as an autoload BEFORE the feature was ever required -- the thing load-path injection cannot verify"},
+    {"keys": "M-x elpkg-greet RET", "comment": "run it like a user would"},
+    {"wait": "text", "pattern": "elpkg says hi"},
+    {"assert": {"eval": "(featurep 'elpkg)"},
+     "comment": "invoking the autoload loaded the (byte-compiled) installed copy"},
+    {"assert": {"eval": "(string-prefix-p (expand-file-name \"elpa\" elate-session-dir) (locate-library \"elpkg\"))"},
+     "comment": "it resolves from the sandbox-local package-user-dir, not the source tree"}
+  ]
+}

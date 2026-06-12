@@ -1,0 +1,28 @@
+[project]
+name = "elate"
+version = "0.1.0"
+description = "Emacs Lisp Automation Tool: spawn and drive sandboxed, observable Emacs sessions"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+dependencies = [
+    "anyio>=4",
+    "mcp>=1.10,<2",
+    "pyobjc-framework-Quartz>=10; sys_platform == 'darwin'",
+]
+
+[project.scripts]
+elate = "elate.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/elate"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
