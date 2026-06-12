@@ -1,15 +1,33 @@
 [project]
 name = "elate"
-version = "0.1.0"
+version = "0.2.0"
 description = "Emacs Lisp Automation Tool: spawn and drive sandboxed, observable Emacs sessions"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "GPL-3.0-or-later" }
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Daniel Kraus", email = "daniel@kraus.my" }]
+keywords = ["emacs", "elisp", "testing", "automation", "mcp", "tmux", "ert"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Text Editors :: Emacs",
+]
 dependencies = [
     "anyio>=4",
     "mcp>=1.10,<2",
     "pyobjc-framework-Quartz>=10; sys_platform == 'darwin'",
 ]
+
+[project.urls]
+Homepage = "https://github.com/dakra/elate"
+Repository = "https://github.com/dakra/elate"
+Changelog = "https://github.com/dakra/elate/blob/main/CHANGELOG.md"
 
 [project.scripts]
 elate = "elate.cli:main"

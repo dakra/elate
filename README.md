@@ -1,11 +1,13 @@
 # elate — Emacs Lisp Automation Tool
 
+[![CI](https://github.com/dakra/elate/actions/workflows/ci.yml/badge.svg)](https://github.com/dakra/elate/actions/workflows/ci.yml)
+
 Spawn disposable, sandboxed Emacs sessions — terminal (tmux-hosted TTY) or
 windowed GUI — drive them with keys, mouse, and elisp, and observe the
 result as text, structured data, or PNG screenshots. Built for test-driving
 Emacs packages interactively — the things `emacs --batch` + ERT can't see.
-See `PLAN.md` for the design and `CHANGELOG.md` for what each phase added;
-ready-to-run walkthroughs live in [Recipes](#recipes) and `examples/`.
+See `CHANGELOG.md` for what each release added; ready-to-run walkthroughs
+live in [Recipes](#recipes) and `examples/`.
 
 ## Requirements
 
@@ -18,6 +20,16 @@ ready-to-run walkthroughs live in [Recipes](#recipes) and `examples/`.
 
 ## Install
 
+elate is on PyPI as [`elate`](https://pypi.org/project/elate/):
+
+```sh
+uvx elate --help          # no install — uvx runs it straight from PyPI
+pipx run elate --help     # same, via pipx
+pip install elate         # or install it like any Python package
+```
+
+For development, from a checkout:
+
 ```sh
 uv sync          # development
 uv run elate --help
@@ -27,6 +39,10 @@ uv tool install .
 ```
 
 ## Quick start
+
+The examples below assume `elate` is on PATH (`pip install elate` or
+`uv tool install elate`); if you run it without installing, prepend the
+runner — `uvx elate start …` / `pipx run elate start …`.
 
 ```sh
 # Start a sandboxed TTY Emacs (fresh fake $HOME, generated init, own tmux server)
@@ -65,6 +81,10 @@ elate -s demo wait text 'Compilation finished' --buffer '*compilation*' --timeou
 elate -s demo wait prompt
 
 elate stop demo
+
+# Stopped sandboxes stay behind for their transcripts; delete them when
+# done (purge never touches a running session)
+elate purge demo          # or: elate purge --all
 ```
 
 Notes:
@@ -369,7 +389,7 @@ covered explicitly: every step accepts a `"comment"` key, and
 
 ```sh
 elate run scenario.json             # fresh session, steps, assertions, teardown
-elate run scenario.json --json      # per-step results, timings, snapshots
+elate --json run scenario.json      # per-step results, timings, snapshots
 elate run scenario.json --keep      # keep the session afterwards
 elate run scenario.json --keep-on-failure   # keep it only when it failed
 elate run scenario.json --emacs /opt/emacs-29/bin/emacs
@@ -524,7 +544,7 @@ jobs:
           version: ${{ matrix.emacs_version }}
       - run: sudo apt-get update && sudo apt-get install -y tmux
       - uses: astral-sh/setup-uv@v5
-      - run: uvx --from git+https://github.com/you/elate elate run scenario.json --json
+      - run: uvx --from git+https://github.com/you/elate elate --json run scenario.json
 ```
 
 Notes for CI: TTY sessions need only `tmux`; export a UTF-8 locale
@@ -634,18 +654,196 @@ clean-install variant of this loop (install a package for real, then
 drive its autoloaded entry point), see `examples/clean-install.json`
 and the [Clean-install sessions](#clean-install-sessions) section.
 
-## MCP server
+## Using elate from AI harnesses
 
-`elate mcp` serves all of the above as MCP tools over stdio, for AI
-harnesses like Claude Code. Register it:
+elate is built to be driven by AI agents. Pick the integration by harness:
+
+- **Claude Code** → install the [plugin](#claude-code-plugin) (two
+  commands; bundles the Agent Skill and the MCP server — everything below
+  in one step).
+- **Any MCP-capable harness** (Codex CLI, Cursor, Zed, Gemini CLI, Claude
+  Desktop, …) → register the [MCP server](#mcp-server): one line, and the
+  server command is the same `uvx elate mcp` everywhere.
+- **Any harness with shell access** → the plain CLI is the full feature
+  set; `AGENTS.md` at the repo root is the ~40-line distillation most
+  agents-md-aware tools pick up automatically, and the
+  [Agent Skill](#agent-skill) files teach the complete workflow.
+
+### Claude Code plugin
+
+The repo doubles as a Claude Code plugin (and hosts its own marketplace),
+bundling the Agent Skill and the MCP server below. Install in two commands:
 
 ```sh
-# from a checkout
-claude mcp add elate -- uv run --directory /path/to/elate elate mcp
-
-# or, after `uv tool install .`
-claude mcp add elate -- elate mcp
+claude plugin marketplace add dakra/elate
+claude plugin install elate
 ```
+
+You get:
+
+- the **skill**, namespaced as `/elate:elate` — triggers organically
+  whenever the model needs to test-drive or debug Emacs Lisp;
+- the **MCP server**, auto-registered from the plugin's `.mcp.json` as
+  `uvx elate mcp` (always the latest PyPI release — the plugin clone stays
+  a thin config layer with no environment of its own). The first connect
+  may take a few seconds while `uvx` resolves elate from PyPI on a cold
+  cache;
+- the **`emacs-tester` subagent** (`agents/emacs-tester.md`, invokable as
+  `elate:emacs-tester`) — a test pilot preloaded with the skill, for
+  delegating long interactive test-drives out of the main context; it
+  drives elate in its own context window and returns condensed findings
+  instead of a wall of transcripts;
+- **leftover-session hooks** (`hooks/check-running.sh`): a SessionEnd
+  hook warns when you leave a Claude Code session while elate sessions
+  are still running (names + the stop command), and a SessionStart hook
+  injects the same fact as context at the next session start so the
+  model can deal with the leftovers. Both are best-effort and
+  fail-silent: they never delay or break a session when elate isn't
+  installed or nothing is running — stopped sandboxes are inert and
+  don't warrant a warning. One blind spot by design: the hooks look up
+  sessions via `elate` on PATH (falling back to the offline uv tool
+  cache), so sessions driven exclusively through `uv run` inside a
+  checkout are invisible to them.
+
+Two notes on `.mcp.json`:
+
+- **Dual role:** because the repo root is also the plugin root, the same
+  `.mcp.json` acts as *project-scope* MCP config for anyone opening this
+  repo in Claude Code. That is fine — project-scope servers always require
+  per-user approval before they run. Two consequences: the project-scope
+  server runs the **latest PyPI release, not your checkout** — when hacking
+  on elate, register the checkout command from the
+  [MCP server](#mcp-server) section instead. And a maintainer with the
+  plugin installed who opens this repo gets **two** elate servers (project
+  `elate` plus `plugin:elate:elate`, 44 tools with ambiguous names) —
+  approve/enable at most one.
+- **Offline / pinned setups:** to run the MCP server from the plugin clone
+  itself instead of PyPI, change the server entry to
+  `uv run --directory ${CLAUDE_PLUGIN_ROOT} elate mcp`
+  (JSON has no comments, so this fallback lives here).
+
+**Pinned (reproducible) installs:** `marketplace add dakra/elate` serves
+GitHub HEAD, updating whenever the version label bumps. To pin instead,
+add the marketplace at a release tag — releases are tagged
+`elate--v{version}` (see [Publishing](#publishing-to-pypi-maintainer)),
+and because the plugin's source is the marketplace clone itself
+(`"source": "./"`), the installed payload is exactly that tag's tree:
+
+```sh
+# X.Y.Z = a released version (git tag -l 'elate--v*' lists them)
+claude plugin marketplace add dakra/elate@elate--vX.Y.Z
+claude plugin install elate
+```
+
+Marketplace sources accept a branch or tag (not a raw commit SHA) two
+ways: `@ref` appended to the GitHub shorthand as above, or `#ref` appended
+to a full git URL
+(`claude plugin marketplace add 'https://github.com/dakra/elate.git#elate--vX.Y.Z'`).
+A tag pin is the reproducible form since tags don't move.
+
+Local development: `claude --plugin-dir .` loads the checkout as the
+plugin in a session; `claude plugin validate .` checks the marketplace
+manifest and `claude plugin validate .claude-plugin/plugin.json` the
+plugin manifest (add `--strict` to fail on warnings — CI runs both calls
+with it).
+
+### Agent Skill
+
+`skills/elate/` is an Agent Skill that teaches an AI harness to drive the
+elate CLI well (the act → wait → observe loop, key-delivery decision tree,
+fresh-session rules, scenario scripts) at near-zero ambient token cost:
+`SKILL.md` plus progressively-disclosed `REFERENCE.md` (generated from the
+CLI — CI fails on drift), `RECIPES.md`, and `SCRIPTING.md`. Install it
+standalone by copying or symlinking:
+
+```sh
+ln -s "$(pwd)/skills/elate" ~/.claude/skills/elate
+```
+
+Harnesses without skill support get the same distillation from `AGENTS.md`
+at the repo root.
+
+### MCP server
+
+`elate mcp` serves all of the above as typed MCP tools over stdio — the
+right fit for harnesses without shell access, and for GUI screenshots
+returned inline as images. The server command is the same in every
+harness: `uvx elate mcp`. Registration per harness:
+
+**Claude Code** ([MCP docs](https://code.claude.com/docs/en/mcp)) —
+plugin users skip this, the plugin already registers the server:
+
+```sh
+claude mcp add elate -- uvx elate mcp
+```
+
+**Claude Desktop**
+([MCP docs](https://modelcontextprotocol.io/quickstart/user)) — the
+canonical no-shell-access case. Settings → Developer → Edit Config opens
+`claude_desktop_config.json`
+(macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`,
+Windows: `%APPDATA%\Claude\claude_desktop_config.json`); add the server
+and restart the app:
+
+```json
+{
+  "mcpServers": {
+    "elate": { "command": "uvx", "args": ["elate", "mcp"] }
+  }
+}
+```
+
+**Codex CLI** ([MCP docs](https://developers.openai.com/codex/mcp/)):
+
+```sh
+codex mcp add elate -- uvx elate mcp
+```
+
+or in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.elate]
+command = "uvx"
+args = ["elate", "mcp"]
+```
+
+**Cursor** ([MCP docs](https://cursor.com/docs/context/mcp)) —
+`.cursor/mcp.json` in the project, or `~/.cursor/mcp.json` globally:
+
+```json
+{
+  "mcpServers": {
+    "elate": { "type": "stdio", "command": "uvx", "args": ["elate", "mcp"] }
+  }
+}
+```
+
+**Zed** ([MCP docs](https://zed.dev/docs/ai/mcp)) — `settings.json`:
+
+```json
+{
+  "context_servers": {
+    "elate": { "command": "uvx", "args": ["elate", "mcp"] }
+  }
+}
+```
+
+**Gemini CLI**
+([MCP docs](https://google-gemini.github.io/gemini-cli/docs/tools/mcp-server.html))
+— `gemini mcp add elate uvx elate mcp`, or in `~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "elate": { "command": "uvx", "args": ["elate", "mcp"] }
+  }
+}
+```
+
+Hacking on elate itself? Serve the checkout instead of the PyPI release —
+swap the command for `uv run --directory /path/to/elate elate mcp`
+(e.g. `claude mcp add elate -- uv run --directory /path/to/elate elate mcp`;
+same split across `command`/`args` in the JSON/TOML forms).
 
 Tools (1:1 with the CLI; every response is structured JSON, and error
 responses embed a compact state snapshot so the model sees why):
@@ -728,6 +926,9 @@ Each session gets a sandbox under `~/.cache/elate/sessions/<name>/`
 (`$ELATE_HOME` overrides the base dir) with a fake `home/`, a generated
 `init/` used via `--init-directory`, a `server/` dir holding a private
 server.el socket, and `log/transcript.jsonl` recording every command.
+Stopped sessions keep their sandbox (transcripts outlive the Emacs) until
+`elate purge NAME…`/`elate purge --all` deletes them; purge never removes
+a running session.
 
 TTY Emacs runs `-nw` inside a dedicated tmux server whose socket lives in
 the sandbox (`tmux -S <session_dir>/tmux.sock`), so your own tmux is
@@ -756,3 +957,93 @@ uv run pytest -k kbd           # unit tests only
 ```
 
 The integration tests skip automatically when `emacs` or `tmux` is missing.
+
+## Publishing to PyPI (maintainer)
+
+Releases are published manually — CI never uploads.
+
+> **Release rule:** the Agent Skill (`skills/elate/`) teaches `uvx elate`,
+> i.e. *latest PyPI* — while its REFERENCE.md is generated from HEAD. A
+> merged CLI change is therefore not "done" until the version is bumped
+> and published; otherwise every skill consumer reads docs for a CLI that
+> `uvx` doesn't serve yet. The Claude Code plugin adds two clauses:
+>
+> - The version bump is **three files**: `pyproject.toml`,
+>   `.claude-plugin/plugin.json`, and `.claude-plugin/marketplace.json`
+>   (`test_versions_are_in_sync` fails the suite if they drift).
+> - **Publish to PyPI first, push the bump second.** The plugin
+>   marketplace serves whatever the cloned GitHub HEAD contains and does
+>   no content↔version check at install — the marketplace `version` is a
+>   pure label and the *update gate* (installed plugins only refresh when
+>   it changes). The label stays honest only if the three-file bump and
+>   the PyPI publish both land before the push; anyone installing between
+>   a content push and the next bump gets a mislabeled HEAD snapshot and
+>   no updates until the version string moves. And note the asymmetry:
+>   publishing to PyPI alone updates *nothing* for plugin users — plugin
+>   delivery always requires a push.
+
+```sh
+# 1. Bump the version in pyproject.toml AND .claude-plugin/plugin.json AND
+#    .claude-plugin/marketplace.json (uv run pytest -k versions_are_in_sync
+#    checks); update CHANGELOG.md; re-validate the manifests (CI runs the
+#    same two calls); commit. Do NOT push yet.
+claude plugin validate --strict .
+claude plugin validate --strict .claude-plugin/plugin.json
+
+# 2. Tag the release: cross-checks plugin.json against the marketplace
+#    entry, then creates the elate--v{version} git tag — the ref consumers
+#    pin marketplaces to (see "Pinned installs" in the plugin section).
+#    Refuses on a dirty working tree; --dry-run previews. The tag stays
+#    local until step 6 — if a later step fails, `git tag -d elate--vX.Y.Z`
+#    before retrying (`claude plugin tag` refuses to overwrite an existing
+#    tag).
+claude plugin tag
+
+# 3. Build sdist + wheel, and check the metadata PyPI will validate:
+rm -rf dist && uv build
+uvx twine check dist/*
+
+# 4. Optional dress rehearsal against TestPyPI (needs a test.pypi.org token):
+uv publish --publish-url https://test.pypi.org/legacy/ --token "$TEST_PYPI_TOKEN"
+#    Verify the upload. Two flags are load-bearing: TestPyPI hosts stale
+#    copies of most dependencies, so uv's default first-index strategy can
+#    never resolve them — `unsafe-best-match` lets dependencies fall back
+#    to real PyPI (acceptable here: a manual maintainer action, not a
+#    build). And elate itself must be pinned to the new version, which at
+#    this point exists ONLY on TestPyPI — that pin is what makes this
+#    exercise the upload instead of resolving last release from PyPI.
+uvx --isolated --index https://test.pypi.org/simple/ \
+  --index-strategy unsafe-best-match \
+  --from "elate==$(uv run elate --version | cut -d' ' -f2)" elate --version
+
+# 5. Publish for real (token from pypi.org → Account settings → API tokens;
+#    scope it to the elate project after the first upload):
+uv publish --token "$PYPI_TOKEN"     # or set UV_PUBLISH_TOKEN
+
+# 6. Only now push the bump, tag included — plugin/skill users update from
+#    GitHub HEAD, which must never advertise a version PyPI doesn't serve:
+git push origin main "elate--v$(uv run elate --version | cut -d' ' -f2)"
+```
+
+### Community marketplace submission (optional)
+
+The self-hosted marketplace above is fully self-sufficient; submitting to
+Anthropic's community marketplace is optional and maintainer-initiated.
+When desired:
+
+- Submit via the Console form at
+  [platform.claude.com/plugins/submit](https://platform.claude.com/plugins/submit)
+  (the claude.ai form requires a Team/Enterprise org with directory
+  management access; the Console form does not).
+- Run both `claude plugin validate` calls first — the review pipeline runs
+  the same check, plus automated safety screening.
+- Approved plugins land **pinned to a commit SHA** in
+  [`anthropics/claude-plugins-community`](https://github.com/anthropics/claude-plugins-community)
+  (the catalog syncs nightly, so listing lags approval; Anthropic's CI
+  bumps the pin as new commits are pushed here). Unlike the official
+  marketplace, the community one is not pre-registered — users add it
+  once with `claude plugin marketplace add anthropics/claude-plugins-community`,
+  then install with `claude plugin install elate@claude-community` — the
+  self-hosted marketplace keeps working independently either way.
+- PRs against that repo are closed automatically; everything flows through
+  the submission form.

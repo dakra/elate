@@ -1,0 +1,165 @@
+# elate scenario scripts
+
+A scenario script is a **JSON** file (deliberately not YAML: zero extra
+dependency, every other elate surface already speaks JSON) describing a
+whole interaction — session config, steps, assertions — that `elate run`
+executes against a fresh throwaway session and turns into an exit code.
+That makes a script a regression test and the CI entry point.
+
+```json
+{
+  "name": "my-pkg smoke test",
+  "session": {"ui": "tty", "size": "100x30", "config": "minimal",
+              "load": ["./my-pkg.el"]},
+  "steps": [
+    {"keys": "M-x my-pkg-mode RET"},
+    {"wait": "text", "pattern": "My-Pkg", "buffer": "*scratch*", "timeout": 10},
+    {"type": "hello"},
+    {"assert": {"buffer_contains": "hello"}},
+    {"test": "my-pkg-", "load_files": ["./tests/my-pkg-tests.el"],
+     "allow_unexpected": true},
+    {"assert": {"tests": {"unexpected": 0, "timed-out": false}}},
+    {"lint": ["./my-pkg.el"]},
+    {"assert": {"eval": "(featurep 'my-pkg)"}}
+  ]
+}
+```
+
+Validation is strict and up front: unknown step/assert/session keys, wrong
+value types, bad enum values, out-of-bounds numbers, an option on the wrong
+step kind, or an empty `"steps"` list are loud errors **before anything
+boots**. Unknown *top-level* keys are ignored (metadata like `"name"`,
+`"exported_at"`). Every step additionally accepts `"comment"` (string) and
+`"skip": true`; a step with only a comment is recorded as skipped.
+
+Relative paths (session `load`/`init_file`, test `load_files`, `lint`
+files, `screenshot` output) resolve against the **script file's
+directory**, so scripts can live next to the package they test and run
+from any cwd.
+
+## The `session` block (all keys optional)
+
+| key | type | default | notes |
+|---|---|---|---|
+| `ui` | `"tty"` \| `"gui"` | `"tty"` | |
+| `size` | `"COLSxROWS"` | `"120x36"` | minimum `10x4` |
+| `config` | `"minimal"` \| `"bare"` \| `"init-file"` \| `"clean-install"` | `"minimal"` | |
+| `init_file` | string path | — | only with config `minimal`/`init-file` (implies `init-file`); conflicts loudly with `bare`/`clean-install` |
+| `load` | list of strings | — | files/dirs for load-path; with `clean-install`: packages to install |
+| `eval` | list of strings | — | startup forms |
+| `emacs` | string path | — | binary override (also: `run --emacs`, `matrix`) |
+| `headless` | bool | false | GUI under a private Xvfb (Linux) |
+| `allow_init_error` | bool | false | see init_error contract below |
+
+**init_error contract**: a fresh session whose startup `load`/`eval`
+signalled an error **fails the run before any step executes** (the package
+under test may not even be loaded) — unless `"allow_init_error": true`.
+
+## Steps — exactly one verb per step
+
+Timeouts are numbers in `(0, 600]` seconds.
+
+| verb | value | options (type, default) |
+|---|---|---|
+| `keys` | kbd string | `delivery`: `"semantic"`(default)/`"events"`/`"raw"`; `timeout` (15) |
+| `type` | literal string | — |
+| `eval` | elisp form string | `timeout` (15) |
+| `wait` | `"idle"` \| `"text"` \| `"prompt"` | idle: `min_idle` (number 0–60, default 0.2); text: `pattern` (required, **Python** regexp), `buffer` (string); all: `timeout` (10). Options on the wrong wait kind are rejected. |
+| `mouse` | `"click"` \| `"double"` \| `"drag"` \| `"wheel"` | `button` (int 1–3, 1); `buffer`; `pos`/`line`/`to_pos`/`to_line` (int >= 1); `col`/`to_col` (int >= 0); `part`: `"text"`(default)/`"mode-line"`; `direction`: `"down"`(default)/`"up"`; `count` (int 1–50, 1); `delivery`: `"macro"`(default)/`"events"`; `timeout` (15) |
+| `test` | ERT selector string (`"t"` = all) | `load_files` (list of paths); `timeout` (60); `allow_unexpected` (bool) |
+| `lint` | non-empty list of file paths | `timeout` (60); `allow_findings` (bool) |
+| `screenshot` | output path, or `null` to embed text | `ansi` (bool, TTY only) |
+| `resize` | `"COLSxROWS"` (min `10x4`) | — |
+| `assert` | assertion object (below) | — |
+
+Failure semantics:
+- An `eval` step fails on an elisp error (backtrace in the step record).
+- A `test` step fails on unexpected results or timeout **unless**
+  `allow_unexpected` — set it when you'd rather assert exact counts.
+- A `lint` step fails on any finding **unless** `allow_findings`.
+- The run stops at the **first failure**; the failed step embeds a state
+  snapshot; later steps are recorded `"not-run"`.
+
+## Assertions — exactly one kind per `assert` step
+
+| kind | value | extra options |
+|---|---|---|
+| `buffer_contains` | substring | `buffer` (default: current) |
+| `buffer_matches` | Python regexp (multiline) | `buffer` |
+| `state` | non-empty object of state-field → expected value; dotted paths work (`"minibuffer.prompt"`) | — |
+| `messages_match` | Python regexp over `*Messages*` | — |
+| `popup` | popup kind string, or `true` for any | — |
+| `tests` | non-empty object of count-field → expected (`{"unexpected": 0, "timed-out": false}`), checked against the **last `test` step** | — |
+| `lint_clean` | `true`/`false`, checked against the **last `lint` step** | — |
+| `eval` | elisp form; passes when it evaluates without error to non-`nil` (the catch-all) | `timeout` (10) |
+
+`tests`/`lint_clean` need a preceding `test`/`lint` step in the same run.
+
+## Running
+
+```sh
+elate run scenario.json                  # fresh session, teardown, exit 0/1
+elate --json run scenario.json           # per-step records, timings, snapshots
+                                         # (--json is global: BEFORE the subcommand)
+elate run scenario.json --keep           # keep the session afterwards
+elate run scenario.json --keep-on-failure
+elate run scenario.json --emacs /opt/emacs-29/bin/emacs
+elate -s existing run scenario.json      # against an existing session:
+                                         # session block ignored, no teardown
+```
+
+Fresh sessions per run are the default **on purpose**: lint executes
+compile-time code and lint/test results depend on session history, so only
+a throwaway session gives reproducible verdicts. `--emacs` with `-s` is a
+loud error (an existing session already runs its own binary).
+
+## Version matrix
+
+```sh
+elate matrix --emacs /opt/e29/bin/emacs,/opt/e30/bin/emacs scenario.json
+elate matrix --emacs-glob '/opt/emacs-*/bin/emacs' scenario.json
+elate matrix --emacs emacs scenario.json   # bare names resolve via PATH
+```
+
+One fresh session per binary; duplicates (symlink/relative/PATH spellings)
+run once; one broken binary records a failure but does not abort the rest.
+Exit 0 only when every version passed.
+
+## Transcript export
+
+```sh
+elate -s NAME export-script -o scenario.json   # stopped sessions work too
+```
+
+Best-effort starting point, not a faithful recorder: inputs become steps in
+transcript order; observations (`state`/`buffer`/`messages`/`popups`/…)
+become assertion stubs with `"skip": true` for you to edit into real
+assertions; transcript-clipped values export skipped with a comment.
+Timing and out-of-band changes are not captured; the emacs binary is
+deliberately not pinned (that is `--emacs`/`matrix`'s job).
+
+## CI pattern (GitHub Actions)
+
+```yaml
+jobs:
+  scenario:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs_version: ["29.4", "30.1", "snapshot"]
+    steps:
+      # In production CI, pin third-party actions to commit SHAs.
+      - uses: actions/checkout@v6
+      - uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs_version }}
+      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - uses: astral-sh/setup-uv@v8
+      - run: uvx elate --json run scenario.json
+```
+
+TTY sessions need only tmux. Export a UTF-8 locale (`LANG=C.UTF-8`) if
+steps type non-ASCII text. On failure the `--json` output embeds the
+failing step's state snapshot; `--keep-on-failure` plus
+`elate -s NAME screenshot` captures more before teardown.

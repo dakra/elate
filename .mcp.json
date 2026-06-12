@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "elate": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["elate", "mcp"]
+    }
+  }
+}

@@ -504,6 +504,110 @@ def stop_session(name: str, via: str | None = None) -> dict[str, Any]:
     return {"name": name, "stopped": True, "was_alive": was_alive}
 
 
+def _dir_size(path: Path) -> int:
+    """Total file bytes under path (best effort; 0 on any trouble)."""
+    total = 0
+    try:
+        for p in path.rglob("*"):
+            try:
+                if p.is_file() and not p.is_symlink():
+                    total += p.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return total
+
+
+def purge_sessions(names: Sequence[str] | None = None,
+                   all_sessions: bool = False) -> dict[str, Any]:
+    """Delete the sandbox directories of sessions that are not running.
+
+    Running sessions are NEVER purged: naming one is a loud error, and
+    under ``all_sessions`` they are skipped and reported.  Before the
+    sandbox is removed, non-running sessions get the same force-cleanup
+    as ``stop`` (identity-checked pid kills, tmux kill-server, recorder
+    reaping), so a half-dead tmux server or recorder helper cannot
+    outlive its socket directory.  Corrupt registries (unreadable
+    session.json) get a best-effort ``tmux -S <dir>/tmux.sock
+    kill-server`` instead, then the same removal.
+
+    Only directories directly under :func:`sessions_root` are deleted --
+    the registry's stored ``session_dir`` is deliberately not trusted
+    with an ``rmtree``.  A session-dir entry that is itself a symlink
+    (something elate never creates) is not followed: the link itself is
+    removed, the target is preserved, and the report says so.
+
+    Like the rest of elate, purge assumes a single controller: a
+    concurrent ``start`` of a name just classified as not-running can
+    race the removal (same disposition as the record-start TOCTOU).
+    """
+    if not names and not all_sessions:
+        raise ElateError(
+            "purge needs explicit session names or --all "
+            "(purge --all removes every stopped/dead sandbox)")
+    root = sessions_root()
+    listing = {s["name"]: s for s in list_sessions()}
+    if names:
+        names = list(dict.fromkeys(names))  # dedupe, keep order
+        unknown = [n for n in names if n not in listing]
+        if unknown:
+            raise SessionNotFound(
+                f"no session named {', '.join(repr(n) for n in unknown)} "
+                f"(looked in {root})")
+        targets = [listing[n] for n in names]
+        running = [t["name"] for t in targets if t["status"] == "running"]
+        if running:
+            raise ElateError(
+                f"session(s) still running: {', '.join(running)} -- purge "
+                "never removes a running session; stop first "
+                "(elate stop NAME)")
+    else:
+        targets = list(listing.values())
+    purged: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    freed = 0
+    for entry in targets:
+        if entry["status"] == "running":
+            skipped.append(entry["name"])
+            continue
+        path = root / entry["name"]
+        if entry["status"] == "corrupt":
+            # No loadable registry: kill any tmux server still bound to
+            # the sandbox's conventional socket path, best effort.
+            sock = path / "tmux.sock"
+            if sock.exists():
+                try:
+                    RawChannel(str(sock)).kill_server()
+                except ElateError:
+                    pass  # no tmux on PATH etc.: still purge the files
+        else:
+            try:
+                _force_cleanup(load_session(entry["name"]))
+            except ElateError:
+                pass  # already gone / unreadable mid-scan: still purge
+        if path.is_symlink():
+            # A hand-made symlinked session dir (elate never creates
+            # one): rmtree refuses symlinks, and following the link
+            # would escape sessions_root. Remove the link itself; the
+            # target -- and everything in it -- is preserved, and the
+            # report must not pretend otherwise (no freed bytes).
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            purged.append({
+                "name": entry["name"], "status": entry["status"],
+                "note": "session dir was a symlink; removed the link, "
+                        "kept the target"})
+            continue
+        freed += _dir_size(path)
+        shutil.rmtree(path, ignore_errors=True)
+        purged.append({"name": entry["name"], "status": entry["status"]})
+    return {"purged": purged, "skipped_running": skipped,
+            "freed_bytes": freed}
+
+
 def session_info(name: str) -> dict[str, Any]:
     sess = load_session(name)
     alive = sess.is_alive()

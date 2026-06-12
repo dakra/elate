@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.0
+
+- `elate purge`: delete the sandboxes of stopped/dead sessions (the
+  transcripts included) — by name or `--all`; a running session is never
+  purged. Leftover processes of dead sessions are cleaned up first.
+  Containment-first: only entries directly under the sessions root are
+  removed, and a hand-made symlinked session dir is unlinked without
+  following (the target survives; the report says so).
+- Plugin: `emacs-tester` subagent (`elate:emacs-tester`) — preloaded
+  with the skill, for delegating long interactive Emacs test-drives out
+  of the main context; returns findings, not transcripts.
+- Plugin: leftover-session hooks — SessionEnd warns about elate
+  sessions still running when a Claude Code session ends, SessionStart
+  injects the same fact as context at the next session start (silent
+  and instant for everyone else).
+- CI on GitHub Actions: Linux Emacs matrix (29.4 → snapshot), a
+  dedicated Xvfb GUI job, macOS full suite, build + wheel smoke test
+  (publishing stays manual).
+- `skills/elate/`: an Agent Skill teaching harnesses to drive the elate
+  CLI (act → wait → observe loop, key delivery, scenario scripts), with
+  generated-from-the-CLI `REFERENCE.md` (CI fails on drift), `RECIPES.md`,
+  and `SCRIPTING.md`; `AGENTS.md` for harnesses without skill support.
+- Claude Code plugin + self-hosted marketplace (`.claude-plugin/`,
+  `.mcp.json`): two-command install delivering the skill as
+  `/elate:elate` plus the MCP server (`uvx elate mcp`) auto-registered.
+- Harness docs: README "Using elate from AI harnesses" with per-harness
+  MCP registration (Claude Code, Claude Desktop, Codex CLI, Cursor, Zed,
+  Gemini CLI — the same `uvx elate mcp` everywhere) and pinned-install
+  guidance (`elate--v{version}` tags, `@ref`/`#ref` forms); release flow
+  tags via `claude plugin tag`; CI runs `claude plugin validate --strict`
+  over both manifests plus an end-to-end local marketplace-install check.
+
 ## 0.1.0
 
 Everything below shipped in phases on the way to 0.1; one section per phase.

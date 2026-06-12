@@ -58,11 +58,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("list", help="list known sessions")
 
+    sp = sub.add_parser(
+        "purge",
+        help="delete the sandboxes of stopped/dead sessions",
+        description="Delete the sandbox directories (transcripts included) "
+                    "of sessions that are no longer running. Stopped "
+                    "sandboxes are inert but accumulate forever otherwise; "
+                    "purge is the supported cleanup. A running session is "
+                    "never purged: naming one is an error, and --all skips "
+                    "and reports it. Leftover processes of dead sessions "
+                    "are cleaned up before their files go.")
+    sp.add_argument("names", nargs="*", metavar="NAME",
+                    help="session to purge (repeatable)")
+    sp.add_argument("--all", action="store_true", dest="all_sessions",
+                    help="purge every session that is not running")
+
     sp = sub.add_parser("info", help="show session details")
     sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
 
     sp = sub.add_parser("keys", help="send keys (Emacs kbd notation)")
-    sp.add_argument("keys")
+    sp.add_argument("keys", help="key sequence in Emacs kbd notation, "
+                                 "e.g. 'C-x C-f' or 'M-x foo RET'")
     grp = sp.add_mutually_exclusive_group()
     grp.add_argument("--semantic", action="store_true",
                      help="deliver via execute-kbd-macro (default)")
@@ -402,6 +418,25 @@ def cmd_stop(args: argparse.Namespace) -> Result:
     name = _name_arg(args)
     result = S.stop_session(name)
     return result, f"stopped session {name!r}", 0
+
+
+def cmd_purge(args: argparse.Namespace) -> Result:
+    result = S.purge_sessions(args.names, all_sessions=args.all_sessions)
+    purged = result["purged"]
+    skipped = result["skipped_running"]
+    if purged:
+        mib = result["freed_bytes"] / (1024 * 1024)
+        names = ", ".join(p["name"] for p in purged)
+        human = f"purged {len(purged)} sandbox(es), {mib:.1f} MiB: {names}"
+        for p in purged:
+            if p.get("note"):
+                human += f"\n{p['name']}: {p['note']}"
+    else:
+        human = "nothing to purge"
+    if skipped:
+        human += (f"\nskipped (still running): {', '.join(skipped)} "
+                  "-- stop them first")
+    return result, human, 0
 
 
 def cmd_list(args: argparse.Namespace) -> Result:
@@ -1218,6 +1253,7 @@ _COMMANDS = {
     "start": cmd_start,
     "stop": cmd_stop,
     "list": cmd_list,
+    "purge": cmd_purge,
     "info": cmd_info,
     "keys": cmd_keys,
     "type": cmd_type,

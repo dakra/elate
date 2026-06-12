@@ -1,0 +1,393 @@
+# CI for elate: TTY suite across an Emacs version matrix on Linux, the
+# first-ever execution of the Linux/Xvfb GUI path, the full suite on macOS,
+# and a build + twine check + install-smoke of the distribution artifacts.
+#
+# Publishing is deliberately NOT part of CI: the maintainer publishes to
+# PyPI manually (see "Publishing" in README). This workflow never uploads
+# anywhere except GitHub Actions artifacts and uses no tokens/secrets.
+#
+# Supply-chain policy: every third-party action is pinned to a full commit
+# SHA (with a "# vX.Y / YYYY-MM-DD" comment naming the tag it corresponds
+# to), the job token is read-only (top-level permissions), and checkouts
+# don't persist credentials. Known residual: purcell/setup-emacs builds
+# from the floating github:purcell/nix-emacs-ci flake ref — accepted.
+#
+# Emacs-version policy:
+# - 29.4 legs are BLOCKING. The agent elisp was audited for >=30-only
+#   APIs: completion-preview (Emacs 30) is read via `bound-and-true-p`,
+#   help-fns-function-name (29.1) is wrapped in ignore-errors, and the
+#   profiler entry points are fboundp-guarded — no unguarded post-29 API
+#   was found, and README states Emacs 29+ as the floor. Tests that need
+#   newer features (which-key bundled in 30, tty child frames in 31)
+#   skip themselves when the feature is absent.
+# - The snapshot leg is NON-BLOCKING (continue-on-error): it tracks
+#   unreleased Emacs, so breakage there is upstream signal and should not
+#   gate PRs. Honest caveat: a red snapshot leg keeps the run (and badge)
+#   green and triggers no notification whatsoever — the only way it is
+#   ever noticed is someone periodically opening the Actions run view.
+#   That is the accepted protocol for this leg.
+# - Python is deliberately unpinned: uv picks the runner's interpreter
+#   (requires-python >=3.10 keeps this safe), trading one extra "what
+#   changed?" axis on failures for free coverage of current Pythons.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: nothing in this workflow writes to the repo, so the
+# job token is read-only. A compromised action cannot push/tag/comment.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ---------------------------------------------------------------- Linux TTY
+  test-linux-tty:
+    name: "Linux TTY (Emacs ${{ matrix.emacs }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Policy: newest point release of each supported major (29.4 and
+        # 30.2 are the latest 29.x/30.x in nix-emacs-ci), bumped
+        # deliberately when upstream adds one. release-snapshot is
+        # currently 31.0.90 — the exact version the suite was developed
+        # and verified against locally, so it is the canary leg most
+        # likely to be green on the first push.
+        emacs: ["29.4", "30.2", "release-snapshot", "snapshot"]
+    # Snapshot tracks unreleased Emacs; don't let upstream churn block CI.
+    continue-on-error: ${{ matrix.emacs == 'snapshot' }}
+    env:
+      # The raw (tmux) channel inherits the caller's locale; unicode tests
+      # need UTF-8 (C.UTF-8 always exists on Ubuntu, no locale-gen needed).
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3 / 2026-06-02
+        with:
+          persist-credentials: false
+
+      # purcell/setup-emacs is used directly (the jcs090218 wrapper only
+      # adds Windows support and itself delegates here on unix), pinned to
+      # a commit SHA. Its `version` input maps to nix-emacs-ci flake
+      # attributes via emacs-${version/./-}: 29.4 -> emacs-29-4, 30.2 ->
+      # emacs-30-2, release-snapshot/snapshot pass through — all verified
+      # to exist upstream. These builds are headless (no window-system) —
+      # fine here, the GUI tests skip without $DISPLAY. tmux >= 3.2
+      # required by the suite (Ubuntu 24.04 ships 3.4). Note: a
+      # nix-emacs-ci Cachix miss (fresh snapshot bump, Cachix outage)
+      # means building Emacs from source, which will blow timeout-minutes
+      # — known failure mode, rerun later rather than raising the budget.
+      - name: Install Emacs ${{ matrix.emacs }}
+        uses: purcell/setup-emacs@509bfe03ba1ffddb67b3c6d9eaaeb96b45182cc7 # v8.0 / 2026-06-04
+        with:
+          version: ${{ matrix.emacs }}
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0 / 2026-06-03
+        with:
+          enable-cache: true
+
+      - name: Show tool versions
+        run: |
+          emacs --version | head -n 2
+          emacsclient --version
+          tmux -V
+          uv --version
+
+      - name: Install project
+        run: uv sync --frozen
+
+      # The suite has its own internal timeouts (RPC/wait deadlines), so no
+      # pytest-timeout plugin is needed; timeout-minutes bounds the job.
+      # --no-sync: the environment was installed --frozen above; never let
+      # `uv run` quietly re-resolve if lock and pyproject ever drift.
+      - name: Run test suite (TTY; GUI tests skip without a display)
+        run: uv run --no-sync pytest -q
+
+  # ---------------------------------------------------------------- Linux GUI
+  # First-ever execution of the Linux/Xvfb/X11 GUI path (code-complete but
+  # never verified before this workflow existed) — kept as its own job so a
+  # failure here is immediately legible and doesn't muddy the TTY legs.
+  # Blocking on purpose (continue-on-error: false is the default): if this
+  # path is broken we want to know loudly.
+  #
+  # Known coverage hole: GUI tests run on exactly one Emacs per OS (apt
+  # 29.3 here, the cask version on macOS) — the nix-emacs-ci builds used
+  # by the TTY matrix are headless, so no GUI x version matrix exists and
+  # the locally-developed-against 31.x GUI path is never exercised in CI.
+  test-linux-gui:
+    name: "Linux GUI (Xvfb, Emacs 29.3/apt)"
+    # Pinned to 24.04 (not ubuntu-latest) so the apt Emacs version — and
+    # with it this leg's meaning and the job name above — changes only
+    # when deliberately bumped, not when GitHub migrates ubuntu-latest.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3 / 2026-06-02
+        with:
+          persist-credentials: false
+
+      # emacs-gtk is the X11/GTK build (NOT pgtk, which is Wayland-first
+      # and unsupported under plain X). It pulls emacs-bin-common, which
+      # provides emacsclient. The nix-emacs-ci builds used by the TTY legs
+      # are headless, so this leg installs from apt instead (29.3 on
+      # ubuntu-24.04). xvfb provides xvfb-run AND the Xvfb binary that the
+      # in-suite headless test spawns itself; imagemagick ('import'; the
+      # bare name is registered by the package postinst via
+      # update-alternatives — verified in the noble .deb) + x11-apps
+      # ('xwd') cover both X11 screenshot backends; a GUI Emacs needs at
+      # least one real font under Xvfb.
+      - name: Install GUI Emacs, tmux, Xvfb, screenshot tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y emacs-gtk tmux xvfb imagemagick x11-apps fonts-dejavu-core
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0 / 2026-06-03
+        with:
+          enable-cache: true
+
+      - name: Show tool versions
+        run: |
+          emacs --version | head -n 2
+          emacsclient --version
+          tmux -V
+          import -version | head -n 1
+
+      - name: Install project
+        run: uv sync --frozen
+
+      # tests/test_gui.py needs $DISPLAY on Linux — xvfb-run provides it.
+      # test_snap_series_gui is the one display-gated test outside that
+      # module. The in-suite Xvfb headless test additionally spawns its own
+      # nested Xvfb via elate itself.
+      - name: Run GUI test suite under Xvfb
+        run: >
+          xvfb-run -a -s "-screen 0 1600x1200x24"
+          uv run --no-sync pytest -q tests/test_gui.py
+          "tests/test_recording.py::test_snap_series_gui"
+
+  # ------------------------------------------------------------------- macOS
+  test-macos:
+    name: "macOS (full suite)"
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      # macOS has no C.UTF-8; en_US.UTF-8 covers the raw-channel unicode
+      # tests (tmux inherits the caller's locale).
+      LANG: en_US.UTF-8
+      LC_ALL: en_US.UTF-8
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3 / 2026-06-02
+        with:
+          persist-credentials: false
+
+      # The homebrew-core 'emacs' formula is built --without-ns (terminal
+      # only), which would make the GUI tests fail rather than run. The
+      # 'emacs-app' cask (emacsformacosx.com, currently 30.2) ships a real
+      # Cocoa Emacs.app and links both 'emacs' and 'emacsclient' into PATH.
+      # The cask version floats: when it bumps (e.g. to 31.x) this leg's
+      # Emacs changes without a diff here — accepted; this comment is the
+      # acknowledgment.
+      - name: Install Emacs (GUI .app) and tmux
+        run: |
+          brew install --cask emacs-app
+          brew install tmux
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0 / 2026-06-03
+        with:
+          enable-cache: true
+
+      - name: Show tool versions
+        run: |
+          emacs --version | head -n 2
+          emacsclient --version
+          tmux -V
+
+      - name: Install project
+        run: uv sync --frozen
+
+      # Screen-Recording-gated tests (PNG screenshots, GUI snap) skip on
+      # runners without the permission — by design, the denial path is
+      # itself under test.
+      - name: Run full test suite
+        run: uv run --no-sync pytest -q
+
+  # ------------------------------------------------------------- Skill docs
+  # skills/elate/REFERENCE.md is generated from the argparse tree
+  # (scripts/gen-skill-ref.py). Regenerate and fail on drift so the Agent
+  # Skill can never describe a CLI that no longer exists — the same
+  # drift-proofing as the tested examples/. No Emacs/tmux needed: the
+  # generator only imports the parser.
+  skill-reference:
+    name: "Skill REFERENCE.md drift check"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3 / 2026-06-02
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0 / 2026-06-03
+        with:
+          enable-cache: true
+
+      - name: Install project
+        run: uv sync --frozen
+
+      # `git diff --exit-code` alone passes vacuously if the file were
+      # ever untracked (diff only sees tracked paths); the porcelain check
+      # catches untracked/renamed output too.
+      - name: Regenerate REFERENCE.md and fail on drift
+        run: |
+          uv run --no-sync python scripts/gen-skill-ref.py
+          test -f skills/elate/REFERENCE.md
+          git diff --exit-code -- skills/elate/REFERENCE.md
+          test -z "$(git status --porcelain -- skills/elate/)"
+
+  # -------------------------------------------------------- Plugin manifests
+  # Run the REAL `claude plugin validate --strict` over both manifests.
+  # Feasibility verified locally (Claude Code 2.1.175): validate is a purely
+  # local schema check and runs fine in a fresh, never-logged-in
+  # CLAUDE_CONFIG_DIR — no authentication, no API traffic. Two calls are
+  # required: `validate <dir>` checks ONLY the marketplace manifest when one
+  # exists; the plugin manifest needs the explicit path (I3 finding).
+  # Claude Code is installed UNPINNED on purpose: this job's point is to
+  # notice when the *current* validator stops accepting our manifests, so
+  # tracking latest is the feature (same accepted-float rationale as the
+  # nix-emacs-ci flake ref above; no secrets exist in this workflow for a
+  # compromised package to exfiltrate, and the job token is read-only).
+  plugin-validate:
+    name: "Claude Code plugin validate + install"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # No update checks; keep the unauthenticated CLI fully offline.
+      DISABLE_AUTOUPDATER: "1"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3 / 2026-06-02
+        with:
+          persist-credentials: false
+
+      # Don't rely on the runner's real ~/.claude being fresh — point all
+      # claude state at a job-scoped dir (created on first use; verified:
+      # the CLI creates a nonexistent CLAUDE_CONFIG_DIR itself). Makes the
+      # job deterministic on self-hosted runners with leftover state, and
+      # is what the install check below greps through. (The `runner`
+      # context isn't allowed in job-level env, hence GITHUB_ENV.)
+      - name: Point claude state at a job-scoped config dir
+        run: echo "CLAUDE_CONFIG_DIR=$RUNNER_TEMP/claude-config" >> "$GITHUB_ENV"
+
+      # Declare the Node toolchain instead of inheriting whatever the
+      # runner image preinstalls (claude-code engines: node >=18). Also
+      # makes `npm install -g` target the setup-node prefix, which the
+      # runner user owns — no reliance on /usr/local being writable.
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 / 2026-04-20
+        with:
+          node-version: 22
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Validate marketplace + plugin manifests (--strict)
+        run: |
+          claude --version
+          claude plugin validate --strict .
+          claude plugin validate --strict .claude-plugin/plugin.json
+
+      # End-to-end install proxy (the I3 recipe): a local marketplace add +
+      # install exercises the actual payload delivery — the `"source": "./"`
+      # clone — which validate cannot. Catches skill files missing from the
+      # clone, broken source config, etc. Local path only; no network.
+      - name: Install the plugin from this checkout and check the payload
+        run: |
+          claude plugin marketplace add "$PWD"
+          claude plugin install elate@elate
+          for f in .claude-plugin/plugin.json .mcp.json \
+                   skills/elate/SKILL.md skills/elate/REFERENCE.md \
+                   agents/emacs-tester.md hooks/hooks.json \
+                   hooks/check-running.sh; do
+            found="$(find "$CLAUDE_CONFIG_DIR" -path "*elate*/$f" | head -n 1)"
+            if [ -z "$found" ]; then
+              echo "missing from installed payload: $f"
+              exit 1
+            fi
+          done
+          # The SessionEnd hook is spawned directly (exec form): the
+          # exec bit must survive the marketplace clone.
+          hook="$(find "$CLAUDE_CONFIG_DIR" -path '*elate*/hooks/check-running.sh' | head -n 1)"
+          if [ ! -x "$hook" ]; then
+            echo "installed hooks/check-running.sh is not executable"
+            exit 1
+          fi
+
+  # ------------------------------------------------------------------- Build
+  # Build + metadata check + install smoke. NO publishing — the maintainer
+  # uploads to PyPI manually; artifacts go to GitHub Actions storage and
+  # nowhere else.
+  build:
+    name: "Build sdist/wheel + twine check + wheel smoke"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # The wheel smoke below starts a real TTY session (raw channel
+      # inherits the locale, same as the test jobs).
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3 / 2026-06-02
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0 / 2026-06-03
+        with:
+          enable-cache: true
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Check distribution metadata
+        run: uvx twine check dist/*
+
+      # Smoke-install the built wheel: catches packaging mistakes twine
+      # can't see (missing package data such as elisp/elate-agent.el in
+      # the wheel, broken entry point). emacs-nox + tmux are cheap from
+      # apt, so go beyond --version: a real start/eval/stop round-trip is
+      # the CI proxy for the I1 gate "uvx elate start works on a clean
+      # machine". The unquoted glob is deliberate — bash expands it to
+      # the single wheel uv build just produced.
+      - name: Install minimal Emacs and tmux for the wheel smoke
+        run: sudo apt-get update && sudo apt-get install -y emacs-nox tmux
+
+      - name: Smoke test the built wheel
+        run: |
+          uvx --from dist/elate-*.whl elate --version
+          uvx --from dist/elate-*.whl elate start --name wheel-smoke
+          uvx --from dist/elate-*.whl elate -s wheel-smoke eval "(+ 1 2)"
+          uvx --from dist/elate-*.whl elate stop wheel-smoke
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 / 2026-04-10
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
