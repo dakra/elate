@@ -12,6 +12,7 @@ like CLI commands, tagged with via="mcp".
 
 from __future__ import annotations
 
+import base64
 import functools
 import json
 import re
@@ -46,8 +47,18 @@ together buffer/echo/messages calls. All responses are JSON; responses
 with "ok": false carry an "error" and usually a "state" snapshot
 explaining the situation.
 
+For repeatable/deterministic checks, prefer a scenario over the
+imperative loop: elate_run_script runs a whole JSON scenario (session +
+ordered steps + assertions) in one call -- fresh sandbox, pass/fail,
+exit-coded -- and is what you commit to a project's CI. Bootstrap one
+from a session you drove by hand with the CLI's `export-script`, and run
+it across Emacs versions with the CLI's `matrix`. The act->wait->observe
+tools above are for exploration; the scenario is the asset.
+
 Sessions persist across MCP reconnects; always elate_stop sessions you
 started when you are done (GUI sessions own a visible desktop window).
+Clean up stopped ones with elate_purge so heavy parallel runs stay
+readable.
 """
 
 server = FastMCP("elate", instructions=INSTRUCTIONS)
@@ -269,6 +280,11 @@ def elate_purge(
         "Purge every session that is not running (running ones are skipped "
         "and reported). Use instead of names to clean up everything."))]
         = False,
+    stopped_older_than: Annotated[float | None, Field(ge=0, description=(
+        "Only purge sessions inert at least this many seconds (by their "
+        "idle_for); fresher ones are kept and reported under skipped_recent. "
+        "Lets a heavy parallel run GC stale sandboxes without removing "
+        "just-stopped ones."))] = None,
 ) -> str:
     """Delete the sandboxes (transcripts included) of stopped/dead sessions.
 
@@ -278,14 +294,15 @@ def elate_purge(
     and reported. Leftover processes of dead sessions are cleaned up first;
     only directories directly under the sessions root are removed (a
     symlinked session dir is unlinked, not followed). Returns purged /
-    skipped_running / freed_bytes. Pass names or all_sessions (one
-    required).
+    skipped_running / skipped_recent / freed_bytes. Pass names or
+    all_sessions (one required); stopped_older_than narrows either.
     """
     try:
         names = names or []
         if not names and not all_sessions:
             raise ElateError("elate_purge needs names or all_sessions=true")
-        return _ok(S.purge_sessions(names, all_sessions=all_sessions))
+        return _ok(S.purge_sessions(names, all_sessions=all_sessions,
+                                    stopped_older_than=stopped_older_than))
     except Exception as exc:
         return _fail(exc)
 
@@ -336,13 +353,17 @@ def elate_keys(
         "'M-x my-mode RET', 'a b RET', 'SPC', '<down>'."))],
     delivery: Annotated[Literal["semantic", "events", "raw"], Field(description=(
         "How to deliver the keys. 'semantic' (default): execute-kbd-macro "
-        "inside Emacs -- synchronous and precise, but a sequence that ends "
-        "with an open prompt does NOT hold it open (a bare 'M-x' errors). "
-        "'events': queue on unread-command-events -- asynchronous; USE THIS "
-        "to open a minibuffer prompt and leave it open for inspection or "
-        "follow-up keys. 'raw': real terminal bytes via tmux -- the escape "
-        "hatch that works even when Emacs is busy/wedged (e.g. send 'C-g' "
-        "raw to unblock); cannot encode every chord (e.g. C-%), and is "
+        "inside Emacs -- synchronous and precise. It runs through the command "
+        "loop, so the keys obey active keymaps (in evil normal state plain "
+        "letters are commands, not text), a sequence ending with an open "
+        "prompt does NOT hold it open (a bare 'M-x' errors), and a command "
+        "that rings the bell aborts the whole sequence (the error names the "
+        "culprit). 'events': queue on unread-command-events -- asynchronous; "
+        "USE THIS to open a minibuffer prompt and leave it open, or to "
+        "deliver past a command that rings the bell (events is not a macro, "
+        "so a bell merely beeps). 'raw': real terminal bytes via tmux -- the "
+        "escape hatch that works even when Emacs is busy/wedged (e.g. send "
+        "'C-g' raw to unblock); cannot encode every chord (e.g. C-%), and is "
         "TTY-only (GUI sessions have no raw channel)."))] = "semantic",
     timeout: Annotated[float, Field(gt=0, le=120, description=(
         "Seconds before a semantic delivery is declared blocked "
@@ -404,6 +425,54 @@ def elate_type(
         sess.log("type", text=text, via="mcp",
                  channel="raw" if sess.ui == "tty" else "events")
         return _ok(S.deliver_type(sess, text))
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_send_process(
+    session: Annotated[str, Field(description="Session name.")],
+    buffer: Annotated[str | None, Field(description=(
+        "Buffer whose subprocess to target. Default: the current (selected "
+        "window's) buffer. Errors if the buffer has no live process."))] = None,
+    text: Annotated[str | None, Field(description=(
+        "Literal text to send to the process (e.g. a shell command plus a "
+        "trailing newline). Give exactly one of text/char/file."))] = None,
+    char: Annotated[str | None, Field(description=(
+        "An Emacs kbd string to send instead of literal text: 'C-c' sends "
+        "^C (SIGINT to a shell's foreground job), 'RET' a newline, 'TAB' a "
+        "tab."))] = None,
+    file: Annotated[str | None, Field(description=(
+        "Path whose contents to send (read inside Emacs, so it is not bound "
+        "by the argv size limit -- use for large payloads)."))] = None,
+) -> str:
+    """Send raw input to a buffer's subprocess (comint/REPL/shell/terminal).
+
+    Writes straight to the process behind the buffer (process-send-string),
+    bypassing the command loop. Unlike elate_keys/elate_type -- which drive
+    Emacs -- this drives the *subprocess*: interrupt a job with char='C-c',
+    feed a REPL, or seed shell input. Errors when the buffer has no live
+    process. Returns the process name, buffer, and bytes sent.
+    """
+    sess = None
+    try:
+        given = [x for x in (text, char, file) if x is not None]
+        if len(given) != 1:
+            raise ElateError("elate_send_process needs exactly one of "
+                             "text/char/file")
+        sess = _load(session)
+        chan = sess.semantic()
+        if file is not None:
+            data = chan.rpc("send-process-file", file, buffer)
+            kind = "file"
+        else:
+            payload = char if char is not None else text
+            b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+            data = chan.rpc("send-process", buffer, b64, char is not None)
+            kind = "char" if char is not None else "text"
+        sess.log("send-process", buffer=buffer, kind=kind, via="mcp")
+        return _ok(data)
     except Exception as exc:
         return _fail(exc, sess)
 
@@ -1003,15 +1072,22 @@ def elate_buffer(
 @_threaded
 def elate_faces_at(
     session: Annotated[str, Field(description="Session name.")],
-    line: Annotated[int, Field(ge=1, description=(
-        "1-based line number in the buffer."))],
-    col: Annotated[int, Field(ge=0, description=(
-        "0-based column (clamped to the line)."))],
+    line: Annotated[int | None, Field(ge=1, description=(
+        "1-based line number (pair with col). Omit when using pos."))] = None,
+    col: Annotated[int | None, Field(ge=0, description=(
+        "0-based column, clamped to the line (pair with line)."))] = None,
+    pos: Annotated[int | None, Field(ge=1, description=(
+        "Absolute buffer position instead of line+col -- convenient when "
+        "you already hold a position. Give line+col OR pos, not both."))] = None,
+    run: Annotated[int, Field(ge=1, le=500, description=(
+        "Return this many consecutive cells from the position in one call "
+        "(default 1). >1 returns {buffer, start, count, cells:[...]} -- e.g. "
+        "to compare a typed cell against the suggestion cell beside it."))] = 1,
     buffer: Annotated[str | None, Field(description=(
         "Buffer to inspect. Default: the current (selected window's) "
         "buffer."))] = None,
 ) -> str:
-    """Faces, text properties (with values), and overlays at one position.
+    """Faces, text properties (with values), and overlays at a position.
 
     The point-query companion to elate_buffer's props dump: returns the
     char, the text-property face, char-face (face after overlays resolve --
@@ -1021,13 +1097,31 @@ def elate_faces_at(
     "property-values" (each name paired with its clipped printed value, so a
     flag t reads differently from a number or a symbol). Use this instead of
     repeated elate_eval (get-text-property ...) calls. font-lock is ensured
-    on the line first.
+    first. Address by line+col or by pos; set run>1 to dump a run of
+    adjacent cells in one call.
     """
     sess = None
     try:
         sess = _load(session)
-        data = sess.semantic().rpc("faces-at", line, col, buffer)
-        sess.log("faces-at", line=line, col=col, buffer=buffer, via="mcp")
+        chan = sess.semantic()
+        if pos is not None and (line is not None or col is not None):
+            raise ElateError("give line+col or pos, not both")
+        if pos is not None:
+            start = pos
+            if run == 1:
+                data = chan.rpc("faces-at-pos", pos, buffer)
+                sess.log("faces-at", pos=pos, buffer=buffer, via="mcp")
+                return _ok(data)
+        elif line is not None and col is not None:
+            data = chan.rpc("faces-at", line, col, buffer)
+            if run == 1:
+                sess.log("faces-at", line=line, col=col, buffer=buffer, via="mcp")
+                return _ok(data)
+            start = data["pos"]  # resolve line:col to a position for the range
+        else:
+            raise ElateError("elate_faces_at needs line+col or pos")
+        data = chan.rpc("faces-range", start, run, buffer)
+        sess.log("faces-range", start=start, count=run, buffer=buffer, via="mcp")
         return _ok(data)
     except Exception as exc:
         return _fail(exc, sess)

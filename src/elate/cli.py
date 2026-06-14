@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -21,13 +22,49 @@ def _parse_size(value: str) -> tuple[int, int]:
     return int(m.group(1)), int(m.group(2))
 
 
+_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _parse_duration(value: str) -> float:
+    """A duration like '30s', '15m', '2h', '1d', or a bare number, in seconds."""
+    m = re.match(r"^(\d+(?:\.\d+)?)([smhd]?)$", value.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(
+            f"duration must be a number with optional s/m/h/d suffix, "
+            f"got {value!r}")
+    return float(m.group(1)) * _DURATION_UNITS[m.group(2)]
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Compact human duration, largest sensible unit (e.g. '45s', '3m', '2h')."""
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{seconds / size:.0f}{unit}"
+    return f"{seconds:.0f}s"
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="elate",
         description="Drive sandboxed, observable Emacs sessions.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "For repeatable/deterministic checks, prefer the declarative path:\n"
+            "  write a JSON scenario (session + ordered steps + assertions) and\n"
+            "  `elate run` it (exit 0/1, CI-able); bootstrap one from a live\n"
+            "  session with `elate export-script`; run it across Emacs versions\n"
+            "  with `elate matrix`. The act->wait->observe verbs below are for\n"
+            "  exploration; the scenario you check into a project is the asset.\n"
+            "\n"
+            "Output: human tables on a terminal, JSON when stdout is piped\n"
+            "  (i.e. for agents); force either with --json / --human."),
     )
     p.add_argument("--version", action="version", version=f"elate {__version__}")
-    p.add_argument("--json", action="store_true", help="machine-readable JSON output")
+    out = p.add_mutually_exclusive_group()
+    out.add_argument("--json", action="store_true",
+                     help="force machine-readable JSON output")
+    out.add_argument("--human", action="store_true",
+                     help="force the human-readable table, even when piped")
     p.add_argument("-s", "--session", metavar="NAME", help="session to operate on")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -86,6 +123,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="session to purge (repeatable)")
     sp.add_argument("--all", action="store_true", dest="all_sessions",
                     help="purge every session that is not running")
+    sp.add_argument("--stopped-older-than", metavar="DUR", type=_parse_duration,
+                    help="only purge sessions inert at least this long "
+                         "(e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- "
+                         "keeps just-stopped sandboxes during heavy runs")
 
     sp = sub.add_parser("info", help="show session details")
     sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
@@ -101,6 +142,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--events", action="store_true",
                     help="semantic, but queue on unread-command-events "
                          "(non-blocking; use for sequences that open a prompt)")
+    sp.add_argument("--no-abort-on-bell", action="store_true",
+                    help="deliver via unread-command-events so a command "
+                         "that rings the bell (e.g. evil insert off the "
+                         "prompt row) beeps instead of aborting the whole "
+                         "sequence; asynchronous -- follow with a wait. "
+                         "Semantic keys run through the command loop and "
+                         "obey active keymaps (evil state etc.)")
     sp.add_argument("--timeout", type=float, default=15.0)
 
     sp = sub.add_parser(
@@ -114,6 +162,26 @@ def build_parser() -> argparse.ArgumentParser:
                     "with a dash needs '--' first: elate -s N type -- "
                     "'-foo'.")
     sp.add_argument("text")
+
+    sp = sub.add_parser(
+        "send-process",
+        help="send raw input to a buffer's subprocess (comint/REPL/shell)",
+        description="Write bytes straight to the process behind a buffer "
+                    "(`process-send-string`), bypassing the command loop -- "
+                    "for driving shells/REPLs/terminals. Unlike keys/type "
+                    "(which talk to Emacs), this talks to the subprocess: "
+                    "send ^C to interrupt a job, seed shell history, feed a "
+                    "REPL. Errors if the buffer has no live process.")
+    grp = sp.add_mutually_exclusive_group(required=True)
+    grp.add_argument("text", nargs="?", help="literal text to send")
+    grp.add_argument("--char", metavar="KBD",
+                     help="send an Emacs kbd string, e.g. 'C-c' (^C / SIGINT), "
+                          "'RET' (newline), 'TAB'")
+    grp.add_argument("--file", metavar="PATH",
+                     help="send the contents of PATH (read inside Emacs; for "
+                          "payloads past the argv size limit)")
+    sp.add_argument("--buffer", metavar="NAME",
+                    help="buffer whose process to target (default: current)")
 
     sp = sub.add_parser("mouse", help="synthesize a mouse interaction "
                                       "(semantic; works for tty and gui)")
@@ -262,8 +330,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("faces-at", help="faces, text properties, and "
                                          "overlays at a buffer position")
-    sp.add_argument("position", metavar="LINE:COL",
-                    help="1-based line, 0-based column")
+    sp.add_argument("position", metavar="LINE:COL", nargs="?",
+                    help="1-based line, 0-based column (or use --pos)")
+    sp.add_argument("--pos", type=int, metavar="N",
+                    help="address by absolute buffer position instead of "
+                         "LINE:COL (handy from elisp, which holds positions)")
+    sp.add_argument("--run", type=int, default=1, metavar="K",
+                    help="dump K consecutive cells from the position in one "
+                         "call (default 1) -- e.g. compare a typed cell "
+                         "against the suggestion cell next to it")
     sp.add_argument("--buffer", metavar="NAME",
                     help="buffer to inspect (default: current)")
 
@@ -459,9 +534,11 @@ def cmd_stop(args: argparse.Namespace) -> Result:
 
 
 def cmd_purge(args: argparse.Namespace) -> Result:
-    result = S.purge_sessions(args.names, all_sessions=args.all_sessions)
+    result = S.purge_sessions(args.names, all_sessions=args.all_sessions,
+                              stopped_older_than=args.stopped_older_than)
     purged = result["purged"]
     skipped = result["skipped_running"]
+    recent = result.get("skipped_recent") or []
     if purged:
         mib = result["freed_bytes"] / (1024 * 1024)
         names = ", ".join(p["name"] for p in purged)
@@ -471,6 +548,8 @@ def cmd_purge(args: argparse.Namespace) -> Result:
                 human += f"\n{p['name']}: {p['note']}"
     else:
         human = "nothing to purge"
+    if recent:
+        human += (f"\nkept (stopped too recently): {', '.join(recent)}")
     if skipped:
         human += (f"\nskipped (still running): {', '.join(skipped)} "
                   "-- stop them first")
@@ -481,12 +560,17 @@ def cmd_list(args: argparse.Namespace) -> Result:
     sessions = S.list_sessions()
     if not sessions:
         return {"sessions": []}, "no sessions", 0
-    lines = [f"{'NAME':<20} {'UI':<4} {'STATUS':<9} {'EMACS':<10} UPTIME"]
+    lines = [f"{'NAME':<20} {'UI':<4} {'STATUS':<9} {'EMACS':<10} AGE"]
     for s in sessions:
-        uptime = f"{s['uptime']:.0f}s" if s.get("uptime") is not None else "-"
+        if s.get("uptime") is not None:
+            age = f"up {_fmt_duration(s['uptime'])}"
+        elif s.get("idle_for") is not None:
+            age = f"idle {_fmt_duration(s['idle_for'])}"
+        else:
+            age = "-"
         lines.append(
             f"{s['name']:<20} {s.get('ui') or '-':<4} {s['status']:<9} "
-            f"{s.get('emacs_version') or '-':<10} {uptime}"
+            f"{s.get('emacs_version') or '-':<10} {age}"
         )
     return {"sessions": sessions}, "\n".join(lines), 0
 
@@ -498,17 +582,18 @@ def cmd_info(args: argparse.Namespace) -> Result:
 
 
 def cmd_keys(args: argparse.Namespace) -> Result:
-    if args.raw and args.events:
-        raise ElateError("--events is a semantic delivery mode; drop --raw")
+    queued = args.events or args.no_abort_on_bell
+    if args.raw and queued:
+        raise ElateError("--events/--no-abort-on-bell are semantic delivery "
+                         "modes; drop --raw")
     sess = _require_session(args)
+    method = "events" if queued else "macro"
     sess.log("keys", keys=args.keys,
-             channel="raw" if args.raw else "semantic",
-             method="events" if args.events else "macro")
+             channel="raw" if args.raw else "semantic", method=method)
     if args.raw:
         sess.raw().send_kbd(args.keys)
         result = {"keys": args.keys, "channel": "raw"}
     else:
-        method = "events" if args.events else "macro"
         try:
             data = sess.semantic().rpc("keys", args.keys, method, timeout=args.timeout)
         except EvalTimeout as exc:
@@ -525,6 +610,25 @@ def cmd_type(args: argparse.Namespace) -> Result:
     sess.log("type", text=args.text, channel="raw" if sess.ui == "tty" else "events")
     result = S.deliver_type(sess, args.text)
     return result, f"typed {len(args.text)} chars ({result['channel']})", 0
+
+
+def cmd_send_process(args: argparse.Namespace) -> Result:
+    sess = _require_session(args)
+    if args.file is not None:
+        data = sess.semantic().rpc("send-process-file", args.file, args.buffer)
+        what = f"file {args.file!r}"
+        kind = "file"
+    else:
+        payload = args.char if args.char is not None else args.text
+        as_kbd = args.char is not None
+        b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        data = sess.semantic().rpc("send-process", args.buffer, b64, as_kbd)
+        what = f"{args.char!r} (kbd)" if as_kbd else f"{len(payload)} chars"
+        kind = "char" if as_kbd else "text"
+    sess.log("send-process", buffer=args.buffer, kind=kind)
+    human = (f"sent {what} to {data.get('process')} "
+             f"({data.get('bytes')} bytes) in {data.get('buffer')}")
+    return data, human, 0
 
 
 def cmd_mouse(args: argparse.Namespace) -> Result:
@@ -853,18 +957,13 @@ def cmd_bench(args: argparse.Namespace) -> Result:
     return data, "\n".join(lines), 0
 
 
-def cmd_faces_at(args: argparse.Namespace) -> Result:
-    m = re.match(r"^(\d+):(\d+)$", args.position)
-    if not m:
-        raise ElateError(f"position must be LINE:COL, got {args.position!r}")
-    line, col = int(m.group(1)), int(m.group(2))
-    if line < 1:
-        raise ElateError("faces-at line must be >= 1")
-    sess = _require_session(args)
-    data = sess.semantic().rpc("faces-at", line, col, args.buffer)
-    sess.log("faces-at", line=line, col=col, buffer=args.buffer)
-    lines = [f"{data.get('buffer')} {data.get('line')}:{data.get('column')} "
-             f"(pos {data.get('pos')}) char {data.get('char')!r}"]
+def _faces_cell_human(data: dict[str, Any]) -> list[str]:
+    """Human lines for one faces cell (a faces-at result, or a range cell)."""
+    head = (f"{data.get('line')}:{data.get('column')} "
+            f"(pos {data.get('pos')}) char {data.get('char')!r}")
+    if data.get("buffer"):
+        head = f"{data['buffer']} " + head
+    lines = [head]
     if data.get("face"):
         lines.append("face: " + ", ".join(data["face"]))
     if data.get("char-face") and data.get("char-face") != data.get("face"):
@@ -885,6 +984,45 @@ def cmd_faces_at(args: argparse.Namespace) -> Result:
     if overlays:
         lines.append(f"overlays ({len(overlays)}):")
         lines.extend(f"  {_human_overlay(o)}" for o in overlays)
+    return lines
+
+
+def cmd_faces_at(args: argparse.Namespace) -> Result:
+    if args.run < 1:
+        raise ElateError("faces-at --run must be >= 1")
+    if args.pos is not None and args.position is not None:
+        raise ElateError("give LINE:COL or --pos, not both")
+    if args.pos is None and args.position is None:
+        raise ElateError("faces-at needs LINE:COL or --pos N")
+    sess = _require_session(args)
+    if args.pos is not None:
+        if args.pos < 1:
+            raise ElateError("faces-at --pos must be >= 1")
+        start = args.pos
+        if args.run == 1:
+            data = sess.semantic().rpc("faces-at-pos", args.pos, args.buffer)
+            sess.log("faces-at", pos=args.pos, buffer=args.buffer)
+            return data, "\n".join(_faces_cell_human(data)), 0
+    else:
+        m = re.match(r"^(\d+):(\d+)$", args.position)
+        if not m:
+            raise ElateError(f"position must be LINE:COL, got {args.position!r}")
+        line, col = int(m.group(1)), int(m.group(2))
+        if line < 1:
+            raise ElateError("faces-at line must be >= 1")
+        data = sess.semantic().rpc("faces-at", line, col, args.buffer)
+        sess.log("faces-at", line=line, col=col, buffer=args.buffer)
+        if args.run == 1:
+            return data, "\n".join(_faces_cell_human(data)), 0
+        start = data["pos"]  # resolve LINE:COL to a position for the range
+    data = sess.semantic().rpc("faces-range", start, args.run, args.buffer)
+    sess.log("faces-range", start=start, count=args.run, buffer=args.buffer)
+    cells = data.get("cells") or []
+    lines = [f"{data.get('buffer')}: {data.get('count')} cell(s) from pos "
+             f"{data.get('start')}"]
+    for c in cells:
+        lines.append("")
+        lines.extend("  " + ln for ln in _faces_cell_human(c))
     return data, "\n".join(lines), 0
 
 
@@ -1315,6 +1453,7 @@ _COMMANDS = {
     "profile": cmd_profile,
     "bench": cmd_bench,
     "faces-at": cmd_faces_at,
+    "send-process": cmd_send_process,
     "popups": cmd_popups,
     "messages": cmd_messages,
     "echo": cmd_echo,
@@ -1332,6 +1471,11 @@ _COMMANDS = {
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # Resolve the output mode once: explicit --json/--human win; otherwise
+    # emit JSON when stdout is not a TTY (an agent or a pipe) and the human
+    # table on a real terminal. Assigning back to args.json keeps every
+    # downstream check (including run/matrix progress streaming) correct.
+    args.json = args.json or (not args.human and not sys.stdout.isatty())
     if args.command == "mcp":
         # Serve MCP over stdio. Imported lazily so plain CLI use never
         # pays for (or requires) the mcp package import machinery, and

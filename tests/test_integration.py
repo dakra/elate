@@ -561,7 +561,7 @@ def test_cli_unknown_session(capsys: pytest.CaptureFixture[str]) -> None:
 def test_cli_state_human_and_json(sess: S.Session,
                                   capsys: pytest.CaptureFixture[str]) -> None:
     show_scratch_with(sess, "cli-state-marker")
-    assert cli.main(["-s", NAME, "state"]) == 0
+    assert cli.main(["--human", "-s", NAME, "state"]) == 0
     human = capsys.readouterr().out
     assert "buffer: *scratch* (lisp-interaction-mode)" in human
     assert "windows (1):" in human
@@ -575,7 +575,7 @@ def test_cli_describe(sess: S.Session, capsys: pytest.CaptureFixture[str]) -> No
     assert cli.main(["--json", "-s", NAME, "describe", "key", "C-x C-f"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True and out["binding"] == "find-file"
-    assert cli.main(["-s", NAME, "describe", "variable", "fill-column"]) == 0
+    assert cli.main(["--human", "-s", NAME, "describe", "variable", "fill-column"]) == 0
     human = capsys.readouterr().out
     assert "name: fill-column" in human
 

@@ -46,6 +46,7 @@ class Session:
     ui: str = "tty"
     tmux_socket: str = ""  # tty sessions only
     status: str = "running"
+    stopped_at: float | None = None  # unix time stop_session ran (for purge GC)
     emacs_pid: int | None = None
     emacs_identity: str | None = None  # gui: ps start-time+comm at spawn
     emacs_version: str | None = None
@@ -188,12 +189,28 @@ def load_session(name: str) -> Session:
         raise ElateError(f"corrupt session registry: {path}: {exc}") from exc
 
 
+def _stopped_since(sess: Session) -> float:
+    """Best-effort unix time a non-running session became inert.
+
+    Prefers the explicit ``stopped_at`` written by :func:`stop_session`;
+    a crashed session (no clean stop) has none, so fall back to the
+    registry file's mtime, then to ``created_at``.
+    """
+    if sess.stopped_at:
+        return sess.stopped_at
+    try:
+        return sess.registry_path.stat().st_mtime
+    except OSError:
+        return sess.created_at
+
+
 def list_sessions() -> list[dict[str, Any]]:
     """Scan the sessions directory; report each session with live status."""
     root = sessions_root()
     out: list[dict[str, Any]] = []
     if not root.is_dir():
         return out
+    now = time.time()
     for entry in sorted(root.iterdir()):
         if not (entry / "session.json").is_file():
             continue
@@ -210,7 +227,10 @@ def list_sessions() -> list[dict[str, Any]]:
                 "ui": sess.ui,
                 "status": status,
                 "emacs_version": sess.emacs_version,
-                "uptime": round(time.time() - sess.created_at, 1) if alive else None,
+                "uptime": round(now - sess.created_at, 1) if alive else None,
+                # Seconds since the session went inert, so heavy parallel
+                # runs can tell stale stopped sessions from fresh ones.
+                "idle_for": None if alive else round(now - _stopped_since(sess), 1),
                 "session_dir": sess.session_dir,
             }
         )
@@ -508,6 +528,7 @@ def stop_session(name: str, via: str | None = None) -> dict[str, Any]:
 
         _record.reap_orphan(sess)
     sess.status = "stopped"
+    sess.stopped_at = time.time()
     sess.save()
     sess.log("stop", was_alive=was_alive, **({"via": via} if via else {}))
     return {"name": name, "stopped": True, "was_alive": was_alive}
@@ -529,8 +550,15 @@ def _dir_size(path: Path) -> int:
 
 
 def purge_sessions(names: Sequence[str] | None = None,
-                   all_sessions: bool = False) -> dict[str, Any]:
+                   all_sessions: bool = False,
+                   stopped_older_than: float | None = None) -> dict[str, Any]:
     """Delete the sandbox directories of sessions that are not running.
+
+    ``stopped_older_than`` (seconds) restricts the sweep to sessions that
+    have been inert at least that long (by their ``idle_for``); fresher
+    ones are reported under ``skipped_recent`` and left alone, so a heavy
+    parallel run can GC stale sandboxes without touching just-stopped
+    ones.  It composes with both explicit names and ``all_sessions``.
 
     Running sessions are NEVER purged: naming one is a loud error, and
     under ``all_sessions`` they are skipped and reported.  Before the
@@ -575,11 +603,25 @@ def purge_sessions(names: Sequence[str] | None = None,
         targets = list(listing.values())
     purged: list[dict[str, Any]] = []
     skipped: list[str] = []
+    too_young: list[str] = []
     freed = 0
     for entry in targets:
         if entry["status"] == "running":
             skipped.append(entry["name"])
             continue
+        if stopped_older_than is not None:
+            idle = entry.get("idle_for")
+            if idle is None and entry["status"] == "corrupt":
+                # Corrupt registries have no idle_for; fall back to the
+                # registry file's mtime so the age filter still applies.
+                try:
+                    idle = time.time() - (root / entry["name"]
+                                          / "session.json").stat().st_mtime
+                except OSError:
+                    idle = None
+            if idle is not None and idle < stopped_older_than:
+                too_young.append(entry["name"])
+                continue
         path = root / entry["name"]
         if entry["status"] == "corrupt":
             # No loadable registry: kill any tmux server still bound to
@@ -614,7 +656,7 @@ def purge_sessions(names: Sequence[str] | None = None,
         shutil.rmtree(path, ignore_errors=True)
         purged.append({"name": entry["name"], "status": entry["status"]})
     return {"purged": purged, "skipped_running": skipped,
-            "freed_bytes": freed}
+            "skipped_recent": too_young, "freed_bytes": freed}
 
 
 def session_info(name: str) -> dict[str, Any]:

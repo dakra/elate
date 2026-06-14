@@ -16,8 +16,13 @@ description: Spawns sandboxed Emacs sessions (terminal or GUI) and drives them
 
 elate spawns disposable, sandboxed Emacs sessions (fresh fake `$HOME`,
 generated init, private tmux server) and gives you structured control and
-observation over them. Run it with `uvx elate …` (PyPI; no install step).
-In a checkout of the elate repo itself, use `uv run elate …` instead.
+observation over them. Run it with `uvx elate …` (PyPI; no install step),
+or `uv tool install elate` once to put `elate` on `PATH` (handy when many
+sub-agents each shell out). In a checkout of the elate repo itself, use
+`uv run elate …` instead. After `claude plugin update`, the CLI (`uvx`/`uv
+run`) is already on the new version while the registered MCP server stays
+on the old one until the client restarts — so mid-session the CLI is the
+live path.
 
 Supporting files (read on demand):
 - [REFERENCE.md](REFERENCE.md) — every command, option, default (generated from the CLI)
@@ -96,20 +101,30 @@ Never sleep-and-poll. Never assume an effect happened — observe it.
 | answering an already-open prompt | `type 'filename'` then `keys RET --events` |
 | Emacs is wedged/busy, nothing responds | `keys C-g --raw` (TTY only) |
 | literal text into a buffer | `type 'hello'` (or `eval '(insert …)'` for bulk) |
+| drive a **subprocess** (shell/REPL): ^C, feed input | `send-process --char C-c` / `send-process 'cmd\n'` |
 
-Why: semantic delivery runs `execute-kbd-macro`, which does **not** block on
-an open minibuffer prompt — it exits the prompt with empty input (bare
-`M-x` errors with "'' is not a valid command name"). `--events` queues on
-`unread-command-events` instead, so the prompt stays open for you to
-inspect (`state` shows prompt + candidates) and answer.
+Why: semantic delivery runs `execute-kbd-macro`, which runs the keys
+**through the command loop** — so they obey whatever keymaps are active.
+In an evil buffer in *normal* state, `type "abc"` sends the commands `a`,
+`b`, `c`, not the text; enter insert state (or use `--raw`) first. And it
+does **not** block on an open minibuffer prompt — it exits the prompt with
+empty input (bare `M-x` errors with "'' is not a valid command name").
+`--events` queues on `unread-command-events` instead, so the prompt stays
+open for you to inspect (`state` shows prompt + candidates) and answer.
 
 - `--raw` sends real terminal bytes via tmux: works even when Emacs is
   stuck (the unwedging tool), but rejects chords a terminal cannot encode
   (e.g. `C-%`) and does not exist for GUI sessions.
-- A semantic `keys` error "Keyboard macro terminated by a command ringing
-  the bell" means the sequence hit an **undefined key** or a command
-  signalled. Diagnose with `describe key 'C-c g'` (bound? to what?) and
-  `messages`.
+- A command that **rings the bell** aborts the whole semantic macro. elate
+  reports the culprit — `key delivery aborted -- COMMAND rang the bell in
+  BUFFER at point N` — so diagnose with `describe key …` / `messages`. To
+  deliver *past* a spurious bell (e.g. evil insert off the prompt row),
+  use `keys … --no-abort-on-bell` (queued via events, so asynchronous —
+  follow with a `wait`).
+- `send-process` writes straight to a buffer's subprocess
+  (`process-send-string`), bypassing the command loop: `--char C-c`
+  interrupts a job, `send-process 'cmd\n'` feeds a shell/REPL, `--file`
+  seeds a large payload. `keys`/`type` drive Emacs; this drives the process.
 - If a semantic `keys` call times out, the sequence probably left Emacs
   reading input: retry with `--events`, or recover with `C-g --raw`.
 - After an eval/keys timeout where Emacs stays busy: `keys C-g --raw`
@@ -138,6 +153,7 @@ Screenshots are for humans; assertions should read structure:
 ```sh
 uvx elate -s s buffer demo.el --props        # RLE face/property runs + overlays
 uvx elate -s s faces-at 3:14 --buffer demo.el  # LINE:COL (1-based:0-based)
+uvx elate -s s faces-at --pos 420 --run 3    # by position; 3 adjacent cells at once
 uvx elate -s s popups                        # transient/which-key/corfu/childframes as text
 ```
 - `--props` runs `font-lock-ensure` first, so never-displayed buffers
@@ -145,7 +161,10 @@ uvx elate -s s popups                        # transient/which-key/corfu/childfr
 - `faces-at` reports every text property at the point, with **values**
   (`property-values`: e.g. your own `my-prompt=t` vs `my-count=42`) — use it
   to assert a package's custom text properties instead of repeated
-  `eval (get-text-property …)`. Over MCP it is `elate_faces_at`.
+  `eval (get-text-property …)`. Address by `LINE:COL` or `--pos N` (a buffer
+  position, handy from elisp); `--run K` dumps K adjacent cells in one call
+  (compare a typed cell against the dimmed suggestion beside it). Over MCP it
+  is `elate_faces_at` (`pos` / `run`).
 - `state`'s `popups` field tells you when a `popups` capture is worthwhile.
 - TTY `screenshot` prints the rendered screen as text (works post-mortem on
   a crashed Emacs); GUI `screenshot -o x.png` writes a PNG you can Read.
@@ -196,14 +215,21 @@ every step and assertion kind: see [SCRIPTING.md](SCRIPTING.md).
 
 ## JSON output and exit codes
 
-Every command takes a global `--json` (before the subcommand):
+Output is the human table on a terminal and **JSON when stdout is not a TTY**
+— i.e. you get clean JSON automatically when piping or running headless, no
+flag needed. Force it either way with the global `--json` / `--human` (before
+the subcommand):
 
 ```sh
-uvx elate --json -s s eval '(emacs-version)'   # {"ok": true, "value": …}
+uvx elate -s s eval '(emacs-version)' | cat     # piped → {"ok": true, "value": …}
+uvx elate --json -s s eval '(emacs-version)'    # force JSON even on a terminal
+uvx elate --human -s s list | less              # force the table even when piped
 ```
-Errors embed a state snapshot so you see *why*. Exit codes: **0** success,
-**1** error (elisp errors, test failures, lint findings), **2** CLI usage
-error, **3** `wait` timeout. Branch on them in shell loops.
+Parse the JSON — don't scrape the human table (`eval --json` gives `value`,
+`value-length`, `truncated`, `error`, `backtrace`, `messages`). Errors embed a
+state snapshot so you see *why*. Exit codes: **0** success, **1** error (elisp
+errors, test failures, lint findings), **2** CLI usage error, **3** `wait`
+timeout. Branch on them in shell loops.
 
 ## GUI sessions (when TTY isn't enough)
 
@@ -227,7 +253,7 @@ images** instead of PNG files to read. If `elate_*` MCP tools are already
 available in your session (the Claude Code plugin registers the server
 automatically), use them directly — do **not** register a duplicate;
 otherwise the server can be registered with
-`claude mcp add elate -- uvx elate mcp`. The 24 `elate_*` tools cover the core surface (`resize`,
+`claude mcp add elate -- uvx elate mcp`. The 25 `elate_*` tools cover the core surface (`resize`,
 `export-script`, `snap`, and `matrix` stay CLI-only); sessions are shared
 between both (same names, same sandboxes), so you can mix.
 
@@ -239,9 +265,10 @@ uvx elate stop NAME       # stop every session you started
 ```
 `elate stop` ends the session's processes; a crashed TTY Emacs keeps a
 dead pane for post-mortem `screenshot` until stopped. A stopped session's
-sandbox dir — and its `stopped` entry in `elate list` — stays behind on
-purpose (transcripts outlive the Emacs). Stopped sandboxes are inert;
-when the transcripts are no longer needed, `elate purge NAME…` (or
-`elate purge --all`) deletes them — purge never touches a running
-session. Sandboxes live under `~/.cache/elate/sessions/<name>`
-(`$ELATE_HOME` overrides the base).
+sandbox dir — and its `stopped` entry in `elate list` (which shows each
+one's idle age) — stays behind on purpose (transcripts outlive the Emacs).
+Stopped sandboxes are inert; when the transcripts are no longer needed,
+`elate purge NAME…` (or `elate purge --all`) deletes them — purge never
+touches a running session. During a long parallel run, GC only the stale
+ones with `elate purge --all --stopped-older-than 1h`. Sandboxes live
+under `~/.cache/elate/sessions/<name>` (`$ELATE_HOME` overrides the base).

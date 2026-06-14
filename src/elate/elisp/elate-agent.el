@@ -236,6 +236,13 @@ Errors are reported as {ok: false, error, backtrace}."
   "The buffer a user would consider current: the selected window's buffer."
   (window-buffer (selected-window)))
 
+(defun elate--resolve-buffer (name)
+  "Buffer named NAME (a string), or the current buffer when NAME is nil.
+Errors when NAME is given but no such buffer exists."
+  (if (and name (stringp name))
+      (or (get-buffer name) (error "elate: no buffer named %S" name))
+    (elate--current-buffer)))
+
 (defun elate--minibuffer-completions ()
   "Completion candidates plist for the current minibuffer, or nil.
 Capped at 50 candidates; :truncated says whether more exist.  Never
@@ -557,12 +564,32 @@ reaches a timer-servicing point."
                           (buffer-substring-no-properties
                            (min msg-start (point-max)) (point-max))))))))
 
+(defun elate--macro-abort-report (err keys)
+  "Re-signal ERR from a `execute-kbd-macro' of KEYS with the culprit named.
+A command that rings the bell terminates the whole macro at C level
+\(`bitch_at_user'), and the default message names neither the command nor
+where it stopped.  When that is what happened, surface `this-command',
+the keys read for it, the buffer, and point; otherwise propagate ERR
+unchanged."
+  (let ((msg (error-message-string err)))
+    (if (string-match-p "ringing the bell" msg)
+        (error (concat "elate: key delivery aborted -- %s rang the bell "
+                       "in %s at point %d (keys read: %s); the rest of %S "
+                       "did not run. Retry with --no-abort-on-bell or --raw.")
+               (if this-command (format "%S" this-command) "a command")
+               (buffer-name)
+               (point)
+               (key-description (this-command-keys-vector))
+               keys)
+      (signal (car err) (cdr err)))))
+
 (defun elate--rpc-keys (keys &optional method)
   "Deliver KEYS (an Emacs kbd string) semantically.
 METHOD is \"macro\" (default; `execute-kbd-macro', synchronous) or
 \"events\" (append to `unread-command-events'; asynchronous, processed
 when control returns to the command loop -- use this for sequences that
-leave a prompt open)."
+leave a prompt open, or that may ring the bell: events delivery is not a
+macro, so a bell merely beeps instead of aborting the sequence)."
   (let ((vec (kbd keys)))
     (pcase (or method "macro")
       ("events"
@@ -571,8 +598,10 @@ leave a prompt open)."
                     (listify-key-sequence vec)))
        (list :delivered "events" :keys keys))
       ("macro"
-       (execute-kbd-macro vec)
-       (list :delivered "macro" :keys keys))
+       (condition-case err
+           (progn (execute-kbd-macro vec)
+                  (list :delivered "macro" :keys keys))
+         (error (elate--macro-abort-report err keys))))
       (other (error "elate: unknown key delivery method %S" other)))))
 
 (defun elate--rpc-type (text-b64)
@@ -773,6 +802,37 @@ the buffer has a running process).  A missing buffer reports
                 :tick (buffer-chars-modified-tick)
                 :live-process (elate--jbool
                                (and proc (process-live-p proc)))))))))
+
+(defun elate--send-to-process (name payload)
+  "Send string PAYLOAD to the live subprocess of buffer NAME; report it.
+NAME defaults to the current buffer.  Errors when the buffer has no
+running process (so it never silently goes nowhere)."
+  (let* ((buf (elate--resolve-buffer name))
+         (proc (get-buffer-process buf)))
+    (unless (and proc (process-live-p proc))
+      (error "elate: buffer %S has no live process" (buffer-name buf)))
+    (process-send-string proc payload)
+    (list :process (process-name proc)
+          :buffer (buffer-name buf)
+          :bytes (string-bytes payload))))
+
+(defun elate--rpc-send-process (&optional name text-b64 as-kbd)
+  "Send input to the subprocess of buffer NAME (default: current).
+TEXT-B64 is base64 UTF-8.  With AS-KBD non-nil it is an Emacs kbd
+string, so \"C-c\" sends ^C (SIGINT to a shell's foreground job),
+\"RET\" sends a newline, etc.  This is the comint/REPL/terminal
+companion to keys: it talks to the process, not the command loop."
+  (let ((payload (if text-b64 (elate--decode-string text-b64) "")))
+    (when as-kbd
+      (setq payload (concat (kbd payload))))
+    (elate--send-to-process name payload)))
+
+(defun elate--rpc-send-process-file (path &optional name)
+  "Send the contents of PATH to the subprocess of buffer NAME.
+For payloads too large for the argv limit -- PATH is read inside Emacs
+rather than carried through emacsclient's command line."
+  (elate--send-to-process
+   name (with-temp-buffer (insert-file-contents path) (buffer-string))))
 
 ;;;; describe
 
@@ -2106,69 +2166,112 @@ merged away.  Returns {:runs VECTOR :truncated BOOL}."
     (list :overlays (vconcat (mapcar #'elate--overlay-entry ovs))
           :overlays-truncated (elate--jbool truncated))))
 
+(defconst elate--max-faces-cells 500
+  "Cap on the number of cells a single `faces-range' may return.")
+
+(defun elate--faces-ensure-font-lock (beg end)
+  "Ensure font-lock over the whole lines spanning BEG..END (best effort)."
+  (when (and font-lock-mode (fboundp 'font-lock-ensure))
+    (ignore-errors
+      (font-lock-ensure
+       (save-excursion (goto-char beg) (line-beginning-position))
+       (save-excursion (goto-char end) (line-end-position))))))
+
+(defun elate--faces-cell (pos)
+  "Face/text-property/overlay descriptor at POS in the current buffer.
+The caller must have widened and ensured font-lock as needed.  :face is
+the text-property face; :char-face additionally resolves overlays (what
+the user actually sees); :properties lists every text property name and
+:property-values pairs each with its clipped printed value (so a flag t
+reads differently from a number)."
+  (pcase-let ((`(,face ,display ,invisible ,button ,field ,keymap)
+               (elate--props-signature pos)))
+    (list :pos pos
+          :line (line-number-at-pos pos t)
+          :column (save-excursion (goto-char pos) (current-column))
+          :char (if (>= pos (point-max)) :null
+                  (char-to-string (char-after pos)))
+          :face (elate--jnull (elate--face-list face))
+          :char-face (elate--jnull
+                      (elate--face-list (get-char-property pos 'face)))
+          :display (if display (elate--clip-print display) :null)
+          :invisible (if invisible (elate--clip-print invisible) :null)
+          :button (elate--jbool button)
+          :field (if field (elate--clip-print field) :null)
+          :keymap (elate--jbool keymap)
+          :properties (vconcat
+                       (let ((plist (text-properties-at pos)) (names nil))
+                         (while plist
+                           (push (symbol-name (car plist)) names)
+                           (setq plist (cddr plist)))
+                         (nreverse names)))
+          ;; Names alone cannot tell `ghostel-prompt' = t from a number;
+          ;; carry the clipped printed value of each.
+          :property-values
+          (vconcat
+           (let ((plist (text-properties-at pos)) (out nil))
+             (while plist
+               (push (list :name (symbol-name (car plist))
+                           :value (elate--clip-print (cadr plist)))
+                     out)
+               (setq plist (cddr plist)))
+             (nreverse out)))
+          :overlays (vconcat
+                     (mapcar #'elate--overlay-entry (overlays-at pos))))))
+
 (defun elate--rpc-faces-at (line col &optional name)
   "Faces, text properties, and overlays at LINE:COL in buffer NAME.
-LINE is 1-based, COL 0-based (clamped to the line).  :face is the
-text-property face; :char-face additionally resolves overlays (what
-the user actually sees); :properties lists every text property name
-present at the position, and :property-values pairs each name with its
-clipped printed value (so a flag t reads differently from a number)."
-  (let ((buf (if (and name (stringp name))
-                 (or (get-buffer name)
-                     (error "elate: no buffer named %S" name))
-               (elate--current-buffer))))
-    (with-current-buffer buf
-      (save-excursion
-        (save-restriction
-          (widen)
-          (goto-char (point-min))
-          (forward-line (1- (max 1 line)))
-          (move-to-column (max 0 col))
-          (let ((pos (point)))
-            (when (and font-lock-mode (fboundp 'font-lock-ensure))
-              (ignore-errors
-                (font-lock-ensure (line-beginning-position)
-                                  (line-end-position))))
-            (pcase-let ((`(,face ,display ,invisible ,button ,field ,keymap)
-                         (elate--props-signature pos)))
-              (list :buffer (buffer-name)
-                    :pos pos
-                    :line (line-number-at-pos pos t)
-                    :column (current-column)
-                    :char (if (eobp) :null (char-to-string (char-after pos)))
-                    :face (elate--jnull (elate--face-list face))
-                    :char-face (elate--jnull
-                                (elate--face-list
-                                 (get-char-property pos 'face)))
-                    :display (if display (elate--clip-print display) :null)
-                    :invisible (if invisible
-                                   (elate--clip-print invisible)
-                                 :null)
-                    :button (elate--jbool button)
-                    :field (if field (elate--clip-print field) :null)
-                    :keymap (elate--jbool keymap)
-                    :properties (vconcat
-                                 (let ((plist (text-properties-at pos))
-                                       (names nil))
-                                   (while plist
-                                     (push (symbol-name (car plist)) names)
-                                     (setq plist (cddr plist)))
-                                   (nreverse names)))
-                    ;; Names alone cannot tell `ghostel-prompt' = t from a
-                    ;; number; carry the clipped printed value of each.
-                    :property-values
-                    (vconcat
-                     (let ((plist (text-properties-at pos))
-                           (out nil))
-                       (while plist
-                         (push (list :name (symbol-name (car plist))
-                                     :value (elate--clip-print (cadr plist)))
-                               out)
-                         (setq plist (cddr plist)))
-                       (nreverse out)))
-                    :overlays (vconcat
-                               (mapcar #'elate--overlay-entry
-                                       (overlays-at pos)))))))))))
+LINE is 1-based, COL 0-based (clamped to the line)."
+  (with-current-buffer (elate--resolve-buffer name)
+    (save-excursion
+      (save-restriction
+        (widen)
+        (goto-char (point-min))
+        (forward-line (1- (max 1 line)))
+        (move-to-column (max 0 col))
+        (let ((pos (point)))
+          (elate--faces-ensure-font-lock pos pos)
+          (cons :buffer (cons (buffer-name) (elate--faces-cell pos))))))))
+
+(defun elate--rpc-faces-at-pos (pos &optional name)
+  "Like `faces-at', but addressed by absolute buffer position POS.
+POS is clamped to the buffer; the elisp-driven companion to LINE:COL
+when you already hold a position."
+  (with-current-buffer (elate--resolve-buffer name)
+    (save-excursion
+      (save-restriction
+        (widen)
+        (let ((pos (max (point-min) (min pos (point-max)))))
+          (elate--faces-ensure-font-lock pos pos)
+          (cons :buffer (cons (buffer-name) (elate--faces-cell pos))))))))
+
+(defun elate--rpc-faces-range (start count &optional name)
+  "Cell descriptors for COUNT consecutive positions from START in NAME.
+Returns {:buffer :start :count :cells VECTOR}, one cell per position
+\(same shape as `faces-at').  One call to compare adjacent cells -- e.g.
+a typed character against the dimmed suggestion next to it.  COUNT is
+capped at `elate--max-faces-cells'; over the cap is an error, never a
+silent truncation."
+  (when (> count elate--max-faces-cells)
+    (error "elate: faces range count %d exceeds the cap of %d"
+           count elate--max-faces-cells))
+  (with-current-buffer (elate--resolve-buffer name)
+    (save-excursion
+      (save-restriction
+        (widen)
+        (let* ((start (max (point-min) (min start (point-max))))
+               (n (max 1 count))
+               (cells nil)
+               (p start)
+               (i 0))
+          (elate--faces-ensure-font-lock start (min (point-max) (+ start n)))
+          (while (and (< i n) (<= p (point-max)))
+            (push (elate--faces-cell p) cells)
+            (setq p (1+ p) i (1+ i)))
+          (list :buffer (buffer-name)
+                :start start
+                :count (length cells)
+                :cells (vconcat (nreverse cells))))))))
 
 ;;;; Popup capture
 

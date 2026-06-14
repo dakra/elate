@@ -453,7 +453,7 @@ def test_run_human_output_streams_steps(
         "steps": [{"eval": "(+ 1 1)"},
                   {"assert": {"eval": "nil"}}],
     }, "human.json")
-    code = cli.main(["run", path])
+    code = cli.main(["--human", "run", path])
     out = capsys.readouterr().out
     assert code == 1
     assert "[1/2] eval" in out and "... ok" in out
@@ -504,7 +504,7 @@ def test_export_script_roundtrip(elate_home: str, tmp_path: Path,
         capsys.readouterr()
 
     exported = tmp_path / "exported.json"
-    assert cli.main(["-s", name, "export-script", "-o", str(exported)]) == 0
+    assert cli.main(["--human", "-s", name, "export-script", "-o", str(exported)]) == 0
     human = capsys.readouterr().out
     assert "Best-effort" in human
 
@@ -913,7 +913,7 @@ def test_matrix_of_one(elate_home: str, tmp_path: Path,
     assert entry["passed"] == 2 and entry["failed"] == 0
     assert running_run_sessions() == []
     # Human output renders a summary table.
-    code = cli.main(["matrix", "--emacs", emacs, path])
+    code = cli.main(["--human", "matrix", "--emacs", emacs, path])
     human = capsys.readouterr().out
     assert code == 0
     assert "1/1 version(s) passed" in human

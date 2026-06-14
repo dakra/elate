@@ -474,14 +474,14 @@ def test_cli_profile_commands(sess: S.Session,
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True and out["cpu"]["total"] > 0
     # Human rendering names the sections and the profiled function.
-    assert cli.main(["-s", NAME, "profile", "run", "(pfix-busy)", "--cpu"]) == 0
+    assert cli.main(["--human", "-s", NAME, "profile", "run", "(pfix-busy)", "--cpu"]) == 0
     human = capsys.readouterr().out
     assert "== CPU:" in human and "top functions" in human
     assert "calltree" in human and "pfix-busy" in human
     # start/stop/report cycle through the CLI.
-    assert cli.main(["-s", NAME, "profile", "start", "--mem"]) == 0
+    assert cli.main(["--human", "-s", NAME, "profile", "start", "--mem"]) == 0
     assert "profiler started (mem)" in capsys.readouterr().out
-    assert cli.main(["-s", NAME, "profile", "stop"]) == 0
+    assert cli.main(["--human", "-s", NAME, "profile", "stop"]) == 0
     assert "profiler stopped" in capsys.readouterr().out
     assert cli.main(["--json", "-s", NAME, "profile", "report"]) == 0
     assert json.loads(capsys.readouterr().out)["ok"] is True
@@ -567,7 +567,7 @@ def test_bench_interpreted_fallback(sess: S.Session) -> None:
 
 def test_cli_bench_command(sess: S.Session,
                            capsys: pytest.CaptureFixture[str]) -> None:
-    assert cli.main(["-s", NAME, "bench", "(make-list 100 t)", "-n", "50"]) == 0
+    assert cli.main(["--human", "-s", NAME, "bench", "(make-list 100 t)", "-n", "50"]) == 0
     human = capsys.readouterr().out
     assert "50 repetition(s)" in human and "byte-compiled" in human
     assert "GC:" in human and "allocations:" in human and "conses" in human

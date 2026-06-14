@@ -32,8 +32,8 @@ HEADER = """\
      CI fails when this file drifts from the CLI. -->
 
 Generated from the `elate` argparse tree. Every command also accepts the
-global options below; `--json` makes the output machine-readable and is
-the right default for programmatic use.
+global options below. Output is JSON automatically when stdout is not a
+terminal (i.e. for programmatic use); `--json` / `--human` force either.
 """
 
 
@@ -100,7 +100,11 @@ def _argument_lines(parser: argparse.ArgumentParser) -> list[str]:
         lines.append(line)
     for group in parser._mutually_exclusive_groups:  # noqa: SLF001
         spelled = " | ".join(
-            a.option_strings[-1] for a in group._group_actions)  # noqa: SLF001
+            # positionals in a group have no option strings: spell them by
+            # metavar/dest so e.g. `send-process` (TEXT | --char | --file) renders.
+            (a.option_strings[-1] if a.option_strings
+             else (a.metavar or a.dest).upper())
+            for a in group._group_actions)  # noqa: SLF001
         lines.append(f"- mutually exclusive: `{spelled}`")
     return lines
 

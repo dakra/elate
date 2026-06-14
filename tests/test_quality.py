@@ -505,7 +505,7 @@ def test_cli_test_command(sess: S.Session, fixtures: dict[str, Path],
     assert out["ok"] is True and out["passed"] == 1
     assert out["loaded"] == [str(fixtures["ert"].resolve())]
     # Failing run: exit 1, ok false, human summary names the test.
-    code = cli.main(["-s", NAME, "test", "elfix-fail-should"])
+    code = cli.main(["--human", "-s", NAME, "test", "elfix-fail-should"])
     human = capsys.readouterr().out
     assert code == 1
     assert "Ran 1 test(s)" in human
@@ -635,7 +635,7 @@ def test_lint_missing_file_and_empty(sess: S.Session) -> None:
 
 def test_cli_lint_command(sess: S.Session, fixtures: dict[str, Path],
                           capsys: pytest.CaptureFixture[str]) -> None:
-    code = cli.main(["-s", NAME, "lint", str(fixtures["dirty"])])
+    code = cli.main(["--human", "-s", NAME, "lint", str(fixtures["dirty"])])
     human = capsys.readouterr().out
     assert code == 1
     assert "[byte-compile]" in human and "[checkdoc]" in human
@@ -777,7 +777,7 @@ def test_cli_lint_package_lint(elate_home: str, tmp_path: Path,
         assert any(i["tool"] == "package-lint" for i in out["items"])
 
         # Human output tags the tool.
-        code = cli.main(["-s", name, "lint", "--package-lint",
+        code = cli.main(["--human", "-s", name, "lint", "--package-lint",
                          "--archive-dir", str(archive), str(fixture)])
         human = capsys.readouterr().out
         assert "[package-lint]" in human
@@ -944,7 +944,7 @@ def test_cli_faces_at_and_buffer_props(sess: S.Session,
                      "--buffer", "elprops"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True and out["face"] == ["font-lock-keyword-face"]
-    assert cli.main(["-s", NAME, "buffer", "elprops", "--props"]) == 0
+    assert cli.main(["--human", "-s", NAME, "buffer", "elprops", "--props"]) == 0
     human = capsys.readouterr().out
     assert "property runs" in human and "font-lock-keyword-face" in human
     code = cli.main(["--json", "-s", NAME, "faces-at", "nonsense"])
@@ -967,6 +967,114 @@ def test_faces_at_property_values(sess: S.Session) -> None:
     # Names list stays for back-compat.
     assert "ghostel-prompt" in data["properties"]
     sess.semantic().eval_form('(kill-buffer "elpropvals")')
+
+
+def test_faces_at_pos_and_run(sess: S.Session) -> None:
+    assert sess.semantic().eval_form(
+        '(with-current-buffer (get-buffer-create "elposrun")'
+        ' (erase-buffer) (fundamental-mode) (insert "abcdef")'
+        " (put-text-property 1 3 'mark t) t)"
+    )["error"] is None
+    # Address by absolute position.
+    cell = sess.semantic().rpc("faces-at-pos", 1, "elposrun")
+    assert cell["char"] == "a" and cell["pos"] == 1 and "mark" in cell["properties"]
+    # A run of adjacent cells in one call.
+    rng = sess.semantic().rpc("faces-range", 1, 3, "elposrun")
+    assert rng["count"] == 3
+    assert [c["char"] for c in rng["cells"]] == ["a", "b", "c"]
+    # mark is on positions 1..2 (put 1..3 covers the chars at pos 1 and 2).
+    assert "mark" in rng["cells"][0]["properties"]
+    assert "mark" not in rng["cells"][2]["properties"]
+    # Over the cap is a clean error, never a silent truncation.
+    with pytest.raises(RpcError):
+        sess.semantic().rpc("faces-range", 1, 100000, "elposrun")
+    sess.semantic().eval_form('(kill-buffer "elposrun")')
+
+
+def test_cli_faces_at_pos_and_run(sess: S.Session,
+                                  capsys: pytest.CaptureFixture[str]) -> None:
+    sess.semantic().eval_form(
+        '(with-current-buffer (get-buffer-create "elcliposrun")'
+        ' (erase-buffer) (insert "xyz") t)')
+    assert cli.main(["--json", "-s", NAME, "faces-at", "--pos", "1",
+                     "--buffer", "elcliposrun"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["char"] == "x"
+    assert cli.main(["--json", "-s", NAME, "faces-at", "--pos", "1", "--run", "3",
+                     "--buffer", "elcliposrun"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["count"] == 3
+    assert [c["char"] for c in out["cells"]] == ["x", "y", "z"]
+    # Neither LINE:COL nor --pos is a usage-level error.
+    code = cli.main(["--json", "-s", NAME, "faces-at", "--buffer", "elcliposrun"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "pos" in out["error"]
+    sess.semantic().eval_form('(kill-buffer "elcliposrun")')
+
+
+# -- keys: command-loop / bell handling --------------------------------------
+
+def test_keys_bell_abort_reports_culprit(sess: S.Session,
+                                         capsys: pytest.CaptureFixture[str]) -> None:
+    # A command that rings the bell aborts a semantic macro; name the culprit.
+    sess.semantic().eval_form(
+        '(global-set-key (kbd "<f8>") (lambda () (interactive) (ding)))')
+    try:
+        code = cli.main(["--json", "-s", NAME, "keys", "<f8>"])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 1 and out["ok"] is False
+        assert "rang the bell" in out["error"] and "<f8>" in out["error"]
+        # --no-abort-on-bell delivers past it (events path, non-aborting).
+        code = cli.main(["--json", "-s", NAME, "keys", "<f8>", "--no-abort-on-bell"])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 0 and out["ok"] is True and out["delivered"] == "events"
+    finally:
+        sess.semantic().eval_form('(global-unset-key (kbd "<f8>"))')
+
+
+# -- send-process (drive a buffer's subprocess) ------------------------------
+
+def _b64(s: str) -> str:
+    return base64.b64encode(s.encode("utf-8")).decode("ascii")
+
+
+def test_send_process_drives_subprocess(sess: S.Session) -> None:
+    assert sess.semantic().eval_form(
+        '(progn (ignore-errors (kill-buffer "*shell*"))'
+        ' (require (quote shell))'
+        ' (setq explicit-shell-file-name "/bin/sh" shell-file-name "/bin/sh")'
+        ' (shell) t)'
+    )["error"] is None
+    S.wait_stable(sess, buffer="*shell*", quiet_ms=300, timeout=10.0)
+    # Feed a command + newline; it runs in the shell.
+    data = sess.semantic().rpc("send-process", "*shell*",
+                               _b64("echo elate-sp-marker\n"), False)
+    assert data["buffer"] == "*shell*" and data["bytes"] > 0
+    S.wait_stable(sess, buffer="*shell*", quiet_ms=400, timeout=10.0)
+    out = sess.semantic().eval_form(
+        '(with-current-buffer "*shell*"'
+        ' (and (string-match-p "elate-sp-marker" (buffer-string)) t))')
+    assert out["value"] == "t"
+    # --char C-c interrupts a running job. Prove it by responsiveness: kill a
+    # long sleep, then a probe must run promptly -- if the sleep were still
+    # blocking the shell, the probe would queue behind its full 20s.
+    sess.semantic().rpc("send-process", "*shell*", _b64("sleep 20\n"), False)
+    S.wait_stable(sess, buffer="*shell*", quiet_ms=300, timeout=10.0)  # sleep running
+    sess.semantic().rpc("send-process", "*shell*", _b64("C-c"), True)
+    sess.semantic().rpc("send-process", "*shell*",
+                        _b64("echo back-$((6*7))\n"), False)
+    S.wait_stable(sess, buffer="*shell*", quiet_ms=500, timeout=8.0)
+    out = sess.semantic().eval_form(
+        '(with-current-buffer "*shell*"'
+        ' (and (string-match-p "back-42" (buffer-string)) t))')
+    assert out["value"] == "t"  # shell answered fast => the sleep was killed
+    # A buffer with no live process is a clean error.
+    with pytest.raises(RpcError, match="no live process"):
+        sess.semantic().rpc("send-process", "*Messages*", _b64("x"), False)
+    # Kill with the process-kill query disabled, else kill-buffer prompts.
+    sess.semantic().eval_form(
+        '(let ((kill-buffer-query-functions nil))'
+        ' (ignore-errors (kill-buffer "*shell*")))')
 
 
 # -- wait stable (buffer-output settled) -------------------------------------
@@ -1138,11 +1246,11 @@ def test_popup_completion_preview(sess: S.Session) -> None:
 def test_cli_popups_command(sess: S.Session,
                             capsys: pytest.CaptureFixture[str]) -> None:
     S.wait_idle(sess, timeout=10.0)
-    assert cli.main(["-s", NAME, "popups"]) == 0
+    assert cli.main(["--human", "-s", NAME, "popups"]) == 0
     assert "no popups" in capsys.readouterr().out
     assert sess.semantic().eval_form("(elfix-transient)")["error"] is None
     try:
-        assert cli.main(["-s", NAME, "popups"]) == 0
+        assert cli.main(["--human", "-s", NAME, "popups"]) == 0
         human = capsys.readouterr().out
         assert "== transient" in human and "alpha action" in human
         assert cli.main(["--json", "-s", NAME, "popups"]) == 0
@@ -1150,7 +1258,7 @@ def test_cli_popups_command(sess: S.Session,
         assert out["ok"] is True
         assert [p["kind"] for p in out["popups"]] == ["transient"]
         # The human state output points at the popups command.
-        assert cli.main(["-s", NAME, "state"]) == 0
+        assert cli.main(["--human", "-s", NAME, "state"]) == 0
         assert "popups: transient" in capsys.readouterr().out
     finally:
         sess.raw().send_kbd("C-g")

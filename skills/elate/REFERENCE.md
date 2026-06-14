@@ -5,14 +5,16 @@
      CI fails when this file drifts from the CLI. -->
 
 Generated from the `elate` argparse tree. Every command also accepts the
-global options below; `--json` makes the output machine-readable and is
-the right default for programmatic use.
+global options below. Output is JSON automatically when stdout is not a
+terminal (i.e. for programmatic use); `--json` / `--human` force either.
 
 ## Global options
 
 - `--version` -- show program's version number and exit
-- `--json` -- machine-readable JSON output
+- `--json` -- force machine-readable JSON output
+- `--human` -- force the human-readable table, even when piped
 - `-s, --session NAME` -- session to operate on
+- mutually exclusive: `--json | --human`
 
 ## Commands
 
@@ -23,6 +25,7 @@ the right default for programmatic use.
 - [`elate info`](#elate-info)
 - [`elate keys`](#elate-keys)
 - [`elate type`](#elate-type)
+- [`elate send-process`](#elate-send-process)
 - [`elate mouse`](#elate-mouse)
 - [`elate resize`](#elate-resize)
 - [`elate eval`](#elate-eval)
@@ -83,6 +86,7 @@ Delete the sandbox directories (transcripts included) of sessions that are no lo
 
 - `[NAME]` (repeatable) -- session to purge (repeatable)
 - `--all` -- purge every session that is not running
+- `--stopped-older-than DUR` -- only purge sessions inert at least this long (e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- keeps just-stopped sandboxes during heavy runs
 
 ## elate info
 
@@ -98,6 +102,7 @@ send keys (Emacs kbd notation)
 - `--semantic` -- deliver via execute-kbd-macro (default)
 - `--raw` -- deliver as raw terminal bytes via tmux
 - `--events` -- semantic, but queue on unread-command-events (non-blocking; use for sequences that open a prompt)
+- `--no-abort-on-bell` -- deliver via unread-command-events so a command that rings the bell (e.g. evil insert off the prompt row) beeps instead of aborting the whole sequence; asynchronous -- follow with a wait. Semantic keys run through the command loop and obey active keymaps (evil state etc.)
 - `--timeout TIMEOUT` (default: 15)
 - mutually exclusive: `--semantic | --raw`
 
@@ -108,6 +113,18 @@ type literal text (raw channel on tty; queued events on gui)
 Type literal text as if at the keyboard. TTY: raw terminal bytes via tmux. GUI: queued key events through the command loop -- needs a responsive Emacs and is capped at 10000 characters (for bulk text, eval an insert instead). Text starting with a dash needs '--' first: elate -s N type -- '-foo'.
 
 - `text`
+
+## elate send-process
+
+send raw input to a buffer's subprocess (comint/REPL/shell)
+
+Write bytes straight to the process behind a buffer (`process-send-string`), bypassing the command loop -- for driving shells/REPLs/terminals. Unlike keys/type (which talk to Emacs), this talks to the subprocess: send ^C to interrupt a job, seed shell history, feed a REPL. Errors if the buffer has no live process.
+
+- `[text]` -- literal text to send
+- `--char KBD` -- send an Emacs kbd string, e.g. 'C-c' (^C / SIGINT), 'RET' (newline), 'TAB'
+- `--file PATH` -- send the contents of PATH (read inside Emacs; for payloads past the argv size limit)
+- `--buffer NAME` -- buffer whose process to target (default: current)
+- mutually exclusive: `TEXT | --char | --file`
 
 ## elate mouse
 
@@ -198,7 +215,9 @@ Time FORM over --repetitions calls via Emacs's benchmark-call, byte-compiling th
 
 faces, text properties, and overlays at a buffer position
 
-- `LINE:COL` -- 1-based line, 0-based column
+- `[LINE:COL]` -- 1-based line, 0-based column (or use --pos)
+- `--pos N` -- address by absolute buffer position instead of LINE:COL (handy from elisp, which holds positions)
+- `--run K` (default: 1) -- dump K consecutive cells from the position in one call (default 1) -- e.g. compare a typed cell against the suggestion cell next to it
 - `--buffer NAME` -- buffer to inspect (default: current)
 
 ## elate popups

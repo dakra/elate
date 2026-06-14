@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.5.0
+
+Follow-ups from a second heavy session -- this time driving the CLI directly
+with four parallel sub-agents. Mostly discoverability and agent-CLI
+ergonomics.
+
+- **JSON by default for non-interactive use.** The CLI now emits JSON
+  automatically when stdout is not a TTY (a pipe or an agent), and the human
+  table on a terminal -- so programmatic callers get structured output
+  without remembering `--json`. Force either mode with the global `--json` /
+  `--human`.
+- **The declarative layer is now surfaced where agents work.** The MCP server
+  instructions point at `elate_run_script` (and the CLI's `export-script` /
+  `matrix`), the `elate --help` epilog points at `run`/`export-script`/
+  `matrix`, and `AGENTS.md` covers `matrix` -- the scenario workflow was easy
+  to miss from the imperative loop.
+- **`faces-at` addressing:** `--pos N` (an absolute buffer position, natural
+  from elisp) in addition to `LINE:COL`, and `--run K` to dump K adjacent
+  cells in one call (e.g. compare a typed cell against the dimmed suggestion
+  beside it). Mirrored on `elate_faces_at` (`pos` / `run`).
+- **`send-process`** (CLI `send-process`; MCP `elate_send_process`): write raw
+  input straight to a buffer's subprocess (`process-send-string`), bypassing
+  the command loop -- `--char C-c` interrupts a job, text/`--file` feeds a
+  shell/REPL. `keys`/`type` drive Emacs; this drives the process.
+- **keys through the command loop, documented and tamed.** Semantic `keys`
+  obey the active keymaps (in evil normal state plain letters are commands,
+  not text); a command that rings the bell aborts a `--semantic` macro -- the
+  error now names the culprit command/key/point instead of the opaque
+  "terminated by a command ringing the bell". New `keys --no-abort-on-bell`
+  delivers past a spurious bell via the events path (asynchronous; the
+  bell-tolerant `delivery="events"` was already on `elate_keys`).
+- **Stopped-session GC:** `purge --stopped-older-than DUR` (MCP `elate_purge`
+  `stopped_older_than`) GCs only sessions inert long enough, and `elate list`
+  now shows each stopped session's idle age -- so heavy parallel runs can
+  clean up stale sandboxes without touching just-stopped ones.
+- **Invocation ergonomics (docs):** `uv tool install elate` to put `elate` on
+  `PATH`, and a note that after `claude plugin update` the CLI is the live
+  path while the MCP server stays on the old version until the client
+  restarts.
+
 ## 0.4.0
 
 Follow-ups from a heavy MCP-driven session that drove a subprocess/terminal

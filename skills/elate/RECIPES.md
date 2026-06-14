@@ -161,14 +161,25 @@ printf 'PS1="rc-loaded$ "\n' > fixtures/home/.bashrc
 uvx elate start --name sh --home-seed fixtures/home    # rc in place pre-launch
 uvx elate -s sh eval '(let ((explicit-shell-file-name "/bin/bash")) (shell))'
 uvx elate -s sh wait stable --buffer '*shell*' --quiet-ms 300   # prompt settled
-uvx elate -s sh type 'echo hi-$((1+1))\n'
+
+# Drive the subprocess directly with send-process (talks to the process,
+# not Emacs's command loop) — feed input, then interrupt a runaway job:
+uvx elate -s sh send-process 'echo hi-$((1+1))\n' --buffer '*shell*'
 uvx elate -s sh wait stable --buffer '*shell*' --quiet-ms 300   # output settled
 uvx elate -s sh buffer '*shell*'                       # -> hi-2
+uvx elate -s sh send-process 'sleep 99\n' --buffer '*shell*'
+uvx elate -s sh send-process --char C-c --buffer '*shell*'      # ^C: abandon it
 
-# Verify the package's own text properties (values, not just names):
+# Verify the package's own text properties (values, not just names). Use
+# --pos/--run to compare adjacent cells (e.g. typed vs dimmed suggestion):
 uvx elate -s sh faces-at 1:0 --buffer '*shell*'        # e.g. my-prompt=t
+uvx elate -s sh faces-at --pos 12 --run 4 --buffer '*shell*'
 uvx elate stop sh
 ```
+
+`type` and `keys` run through Emacs's command loop (so they obey the
+buffer's keymaps); `send-process` bypasses it and writes raw bytes to the
+buffer's process — the right tool for shells/REPLs that read from a PTY.
 
 Reuse the same startup setup across many sessions with `--eval-file
 setup.el` (a forms file, no `load-path` side effects) or `--profile NAME`

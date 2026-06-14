@@ -355,10 +355,14 @@ The `minimal` config sets `mouse-wheel-inhibit-click-time nil`: stock
 Emacs silently drops a mouse-2 click arriving within 0.35 s of a wheel
 scroll (anti-accidental-paste), which makes scripted runs flaky.
 
-Every command takes `--json` for machine-readable output:
+Output is the human table on a terminal and **JSON automatically when stdout
+is not a TTY** (piped or headless — what an agent or script sees), so you can
+parse without scraping. Force either mode with the global `--json` / `--human`:
 
 ```sh
-elate --json -s demo eval '(emacs-version)'
+elate -s demo eval '(emacs-version)' | cat    # piped → JSON
+elate --json -s demo eval '(emacs-version)'   # force JSON on a terminal
+elate --human -s demo list | less             # force the table even when piped
 ```
 
 Exit codes: `0` success, `1` error (including elisp errors from `eval`),
@@ -696,7 +700,9 @@ You get:
   `uvx elate mcp` (always the latest PyPI release — the plugin clone stays
   a thin config layer with no environment of its own). The first connect
   may take a few seconds while `uvx` resolves elate from PyPI on a cold
-  cache;
+  cache. After `claude plugin update`, the running MCP server keeps the old
+  version until the client restarts, while the CLI (`uvx`/`uv tool`) picks
+  up the new release immediately — so mid-session the CLI is the live path;
 - the **`emacs-tester` subagent** (`agents/emacs-tester.md`, invokable as
   `elate:emacs-tester`) — a test pilot preloaded with the skill, for
   delegating long interactive test-drives out of the main context; it
@@ -724,7 +730,7 @@ Two notes on `.mcp.json`:
   on elate, register the checkout command from the
   [MCP server](#mcp-server) section instead. And a maintainer with the
   plugin installed who opens this repo gets **two** elate servers (project
-  `elate` plus `plugin:elate:elate`, 44 tools with ambiguous names) —
+  `elate` plus `plugin:elate:elate`, 50 tools with ambiguous names) —
   approve/enable at most one.
 - **Offline / pinned setups:** to run the MCP server from the plugin clone
   itself instead of PyPI, change the server entry to
@@ -859,9 +865,10 @@ responses embed a compact state snapshot so the model sees why):
 
 | tool | purpose |
 |---|---|
-| `elate_start` / `elate_stop` / `elate_list` / `elate_info` / `elate_purge` | session lifecycle (`ui`: `tty` or `gui`; `headless` for Xvfb on Linux; `config` includes `clean-install`; `elate_start` also `eval_files`/`profiles`/`home_seed`; `elate_purge` deletes stopped/dead sandboxes) |
-| `elate_keys` | kbd-notation keys; `delivery`: `semantic`, `events` (holds prompts open), or `raw` (TTY only; works even when Emacs is wedged) |
+| `elate_start` / `elate_stop` / `elate_list` / `elate_info` / `elate_purge` | session lifecycle (`ui`: `tty` or `gui`; `headless` for Xvfb on Linux; `config` includes `clean-install`; `elate_start` also `eval_files`/`profiles`/`home_seed`; `elate_purge` deletes stopped/dead sandboxes, `stopped_older_than` GCs only stale ones) |
+| `elate_keys` | kbd-notation keys; `delivery`: `semantic` (through the command loop — obeys keymaps; a bell aborts and names the culprit), `events` (holds prompts open; bell-tolerant), or `raw` (TTY only; works even when Emacs is wedged) |
 | `elate_type` | literal text: raw terminal bytes (TTY) or queued events (GUI) |
+| `elate_send_process` | send raw input to a buffer's subprocess (comint/REPL/shell/terminal): `char` (e.g. `C-c` → ^C/SIGINT), `text`, or `file` — drives the *process*, not Emacs |
 | `elate_mouse` | semantic mouse for both UIs: click/double/drag/wheel at a buffer position, line/column, or the mode line; fires real bindings (buttons, follow-link, mwheel) |
 | `elate_eval` | elisp eval with value, *Messages* delta, error + backtrace |
 | `elate_test` | interactive ERT run: selector support, per-test status/duration/messages/condition/backtrace; failures are data (`ok` stays true — check `unexpected`) |
@@ -872,7 +879,7 @@ responses embed a compact state snapshot so the model sees why):
 | `elate_screenshot` | TTY: rendered screen as text (optionally ANSI-colored). GUI: PNG of the Emacs window, returned as MCP image content plus a JSON block with path + dimensions |
 | `elate_buffer` / `elate_messages` / `elate_echo` | targeted reads (`elate_messages` is cursor-based: only news since the last call); `elate_buffer` takes `props` for face/text-property runs + overlays |
 | `elate_popups` | capture visible popups as text: which-key, transient, hydra, corfu/company, completion-preview, child frames |
-| `elate_faces_at` | faces, overlays, and every text property (with **values**) at one buffer position — assert a package's own text properties without repeated `get-text-property` evals |
+| `elate_faces_at` | faces, overlays, and every text property (with **values**) at a buffer position — by `line`+`col` or `pos`, and `run` adjacent cells in one call; assert a package's own text properties without repeated `get-text-property` evals |
 | `elate_wait` | wait for `stable` (buffer output settled for `quiet_ms` — comint/REPL/terminal) / `idle` (command-loop) / `text` (Python regexp) / `prompt` |
 | `elate_describe` | structured docs + binding resolution for a key/function/variable/mode |
 | `elate_run_script` | execute a whole scenario script (by path) in one call: fresh session, steps, assertions, teardown; script failures are data (`ok` stays true — check `success`); `keep_on_failure` keeps the session for inspection |

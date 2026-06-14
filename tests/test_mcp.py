@@ -38,8 +38,8 @@ NAME = f"m{os.getpid()}"
 
 EXPECTED_TOOLS = {
     "elate_start", "elate_stop", "elate_list", "elate_info",
-    "elate_keys", "elate_type", "elate_mouse", "elate_eval",
-    "elate_state", "elate_screenshot",
+    "elate_keys", "elate_type", "elate_send_process", "elate_mouse",
+    "elate_eval", "elate_state", "elate_screenshot",
     "elate_buffer", "elate_messages", "elate_echo",
     "elate_wait", "elate_describe",
     "elate_test", "elate_lint", "elate_popups", "elate_faces_at",
@@ -631,6 +631,67 @@ def test_faces_at_tool_returns_property_values(elate_home: str,
         vals = {p["name"]: p["value"] for p in out["property-values"]}
         assert vals["ghostel-prompt"] == "t"   # a flag, not a number
         assert vals["ghostel-count"] == "7"
+        # Address by pos, and a run of adjacent cells in one call.
+        out = await call(cs, "elate_faces_at",
+                         {"session": NAME, "pos": 1, "buffer": "mcpfaces"})
+        assert out["ok"] is True and out["char"] == "h"
+        out = await call(cs, "elate_faces_at",
+                         {"session": NAME, "pos": 1, "run": 2,
+                          "buffer": "mcpfaces"})
+        assert out["ok"] is True and out["count"] == 2
+        assert [c["char"] for c in out["cells"]] == ["h", "i"]
+        # line+col together with pos is rejected.
+        out = await call(cs, "elate_faces_at",
+                         {"session": NAME, "line": 1, "col": 0, "pos": 1,
+                          "buffer": "mcpfaces"})
+        assert out["ok"] is False
+
+    with_client(elate_home, fn)
+
+
+def test_send_process_tool(elate_home: str,
+                           mcp_session: dict[str, Any]) -> None:
+    async def fn(cs: ClientSession) -> None:
+        out = await call(cs, "elate_eval", {
+            "session": NAME,
+            "form": '(progn (ignore-errors (kill-buffer "*shell*"))'
+                    ' (require (quote shell))'
+                    ' (setq explicit-shell-file-name "/bin/sh"'
+                    '       shell-file-name "/bin/sh") (shell) (buffer-name))'})
+        assert out["ok"] is True
+        await call(cs, "elate_wait", {"session": NAME, "condition": "stable",
+                                      "buffer": "*shell*", "quiet_ms": 300,
+                                      "timeout": 10.0})
+        out = await call(cs, "elate_send_process",
+                         {"session": NAME, "buffer": "*shell*",
+                          "text": "echo mcp-sp-marker\n"})
+        assert out["ok"] is True and out["bytes"] > 0
+        await call(cs, "elate_wait", {"session": NAME, "condition": "stable",
+                                      "buffer": "*shell*", "quiet_ms": 400,
+                                      "timeout": 10.0})
+        out = await call(cs, "elate_eval", {
+            "session": NAME,
+            "form": '(with-current-buffer "*shell*"'
+                    ' (and (string-match-p "mcp-sp-marker" (buffer-string)) t))'})
+        assert out["value"] == "t"
+        # Exactly one of text/char/file.
+        out = await call(cs, "elate_send_process",
+                         {"session": NAME, "buffer": "*shell*"})
+        assert out["ok"] is False
+        # A buffer with no live process is a clean error.
+        out = await call(cs, "elate_send_process",
+                         {"session": NAME, "buffer": "*Messages*", "text": "x"})
+        assert out["ok"] is False and "no live process" in out["error"]
+        # Restore *scratch* in the selected window: this is a shared
+        # module session, so leave it as we found it. Bind
+        # kill-buffer-query-functions to nil -- killing a buffer with a live
+        # process otherwise prompts (yes-or-no-p) and would wedge the session.
+        await call(cs, "elate_eval",
+                   {"session": NAME,
+                    "form": '(progn'
+                            ' (let ((kill-buffer-query-functions nil))'
+                            '   (kill-buffer "*shell*"))'
+                            ' (switch-to-buffer "*scratch*"))'})
 
     with_client(elate_home, fn)
 
@@ -672,6 +733,11 @@ def test_purge_tool(elate_home: str, mcp_session: dict[str, Any]) -> None:
         assert (await call(cs, "elate_purge", {}))["ok"] is False
         # Naming the running module session is a loud error -- never deleted.
         assert (await call(cs, "elate_purge", {"names": [NAME]}))["ok"] is False
+        # stopped_older_than keeps a just-stopped session (kept, not purged).
+        out = await call(cs, "elate_purge",
+                         {"names": [throwaway], "stopped_older_than": 3600})
+        assert out["ok"] is True
+        assert not out["purged"] and throwaway in out["skipped_recent"]
         # The stopped throwaway is purged and disappears from the list.
         out = await call(cs, "elate_purge", {"names": [throwaway]})
         assert out["ok"] is True
