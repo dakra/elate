@@ -17,15 +17,20 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   `elate purge NAME…`/`elate purge --all` deletes them (never running
   sessions).
 - The loop is **act → wait → observe**: `keys`/`type`/`mouse`/`eval`, then
-  `wait idle` / `wait text REGEXP` / `wait prompt` (never sleep-and-poll),
-  then `state` (one-call scene snapshot — run it first when confused) or
-  `buffer`/`messages`/`popups`/`screenshot`.
+  `wait stable --buffer B --quiet-ms N` (subprocess/REPL output settled) /
+  `wait idle` (command-loop idle) / `wait text REGEXP` / `wait prompt`
+  (never sleep-and-poll), then `state` (one-call scene snapshot — run it
+  first when confused) or `buffer`/`messages`/`faces-at`/`popups`/`screenshot`.
 - Key delivery: semantic `keys 'M-x foo RET'` by default; a sequence that
   opens a minibuffer prompt and leaves it open needs `keys … --events`
   (queued); unwedging a stuck Emacs needs `keys C-g --raw` (TTY only).
 - Eval forms don't run in the selected window's buffer — wrap
   buffer-mutating forms in `(with-current-buffer …)`. Output truncates at
   64 KiB. `wait text` patterns are **Python** regexps, not elisp.
+- Sandbox `$HOME` is fake. For files a **subprocess** needs at spawn (shell
+  rc files), `start --home-seed DIR` copies a fixture tree in before launch.
+  Startup forms run before `emacs-startup-hook`: inline `--eval`, or reuse
+  `--eval-file PATH` / `--profile NAME` (`$XDG_CONFIG_HOME/elate/profiles/`).
 - Tests/lint/profile/bench want a **fresh throwaway session** (results
   depend on session history), and `lint` **executes compile-time code** —
   never lint untrusted files in a session you keep.

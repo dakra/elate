@@ -262,6 +262,9 @@ def start_session(
     init_file: str | None = None,
     loads: Sequence[str] = (),
     evals: Sequence[str] = (),
+    eval_files: Sequence[str] = (),
+    profiles: Sequence[str] = (),
+    home_seed: str | None = None,
     cols: int = 120,
     rows: int = 36,
     ui: str = "tty",
@@ -311,6 +314,9 @@ def start_session(
             init_file=init_file,
             loads=loads,
             evals=evals,
+            eval_files=eval_files,
+            profiles=profiles,
+            home_seed=home_seed,
             ui=ui,
             cols=cols,
             rows=rows,
@@ -1031,6 +1037,68 @@ def wait_text(
 
     where = f"/{regexp}/ in buffer {buffer or '(current)'}"
     return _wait_loop(sess, timeout, where, probe)
+
+
+def wait_stable(
+    sess: Session,
+    buffer: str | None = None,
+    quiet_ms: int = 300,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Wait until BUFFER's text has not changed for QUIET_MS milliseconds.
+
+    Tracks `buffer-chars-modified-tick' (bumped by every text change,
+    process-filter output included), so it settles on comint/REPL,
+    compilation, terminal (vterm & friends), and async-LSP output, and on
+    timer/overlay churn -- the "did the output stop?" question that
+    `wait idle' (command-loop idle) cannot answer. A buffer that does not
+    exist yet counts as "not stable yet" and is polled until the deadline;
+    a buffer that never stops changing (a live clock) times out with a
+    state snapshot.
+    """
+    quiet = max(0.0, quiet_ms / 1000.0)
+    poll = max(min(quiet / 3.0, 0.1), 0.02)
+    deadline = time.monotonic() + timeout
+    last_tick: Any = None
+    quiet_since: float | None = None
+    seen = False
+    ticks = 0
+    live_process = False
+    last_err: str | None = None
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        try:
+            data: dict[str, Any] | None = sess.semantic().rpc(
+                "buffer-tick", buffer, timeout=2.0)
+        except (EvalTimeout, TransportError, RpcError) as exc:
+            last_err = str(exc)
+            data = None
+        if data is not None and data.get("exists") is True:
+            seen = True
+            live_process = bool(data.get("live-process"))
+            tick = data.get("tick")
+            if tick != last_tick:
+                last_tick = tick
+                quiet_since = now
+                ticks += 1
+            elif quiet_since is not None and (now - quiet_since) >= quiet:
+                return {"buffer": data.get("name"), "quiet_ms": quiet_ms,
+                        "ticks_seen": ticks,
+                        "stable_for_ms": round((now - quiet_since) * 1000),
+                        "live_process": live_process}
+        else:
+            # Not created yet (or it vanished): restart the quiet timer.
+            quiet_since = None
+            last_tick = None
+        time.sleep(poll)
+    dump = state_dump(sess)
+    if last_err:
+        dump["last_probe_error"] = last_err
+    detail = f"buffer {buffer or '(current)'} unchanged for {quiet_ms}ms"
+    if not seen:
+        detail += " (buffer never appeared)"
+    raise WaitTimeout(f"timed out after {timeout:g}s waiting for {detail}",
+                      state=dump)
 
 
 def wait_prompt(sess: Session, timeout: float = 10.0) -> dict[str, Any]:

@@ -57,7 +57,10 @@ start a new sandboxed session
 - `--config {minimal,bare,init-file,clean-install}` (default: minimal) -- sandbox config mode (default: minimal; clean-install installs the --load package(s) for real via package-install-file)
 - `--init-file PATH` -- user init file (implies --config init-file)
 - `--load PATH` (repeatable) -- elisp file or directory to put on load-path (repeatable); with --config clean-install: the package to install (.el file, tar, or directory)
-- `--eval FORM` (repeatable) -- elisp form to evaluate at startup (repeatable)
+- `--eval FORM` (repeatable) -- elisp form to evaluate at startup, before emacs-startup-hook (repeatable)
+- `--eval-file PATH` (repeatable) -- elisp file to load at startup, before emacs-startup-hook (repeatable); like a reusable --eval, with no load-path side effects
+- `--profile NAME` (repeatable) -- named startup snippet from $XDG_CONFIG_HOME/elate/profiles/NAME.el (or a path to a .el file); loaded like --eval-file (repeatable)
+- `--home-seed DIR` -- copy this fixture tree into the sandbox's fake $HOME before launch (rc files in place before any subprocess spawns; keeps sandbox isolation)
 - `--size COLSxROWS` (default: 120x36)
 
 ## elate stop
@@ -246,9 +249,10 @@ capture the screen: text for tty sessions, PNG for gui sessions
 
 wait for a condition (exit 3 on timeout)
 
-- `{idle,text,prompt}`
-- `[args]` (repeatable) -- idle: [MIN_IDLE_SECS]; text: REGEXP (Python regex syntax, not elisp); prompt: none
-- `--buffer BUFFER` -- buffer to search (wait text); may not exist yet
+- `{idle,text,prompt,stable}`
+- `[args]` (repeatable) -- idle: [MIN_IDLE_SECS]; text: REGEXP (Python regex syntax, not elisp); prompt/stable: none
+- `--buffer BUFFER` -- buffer to search (wait text) or watch (wait stable); may not exist yet
+- `--quiet-ms MS` (default: 300) -- wait stable: settle threshold -- the buffer must be unchanged for this many ms (default 300)
 - `--timeout SECS` (default: 10)
 
 ## elate run

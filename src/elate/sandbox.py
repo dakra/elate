@@ -20,6 +20,7 @@ Config modes:
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Sequence
 
@@ -99,6 +100,43 @@ def _load_forms(loads: Sequence[str]) -> list[str]:
     return forms
 
 
+def _validated_eval_file(entry: str) -> Path:
+    """Resolved path of an --eval-file argument; error if it is not a file."""
+    path = Path(entry).expanduser()
+    if not path.is_file():
+        raise ElateError(f"--eval-file does not exist: {entry}")
+    return path
+
+
+def profiles_dir() -> Path:
+    """Directory holding named --profile snippets (the real config home)."""
+    config_home = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(config_home) / "elate" / "profiles"
+
+
+def _resolve_profile(name: str) -> Path:
+    """File for a --profile NAME: a literal .el path, else <profiles>/NAME.el."""
+    if "/" in name or name.endswith(".el"):
+        path = Path(name).expanduser()
+    else:
+        path = profiles_dir() / f"{name}.el"
+    if not path.is_file():
+        raise ElateError(
+            f"--profile {name!r} not found at {path} -- create that file, "
+            "or pass a path to a .el file")
+    return path
+
+
+def _eval_file_forms(paths: Sequence[Path]) -> list[str]:
+    """`load' forms for plain elisp files run at startup.
+
+    Unlike `--load', these do NOT add anything to `load-path' -- a profile
+    is a settings snippet, not a package -- and run before
+    `emacs-startup-hook' like every other startup form.
+    """
+    return [f"(load {elisp_string(str(p))} nil t)" for p in paths]
+
+
 # clean-install: install for real instead of load-path injection.  The
 # package archives are emptied so nothing can touch the network -- a
 # dependency that is not built in fails the install with a clear,
@@ -142,6 +180,9 @@ def build_sandbox(
     init_file: str | None = None,
     loads: Sequence[str] = (),
     evals: Sequence[str] = (),
+    eval_files: Sequence[str] = (),
+    profiles: Sequence[str] = (),
+    home_seed: str | None = None,
     ui: str = "tty",
     cols: int = 120,
     rows: int = 36,
@@ -172,8 +213,28 @@ def build_sandbox(
         init_path = Path(init_file).expanduser().resolve()
         if not init_path.is_file():
             raise ElateError(f"--init-file does not exist: {init_file}")
+    if home_seed is not None:
+        seed_path = Path(home_seed).expanduser()
+        if not seed_path.is_dir():
+            raise ElateError(
+                f"--home-seed must be an existing directory: {home_seed}")
 
     dirs = create_dirs(session_dir)
+    if home_seed is not None:
+        # Merge the fixture tree INTO the fake $HOME *before* Emacs launches,
+        # so rc files (.bashrc/.zshrc/.config/...) are in place before any
+        # shell or other subprocess the session spawns (e.g. a package that
+        # auto-launches one on emacs-startup-hook). This keeps the sandbox's
+        # isolation, unlike pointing HOME at a real directory. The
+        # pre-created XDG dirs survive the merge; fixture files win.
+        shutil.copytree(seed_path, dirs["home"], dirs_exist_ok=True,
+                        symlinks=True)
+    # Reusable startup snippets: --eval-file (a forms file) then --profile (a
+    # named forms file), both loaded like inline --eval but before the inline
+    # evals, so an inline --eval can override a profile. Resolved up front so
+    # a missing file fails before Emacs is launched.
+    startup_files = ([_validated_eval_file(p) for p in eval_files]
+                     + [_resolve_profile(n) for n in profiles])
     agent = agent_el_path()
     set_session_dir = f"(setq elate-session-dir {elisp_string(str(session_dir))})"
 
@@ -192,6 +253,8 @@ def build_sandbox(
             for form in _frame_geometry_forms(cols, rows):
                 args += ["--eval", form]
         for form in _load_forms(loads):
+            args += ["--eval", f"(elate-guard {form})"]
+        for form in _eval_file_forms(startup_files):
             args += ["--eval", f"(elate-guard {form})"]
         for form in evals:
             args += ["--eval", f"(elate-guard {form})"]
@@ -221,6 +284,7 @@ def build_sandbox(
         user_lines += _install_forms(loads)
     else:
         user_lines += _load_forms(loads)
+    user_lines += _eval_file_forms(startup_files)
     user_lines += list(evals)
     if user_lines:
         lines.append("(elate-guard\n " + "\n ".join(user_lines) + ")")

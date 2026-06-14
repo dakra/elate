@@ -146,3 +146,31 @@ uvx elate -s demo record stop              # path, event count, duration
 
 TTY only; for GUI sessions use `snap start --interval 0.5` (PNG frame
 series + manifest.json).
+
+## Test a package that drives a subprocess / shell / REPL
+
+Two things differ from the package-under-test loop: rc files must exist in
+the sandbox `$HOME` *before* the subprocess spawns, and you synchronize on
+the buffer's output settling (`wait stable`), not command-loop idle.
+
+```sh
+# A fixture HOME with the rc file the shell will read (kept isolated):
+mkdir -p fixtures/home
+printf 'PS1="rc-loaded$ "\n' > fixtures/home/.bashrc
+
+uvx elate start --name sh --home-seed fixtures/home    # rc in place pre-launch
+uvx elate -s sh eval '(let ((explicit-shell-file-name "/bin/bash")) (shell))'
+uvx elate -s sh wait stable --buffer '*shell*' --quiet-ms 300   # prompt settled
+uvx elate -s sh type 'echo hi-$((1+1))\n'
+uvx elate -s sh wait stable --buffer '*shell*' --quiet-ms 300   # output settled
+uvx elate -s sh buffer '*shell*'                       # -> hi-2
+
+# Verify the package's own text properties (values, not just names):
+uvx elate -s sh faces-at 1:0 --buffer '*shell*'        # e.g. my-prompt=t
+uvx elate stop sh
+```
+
+Reuse the same startup setup across many sessions with `--eval-file
+setup.el` (a forms file, no `load-path` side effects) or `--profile NAME`
+(`$XDG_CONFIG_HOME/elate/profiles/NAME.el`); both run before
+`emacs-startup-hook`, so they set vars an auto-launch hook will read.

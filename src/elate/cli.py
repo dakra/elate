@@ -50,7 +50,21 @@ def build_parser() -> argparse.ArgumentParser:
                          "(repeatable); with --config clean-install: the "
                          "package to install (.el file, tar, or directory)")
     sp.add_argument("--eval", action="append", default=[], metavar="FORM",
-                    help="elisp form to evaluate at startup (repeatable)")
+                    help="elisp form to evaluate at startup, before "
+                         "emacs-startup-hook (repeatable)")
+    sp.add_argument("--eval-file", action="append", default=[], metavar="PATH",
+                    help="elisp file to load at startup, before "
+                         "emacs-startup-hook (repeatable); like a reusable "
+                         "--eval, with no load-path side effects")
+    sp.add_argument("--profile", action="append", default=[], metavar="NAME",
+                    help="named startup snippet from "
+                         "$XDG_CONFIG_HOME/elate/profiles/NAME.el "
+                         "(or a path to a .el file); loaded like --eval-file "
+                         "(repeatable)")
+    sp.add_argument("--home-seed", metavar="DIR",
+                    help="copy this fixture tree into the sandbox's fake "
+                         "$HOME before launch (rc files in place before any "
+                         "subprocess spawns; keeps sandbox isolation)")
     sp.add_argument("--size", type=_parse_size, default=(120, 36), metavar="COLSxROWS")
 
     sp = sub.add_parser("stop", help="stop a session")
@@ -280,11 +294,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="tty only: include ANSI color escapes")
 
     sp = sub.add_parser("wait", help="wait for a condition (exit 3 on timeout)")
-    sp.add_argument("condition", choices=["idle", "text", "prompt"])
+    sp.add_argument("condition", choices=["idle", "text", "prompt", "stable"])
     sp.add_argument("args", nargs="*",
                     help="idle: [MIN_IDLE_SECS]; text: REGEXP (Python regex "
-                         "syntax, not elisp); prompt: none")
-    sp.add_argument("--buffer", help="buffer to search (wait text); may not exist yet")
+                         "syntax, not elisp); prompt/stable: none")
+    sp.add_argument("--buffer", help="buffer to search (wait text) or watch "
+                                     "(wait stable); may not exist yet")
+    sp.add_argument("--quiet-ms", type=int, default=300, metavar="MS",
+                    help="wait stable: settle threshold -- the buffer must be "
+                         "unchanged for this many ms (default 300)")
     sp.add_argument("--timeout", type=float, default=10.0, metavar="SECS")
 
     sp = sub.add_parser(
@@ -409,6 +427,9 @@ def cmd_start(args: argparse.Namespace) -> Result:
         init_file=args.init_file,
         loads=args.load,
         evals=args.eval,
+        eval_files=args.eval_file,
+        profiles=args.profile,
+        home_seed=args.home_seed,
         cols=cols,
         rows=rows,
         ui=args.ui,
@@ -855,7 +876,10 @@ def cmd_faces_at(args: argparse.Namespace) -> Result:
     for flag in ("button", "keymap"):
         if data.get(flag):
             lines.append(f"{flag}: yes")
-    if data.get("properties"):
+    if data.get("property-values"):
+        lines.append("text properties: " + " ".join(
+            f"{p['name']}={p['value']}" for p in data["property-values"]))
+    elif data.get("properties"):
         lines.append("text properties: " + " ".join(data["properties"]))
     overlays = data.get("overlays") or []
     if overlays:
@@ -1024,7 +1048,7 @@ def cmd_wait(args: argparse.Namespace) -> Result:
     # buffer must be logged or the transcript->script exporter would
     # silently retarget replayed waits at the then-current buffer.
     sess.log("wait", condition=args.condition, args=args.args,
-             buffer=args.buffer, timeout=args.timeout)
+             buffer=args.buffer, quiet_ms=args.quiet_ms, timeout=args.timeout)
     if args.condition == "idle":
         if args.args:
             try:
@@ -1036,12 +1060,17 @@ def cmd_wait(args: argparse.Namespace) -> Result:
         else:
             min_idle = 0.2
         data = S.wait_idle(sess, min_idle=min_idle, timeout=args.timeout)
-        return data, f"idle ({data.get('idle'):.2f}s)", 0
+        return data, f"idle {data.get('idle'):.2f}s since last activity", 0
     if args.condition == "text":
         if not args.args:
             raise ElateError("wait text needs a REGEXP argument")
         data = S.wait_text(sess, args.args[0], buffer=args.buffer, timeout=args.timeout)
         return data, f"matched {data['matched']!r} in {data['buffer']}", 0
+    if args.condition == "stable":
+        data = S.wait_stable(sess, buffer=args.buffer,
+                             quiet_ms=args.quiet_ms, timeout=args.timeout)
+        return (data, f"stable: {data['buffer']} unchanged for "
+                      f"{data['quiet_ms']}ms ({data['ticks_seen']} edits seen)", 0)
     # prompt
     data = S.wait_prompt(sess, timeout=args.timeout)
     return data, f"prompt: {data.get('prompt')!r} (contents: {data.get('contents')!r})", 0

@@ -77,6 +77,7 @@ elate -s demo describe function my-pkg-frobnicate
 
 # Synchronize (no sleep-and-poll)
 elate -s demo wait idle
+elate -s demo wait stable --buffer '*shell*' --quiet-ms 300   # subprocess output settled
 elate -s demo wait text 'Compilation finished' --buffer '*compilation*' --timeout 30
 elate -s demo wait prompt
 
@@ -91,6 +92,11 @@ Notes:
 
 - `wait text` takes a **Python** regular expression (not elisp syntax) and
   happily polls a buffer that does not exist yet.
+- `wait stable --buffer B --quiet-ms N` returns once `B`'s text has not
+  changed for `N` ms — the right synchronizer for subprocess/REPL/terminal
+  output (comint, compilation, vterm), where `wait idle` (command-loop
+  idle) only tells you the editor is waiting for input, not that output
+  stopped.
 - A `messages` delta can start mid-line when Emacs coalesces a repeated
   message (`[2 times]`) at the cursor position.
 - Raw `keys` rejects combinations a terminal cannot encode (e.g. `C-%`) —
@@ -266,7 +272,10 @@ elate -s demo faces-at 3:14 --buffer my-buf
 - Overlays report start/end plus `face`, `invisible`, `display`,
   `before-string`, `after-string`, and `priority`.
 - `faces-at` also distinguishes the text-property `face` from the
-  effective `char-face` (which resolves overlays — what the user sees).
+  effective `char-face` (which resolves overlays — what the user sees), and
+  lists every text property at the point with its value
+  (`property-values`), so a package's own props (e.g. `my-prompt=t` vs
+  `my-count=42`) are checkable without `get-text-property` evals.
 - Font-lock is ensured on the requested range first, so never-displayed
   buffers are still fontified correctly.
 
@@ -850,7 +859,7 @@ responses embed a compact state snapshot so the model sees why):
 
 | tool | purpose |
 |---|---|
-| `elate_start` / `elate_stop` / `elate_list` / `elate_info` | session lifecycle (`ui`: `tty` or `gui`; `headless` for Xvfb on Linux; `config` includes `clean-install`) |
+| `elate_start` / `elate_stop` / `elate_list` / `elate_info` / `elate_purge` | session lifecycle (`ui`: `tty` or `gui`; `headless` for Xvfb on Linux; `config` includes `clean-install`; `elate_start` also `eval_files`/`profiles`/`home_seed`; `elate_purge` deletes stopped/dead sandboxes) |
 | `elate_keys` | kbd-notation keys; `delivery`: `semantic`, `events` (holds prompts open), or `raw` (TTY only; works even when Emacs is wedged) |
 | `elate_type` | literal text: raw terminal bytes (TTY) or queued events (GUI) |
 | `elate_mouse` | semantic mouse for both UIs: click/double/drag/wheel at a buffer position, line/column, or the mode line; fires real bindings (buttons, follow-link, mwheel) |
@@ -863,16 +872,14 @@ responses embed a compact state snapshot so the model sees why):
 | `elate_screenshot` | TTY: rendered screen as text (optionally ANSI-colored). GUI: PNG of the Emacs window, returned as MCP image content plus a JSON block with path + dimensions |
 | `elate_buffer` / `elate_messages` / `elate_echo` | targeted reads (`elate_messages` is cursor-based: only news since the last call); `elate_buffer` takes `props` for face/text-property runs + overlays |
 | `elate_popups` | capture visible popups as text: which-key, transient, hydra, corfu/company, completion-preview, child frames |
-| `elate_wait` | wait for `idle` / `text` (Python regexp) / `prompt` |
+| `elate_faces_at` | faces, overlays, and every text property (with **values**) at one buffer position — assert a package's own text properties without repeated `get-text-property` evals |
+| `elate_wait` | wait for `stable` (buffer output settled for `quiet_ms` — comint/REPL/terminal) / `idle` (command-loop) / `text` (Python regexp) / `prompt` |
 | `elate_describe` | structured docs + binding resolution for a key/function/variable/mode |
 | `elate_run_script` | execute a whole scenario script (by path) in one call: fresh session, steps, assertions, teardown; script failures are data (`ok` stays true — check `success`); `keep_on_failure` keeps the session for inspection |
 | `elate_record` | start/stop/status of an asciicast v2 recording of a TTY session (snap series stays CLI-only) |
 
 Sessions live in tmux and survive MCP reconnects; MCP tool calls are
 transcript-logged into the session JSONL just like CLI commands.
-There is deliberately no `elate_faces_at` tool: `elate_buffer` with
-`props: true` and `from_line`/`to_line` covers point queries in one call
-(fewer, fatter tools).
 
 ## Config modes
 

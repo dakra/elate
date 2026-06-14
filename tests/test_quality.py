@@ -21,7 +21,7 @@ import pytest
 
 from elate import cli
 from elate import session as S
-from elate.errors import ElateError, EvalTimeout, RpcError
+from elate.errors import ElateError, EvalTimeout, RpcError, WaitTimeout
 
 HAVE_DEPS = bool(
     shutil.which("emacs") and shutil.which("tmux") and shutil.which("emacsclient")
@@ -950,6 +950,75 @@ def test_cli_faces_at_and_buffer_props(sess: S.Session,
     code = cli.main(["--json", "-s", NAME, "faces-at", "nonsense"])
     out = json.loads(capsys.readouterr().out)
     assert code == 1 and "LINE:COL" in out["error"]
+
+
+def test_faces_at_property_values(sess: S.Session) -> None:
+    # Names alone cannot distinguish a flag t from a number; values can.
+    assert sess.semantic().eval_form(
+        '(with-current-buffer (get-buffer-create "elpropvals")'
+        ' (erase-buffer) (fundamental-mode) (insert "hello")'
+        " (put-text-property 1 6 'ghostel-prompt t)"
+        " (put-text-property 1 6 'ghostel-count 42) t)"
+    )["error"] is None
+    data = sess.semantic().rpc("faces-at", 1, 0, "elpropvals")
+    vals = {p["name"]: p["value"] for p in data["property-values"]}
+    assert vals["ghostel-prompt"] == "t"
+    assert vals["ghostel-count"] == "42"
+    # Names list stays for back-compat.
+    assert "ghostel-prompt" in data["properties"]
+    sess.semantic().eval_form('(kill-buffer "elpropvals")')
+
+
+# -- wait stable (buffer-output settled) -------------------------------------
+
+def test_wait_stable_settles_after_async_output(sess: S.Session) -> None:
+    sess.semantic().eval_form('(ignore-errors (kill-buffer "elstable"))')
+    # Four async inserts spread over ~0.45s, then quiet.
+    sess.semantic().eval_form(
+        '(progn (get-buffer-create "elstable")'
+        ' (dotimes (i 4)'
+        '  (run-at-time (* i 0.12) nil'
+        '   (lambda () (with-current-buffer "elstable"'
+        '     (goto-char (point-max)) (insert "tick"))))) t)')
+    data = S.wait_stable(sess, buffer="elstable", quiet_ms=250, timeout=8.0)
+    assert data["buffer"] == "elstable"
+    assert data["ticks_seen"] >= 1
+    assert data["stable_for_ms"] >= 250
+    sess.semantic().eval_form('(kill-buffer "elstable")')
+
+
+def test_wait_stable_buffer_appears_later(sess: S.Session) -> None:
+    # A buffer that does not exist yet is polled, not errored out.
+    sess.semantic().eval_form('(ignore-errors (kill-buffer "ellater"))')
+    sess.semantic().eval_form(
+        '(run-at-time 0.5 nil (lambda ()'
+        ' (with-current-buffer (get-buffer-create "ellater")'
+        ' (insert "ready"))))')
+    data = S.wait_stable(sess, buffer="ellater", quiet_ms=200, timeout=8.0)
+    assert data["buffer"] == "ellater"
+    sess.semantic().eval_form('(kill-buffer "ellater")')
+
+
+def test_wait_stable_times_out_on_continuous_change(sess: S.Session) -> None:
+    sess.semantic().eval_form('(ignore-errors (kill-buffer "elnoisy"))')
+    sess.semantic().eval_form(
+        '(progn (get-buffer-create "elnoisy")'
+        ' (setq elfix-noisy-timer'
+        '  (run-with-timer 0 0.05'
+        '   (lambda () (with-current-buffer "elnoisy"'
+        '     (goto-char (point-max)) (insert "x"))))) t)')
+    try:
+        with pytest.raises(WaitTimeout) as exc_info:
+            S.wait_stable(sess, buffer="elnoisy", quiet_ms=300, timeout=1.5)
+        assert "elnoisy" in str(exc_info.value)
+        assert "state" in exc_info.value.state or \
+            "screen_tail" in exc_info.value.state
+    finally:
+        # Cancel before killing the buffer so no stray fire hits a dead buffer.
+        sess.semantic().eval_form(
+            '(progn (when (and (boundp (quote elfix-noisy-timer))'
+            ' (timerp elfix-noisy-timer)) (cancel-timer elfix-noisy-timer))'
+            ' (ignore-errors (kill-buffer "elnoisy")) t)')
 
 
 # -- popups ------------------------------------------------------------------------

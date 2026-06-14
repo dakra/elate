@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.0
+
+Follow-ups from a heavy MCP-driven session that drove a subprocess/terminal
+package (rather than a static elisp package) -- the gaps that pattern hit.
+
+- `wait stable` (CLI `wait stable --buffer B --quiet-ms N`; MCP `elate_wait`
+  `condition="stable"`, `quiet_ms`): wait until a buffer's text has not
+  changed for `quiet_ms` ms. Tracks `buffer-chars-modified-tick`, so it
+  settles on comint/REPL, compilation, terminal (vterm & friends), and
+  async-LSP output -- the "did the output stop?" question that `wait idle`
+  (command-loop idle) cannot answer.
+- `elate_faces_at` MCP tool (the CLI `faces-at` had no MCP counterpart), and
+  both now return `property-values`: every text property at the point paired
+  with its clipped printed value, so a package's own props (a flag `t` vs a
+  number) are checkable without repeated `get-text-property` evals.
+- `start --home-seed DIR` (MCP `elate_start` `home_seed`): copy a fixture
+  tree into the sandbox's fake `$HOME` before Emacs launches, so rc files
+  are in place before any subprocess the session spawns -- shell-integration
+  testing that keeps the sandbox isolated.
+- `start --eval-file PATH` and `start --profile NAME` (MCP `eval_files` /
+  `profiles`): reusable startup snippets that run before `emacs-startup-hook`
+  (a forms file with no `load-path` side effects, or a named file from
+  `$XDG_CONFIG_HOME/elate/profiles/`), instead of re-pasting the same forms
+  into every session. Startup order is `--load` -> `--eval-file` ->
+  `--profile` -> `--eval`, and that ordering guarantee is now documented.
+- `elate_purge` MCP tool: the CLI-only `purge` now has its MCP counterpart,
+  so an MCP agent can clean up its own stopped sessions (same safety: a
+  running session is never purged).
+- `wait idle` now reads as "idle Ns since last activity" and its docs note a
+  large idle value is healthy (Emacs waiting for input), not a hang.
+
 ## 0.3.0
 
 - `elate lint --package-lint [--archive-dir DIR]` (MCP: `elate_lint`'s

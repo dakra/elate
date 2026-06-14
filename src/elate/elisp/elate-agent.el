@@ -745,12 +745,34 @@ visible text through the (slow) emacsclient print path."
         :minibuffer (elate--minibuffer-info)))
 
 (defun elate--rpc-idle ()
-  "Idle/busy probe."
+  "Idle/busy probe.
+:idle is seconds since the last command-loop activity (a large value is
+healthy -- Emacs is waiting for input, not wedged).  For \"did the buffer
+output settle?\" use the `buffer-tick' probe / `wait stable' instead."
   (let ((idle (current-idle-time)))
     (list :idle (if idle (float-time idle) :null)
           :input-pending (elate--jbool (input-pending-p))
           :unread (length unread-command-events)
           :minibuffer-active (elate--jbool (active-minibuffer-window)))))
+
+(defun elate--rpc-buffer-tick (&optional name)
+  "Modification tick of buffer NAME (default: current), for output-settled waits.
+Returns :exists, :tick (`buffer-chars-modified-tick' -- bumped by every
+text change, process-filter output included), and :live-process (whether
+the buffer has a running process).  A missing buffer reports
+:exists :false so a waiter can poll until it appears."
+  (let ((buf (if (and name (stringp name))
+                 (get-buffer name)
+               (elate--current-buffer))))
+    (if (not (buffer-live-p buf))
+        (list :exists :false :name (and (stringp name) name))
+      (with-current-buffer buf
+        (let ((proc (get-buffer-process buf)))
+          (list :exists t
+                :name (buffer-name)
+                :tick (buffer-chars-modified-tick)
+                :live-process (elate--jbool
+                               (and proc (process-live-p proc)))))))))
 
 ;;;; describe
 
@@ -2089,7 +2111,8 @@ merged away.  Returns {:runs VECTOR :truncated BOOL}."
 LINE is 1-based, COL 0-based (clamped to the line).  :face is the
 text-property face; :char-face additionally resolves overlays (what
 the user actually sees); :properties lists every text property name
-present at the position."
+present at the position, and :property-values pairs each name with its
+clipped printed value (so a flag t reads differently from a number)."
   (let ((buf (if (and name (stringp name))
                  (or (get-buffer name)
                      (error "elate: no buffer named %S" name))
@@ -2131,6 +2154,18 @@ present at the position."
                                      (push (symbol-name (car plist)) names)
                                      (setq plist (cddr plist)))
                                    (nreverse names)))
+                    ;; Names alone cannot tell `ghostel-prompt' = t from a
+                    ;; number; carry the clipped printed value of each.
+                    :property-values
+                    (vconcat
+                     (let ((plist (text-properties-at pos))
+                           (out nil))
+                       (while plist
+                         (push (list :name (symbol-name (car plist))
+                                     :value (elate--clip-print (cadr plist)))
+                               out)
+                         (setq plist (cddr plist)))
+                       (nreverse out)))
                     :overlays (vconcat
                                (mapcar #'elate--overlay-entry
                                        (overlays-at pos)))))))))))

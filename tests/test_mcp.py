@@ -42,9 +42,9 @@ EXPECTED_TOOLS = {
     "elate_state", "elate_screenshot",
     "elate_buffer", "elate_messages", "elate_echo",
     "elate_wait", "elate_describe",
-    "elate_test", "elate_lint", "elate_popups",
+    "elate_test", "elate_lint", "elate_popups", "elate_faces_at",
     "elate_run_script", "elate_record",
-    "elate_profile", "elate_bench",
+    "elate_profile", "elate_bench", "elate_purge",
 }
 
 
@@ -610,6 +610,76 @@ def test_buffer_props_and_popups_tools(elate_home: str,
         assert out["ok"] is True and out["popups"] == []
         state = await call(cs, "elate_state", {"session": NAME})
         assert state["ok"] is True and state["popups"] == []
+
+    with_client(elate_home, fn)
+
+
+def test_faces_at_tool_returns_property_values(elate_home: str,
+                                               mcp_session: dict[str, Any]) -> None:
+    async def fn(cs: ClientSession) -> None:
+        out = await call(cs, "elate_eval", {
+            "session": NAME,
+            "form": '(with-current-buffer (get-buffer-create "mcpfaces")'
+                    ' (erase-buffer) (fundamental-mode) (insert "hi")'
+                    " (put-text-property 1 3 'ghostel-prompt t)"
+                    " (put-text-property 1 3 'ghostel-count 7) (buffer-name))"})
+        assert out["ok"] is True
+        out = await call(cs, "elate_faces_at",
+                         {"session": NAME, "line": 1, "col": 0,
+                          "buffer": "mcpfaces"})
+        assert out["ok"] is True
+        vals = {p["name"]: p["value"] for p in out["property-values"]}
+        assert vals["ghostel-prompt"] == "t"   # a flag, not a number
+        assert vals["ghostel-count"] == "7"
+
+    with_client(elate_home, fn)
+
+
+def test_wait_stable_tool(elate_home: str,
+                          mcp_session: dict[str, Any]) -> None:
+    async def fn(cs: ClientSession) -> None:
+        await call(cs, "elate_eval",
+                   {"session": NAME,
+                    "form": '(ignore-errors (kill-buffer "mcpstable"))'})
+        await call(cs, "elate_eval", {
+            "session": NAME,
+            "form": '(progn (get-buffer-create "mcpstable")'
+                    ' (dotimes (i 3) (run-at-time (* i 0.12) nil'
+                    ' (lambda () (with-current-buffer "mcpstable"'
+                    ' (goto-char (point-max)) (insert "z"))))) t)'})
+        out = await call(cs, "elate_wait",
+                         {"session": NAME, "condition": "stable",
+                          "buffer": "mcpstable", "quiet_ms": 250,
+                          "timeout": 8.0})
+        assert out["ok"] is True
+        assert out["buffer"] == "mcpstable"
+        assert out["ticks_seen"] >= 1
+        await call(cs, "elate_eval",
+                   {"session": NAME, "form": '(kill-buffer "mcpstable")'})
+
+    with_client(elate_home, fn)
+
+
+def test_purge_tool(elate_home: str, mcp_session: dict[str, Any]) -> None:
+    throwaway = NAME + "pg"
+
+    async def fn(cs: ClientSession) -> None:
+        assert (await call(cs, "elate_start",
+                           {"name": throwaway, "size": "80x24"}))["ok"] is True
+        assert (await call(cs, "elate_stop",
+                           {"session": throwaway}))["ok"] is True
+        # A target is required.
+        assert (await call(cs, "elate_purge", {}))["ok"] is False
+        # Naming the running module session is a loud error -- never deleted.
+        assert (await call(cs, "elate_purge", {"names": [NAME]}))["ok"] is False
+        # The stopped throwaway is purged and disappears from the list.
+        out = await call(cs, "elate_purge", {"names": [throwaway]})
+        assert out["ok"] is True
+        assert any(p["name"] == throwaway for p in out["purged"])
+        lst = await call(cs, "elate_list", {})
+        assert all(s["name"] != throwaway for s in lst["sessions"])
+        # The running session is still there.
+        assert any(s["name"] == NAME for s in lst["sessions"])
 
     with_client(elate_home, fn)
 

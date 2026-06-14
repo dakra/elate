@@ -171,9 +171,28 @@ def elate_start(
         "(.el file, package tar, or package directory) and at least one "
         "is required."))] = None,
     eval_forms: Annotated[list[str] | None, Field(description=(
-        "Elisp forms evaluated at startup, after load_paths. Errors are "
-        "caught and reported as init_error instead of killing the "
+        "Elisp forms evaluated at startup, inside the generated init -- so "
+        "they run BEFORE emacs-startup-hook fires (set vars a package's "
+        "auto-launch hook reads here). Order: init_file -> load_paths -> "
+        "eval_files -> profiles -> eval_forms (so eval_forms can override a "
+        "profile). Errors are caught as init_error instead of killing the "
         "session."))] = None,
+    eval_files: Annotated[list[str] | None, Field(description=(
+        "Elisp files loaded at startup (before emacs-startup-hook), like a "
+        "reusable eval_forms with no load-path side effects -- put a shared "
+        "setup snippet in a file instead of re-pasting it into every "
+        "session."))] = None,
+    profiles: Annotated[list[str] | None, Field(description=(
+        "Named startup snippets resolved from "
+        "$XDG_CONFIG_HOME/elate/profiles/NAME.el (a value with a '/' or "
+        "ending in '.el' is a literal path); loaded like eval_files. For "
+        "reusing the same setup across many sessions."))] = None,
+    home_seed: Annotated[str | None, Field(description=(
+        "Copy this fixture directory tree into the sandbox's fake $HOME "
+        "before Emacs launches, so rc files (.bashrc/.zshrc/.config/...) "
+        "are in place before any subprocess the session spawns -- the way "
+        "to test shell integration while keeping the sandbox isolated."))]
+        = None,
     size: Annotated[str, Field(description=(
         "Terminal size as COLSxROWS, e.g. '120x36'."))] = "120x36",
 ) -> str:
@@ -202,6 +221,9 @@ def elate_start(
             init_file=init_file,
             loads=load_paths or [],
             evals=eval_forms or [],
+            eval_files=eval_files or [],
+            profiles=profiles or [],
+            home_seed=home_seed,
             cols=int(m.group(1)),
             rows=int(m.group(2)),
             ui=ui,
@@ -230,6 +252,40 @@ def elate_stop(
     """
     try:
         return _ok(S.stop_session(session, via="mcp"))
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool(annotations=ToolAnnotations(readOnlyHint=False,
+                                         destructiveHint=True,
+                                         idempotentHint=True,
+                                         openWorldHint=False))
+@_threaded
+def elate_purge(
+    names: Annotated[list[str] | None, Field(description=(
+        "Sessions to purge -- each must be stopped/dead. Naming a running "
+        "session is an error."))] = None,
+    all_sessions: Annotated[bool, Field(description=(
+        "Purge every session that is not running (running ones are skipped "
+        "and reported). Use instead of names to clean up everything."))]
+        = False,
+) -> str:
+    """Delete the sandboxes (transcripts included) of stopped/dead sessions.
+
+    The supported cleanup for sessions you elate_stop'd: stopped sandboxes
+    are inert but pile up in elate_list otherwise. A running session is
+    NEVER purged -- naming one is an error; with all_sessions it is skipped
+    and reported. Leftover processes of dead sessions are cleaned up first;
+    only directories directly under the sessions root are removed (a
+    symlinked session dir is unlinked, not followed). Returns purged /
+    skipped_running / freed_bytes. Pass names or all_sessions (one
+    required).
+    """
+    try:
+        names = names or []
+        if not names and not all_sessions:
+            raise ElateError("elate_purge needs names or all_sessions=true")
+        return _ok(S.purge_sessions(names, all_sessions=all_sessions))
     except Exception as exc:
         return _fail(exc)
 
@@ -945,6 +1001,40 @@ def elate_buffer(
 
 @server.tool(annotations=_READONLY)
 @_threaded
+def elate_faces_at(
+    session: Annotated[str, Field(description="Session name.")],
+    line: Annotated[int, Field(ge=1, description=(
+        "1-based line number in the buffer."))],
+    col: Annotated[int, Field(ge=0, description=(
+        "0-based column (clamped to the line)."))],
+    buffer: Annotated[str | None, Field(description=(
+        "Buffer to inspect. Default: the current (selected window's) "
+        "buffer."))] = None,
+) -> str:
+    """Faces, text properties (with values), and overlays at one position.
+
+    The point-query companion to elate_buffer's props dump: returns the
+    char, the text-property face, char-face (face after overlays resolve --
+    what the user actually sees), display/invisible/field, button/keymap
+    presence, the overlays at the position, and -- key for verifying a
+    package's own text properties -- "properties" (every property name) plus
+    "property-values" (each name paired with its clipped printed value, so a
+    flag t reads differently from a number or a symbol). Use this instead of
+    repeated elate_eval (get-text-property ...) calls. font-lock is ensured
+    on the line first.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        data = sess.semantic().rpc("faces-at", line, col, buffer)
+        sess.log("faces-at", line=line, col=col, buffer=buffer, via="mcp")
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_READONLY)
+@_threaded
 def elate_popups(
     session: Annotated[str, Field(description="Session name.")],
 ) -> str:
@@ -1022,44 +1112,57 @@ def elate_echo(
 @_threaded
 def elate_wait(
     session: Annotated[str, Field(description="Session name.")],
-    condition: Annotated[Literal["idle", "text", "prompt"], Field(description=(
-        "'idle': Emacs answers promptly, no pending input, idle >= "
-        "min_idle seconds -- use after keys/eval to let effects settle. "
-        "'text': pattern appeared in a buffer -- use to await output. "
+    condition: Annotated[Literal["idle", "text", "prompt", "stable"], Field(
+        description=(
+        "'stable': BUFFER's text stopped changing for quiet_ms ms -- the "
+        "right wait for subprocess/REPL output (comint, compilation, "
+        "terminal, async LSP); this is usually what you want, not 'idle'. "
+        "'idle': Emacs command loop has been idle >= min_idle s with no "
+        "pending input -- use after keys/eval to let UI effects settle (it "
+        "says nothing about whether buffer OUTPUT finished). 'text': a "
+        "pattern appeared in a buffer -- use to await known output. "
         "'prompt': a minibuffer prompt became active -- use after keys "
         "that should ask a question."))],
     pattern: Annotated[str | None, Field(description=(
         "For condition='text': a PYTHON regular expression (not elisp "
         "syntax) matched against the buffer text."))] = None,
     buffer: Annotated[str | None, Field(description=(
-        "For condition='text': buffer to search (default: current). May "
-        "not exist yet -- it is polled until the deadline."))] = None,
+        "For condition='text' (buffer to search) or 'stable' (buffer to "
+        "watch); default: current. May not exist yet -- it is polled until "
+        "the deadline."))] = None,
     timeout: Annotated[float, Field(gt=0, le=120, description=(
         "Overall deadline in seconds (0 < timeout <= 120). Prefer several "
         "short waits over one long one."))] = 10.0,
     min_idle: Annotated[float, Field(ge=0, le=60, description=(
         "For condition='idle': minimum idle time in seconds."))] = 0.2,
+    quiet_ms: Annotated[int, Field(ge=50, le=10000, description=(
+        "For condition='stable': the buffer must be unchanged for this many "
+        "milliseconds to count as settled (default 300)."))] = 300,
 ) -> str:
     """Wait for a condition instead of sleep-and-poll.
 
-    Returns what matched (idle time / matched text + position / prompt
-    string + current input). On timeout, ok=false with a "state" snapshot
-    embedded so you can see what Emacs was doing instead -- read it before
-    retrying.
+    Returns what matched (settled buffer + edits seen / idle time / matched
+    text + position / prompt string + current input). On timeout, ok=false
+    with a "state" snapshot embedded so you can see what Emacs was doing
+    instead -- read it before retrying.
     """
     sess = None
     try:
         sess = _load(session)
-        # min_idle must be logged or the transcript->script exporter
-        # would silently lose it from replayed idle waits.
+        # min_idle/quiet_ms must be logged or the transcript->script
+        # exporter would silently lose them from replayed waits.
         sess.log("wait", condition=condition, pattern=pattern, buffer=buffer,
-                 min_idle=min_idle, timeout=timeout, via="mcp")
+                 min_idle=min_idle, quiet_ms=quiet_ms, timeout=timeout,
+                 via="mcp")
         if condition == "idle":
             data = S.wait_idle(sess, min_idle=min_idle, timeout=timeout)
         elif condition == "text":
             if not pattern:
                 raise ElateError("condition='text' needs a pattern")
             data = S.wait_text(sess, pattern, buffer=buffer, timeout=timeout)
+        elif condition == "stable":
+            data = S.wait_stable(sess, buffer=buffer, quiet_ms=quiet_ms,
+                                 timeout=timeout)
         else:
             data = S.wait_prompt(sess, timeout=timeout)
         return _ok(data)

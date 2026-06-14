@@ -40,7 +40,18 @@ Rules that prevent the most common mistakes:
 - Most commands need `-s NAME` **before** the subcommand: `elate -s s eval …`.
 - The sandbox `$HOME` is fake: create fixture files via `eval`
   (`(with-temp-file "~/f" …)`) so nothing touches the real home. There is
-  **no network** inside the sandbox.
+  **no network** inside the sandbox. For files a **subprocess** needs at
+  spawn (e.g. shell rc files for shell-integration tests), use
+  `start --home-seed DIR` — it copies a fixture tree into the fake `$HOME`
+  *before* Emacs launches, keeping isolation (don't point `HOME` at a real
+  dir).
+- Startup forms run **before `emacs-startup-hook`** (set vars an auto-launch
+  hook reads): inline `--eval FORM`, or — to reuse the same setup across
+  sessions instead of re-pasting it — `--eval-file PATH` (a forms file, no
+  `load-path` side effects) and `--profile NAME`
+  (`$XDG_CONFIG_HOME/elate/profiles/NAME.el`). Order:
+  `--load` → `--eval-file` → `--profile` → `--eval` (so `--eval` overrides a
+  profile).
 - `--load PATH`: a **file** is loaded (and its directory put on
   `load-path`); a **directory** is only added to `load-path` — nothing in
   it is loaded, so `require`/load the feature yourself or pass the `.el`
@@ -55,12 +66,19 @@ Never sleep-and-poll. Never assume an effect happened — observe it.
 1. **Act**: `keys` / `type` / `mouse` / `eval`.
 2. **Wait** for the effect (exit 3 = timed out, the condition never held):
    ```sh
+   uvx elate -s s wait stable --buffer '*shell*' --quiet-ms 300  # output settled
    uvx elate -s s wait idle                  # command loop went quiet
    uvx elate -s s wait text 'Compiled OK' --buffer '*compilation*' --timeout 30
    uvx elate -s s wait prompt                # a minibuffer prompt opened
    ```
    `wait text` takes a **Python** regexp (not elisp syntax!) and happily
    polls a buffer that does not exist yet.
+   For **subprocess / REPL / terminal** output (comint, compilation, vterm,
+   async LSP), reach for `wait stable` — it returns once the buffer's text
+   has not changed for `--quiet-ms` ms, which is the "did the output stop?"
+   question. `wait idle` is *command-loop* idle (its `idle` number is just
+   seconds since the last activity — a big value is healthy, not a hang) and
+   says nothing about whether output finished.
 3. **Observe**: `state` is the one-call scene snapshot (buffer, mode, point,
    window layout, minibuffer prompt + completions, echo area, active popup
    kinds, *Messages* tail). When confused, run `state` first — it almost
@@ -124,6 +142,10 @@ uvx elate -s s popups                        # transient/which-key/corfu/childfr
 ```
 - `--props` runs `font-lock-ensure` first, so never-displayed buffers
   fontify correctly.
+- `faces-at` reports every text property at the point, with **values**
+  (`property-values`: e.g. your own `my-prompt=t` vs `my-count=42`) — use it
+  to assert a package's custom text properties instead of repeated
+  `eval (get-text-property …)`. Over MCP it is `elate_faces_at`.
 - `state`'s `popups` field tells you when a `popups` capture is worthwhile.
 - TTY `screenshot` prints the rendered screen as text (works post-mortem on
   a crashed Emacs); GUI `screenshot -o x.png` writes a PNG you can Read.
@@ -205,10 +227,9 @@ images** instead of PNG files to read. If `elate_*` MCP tools are already
 available in your session (the Claude Code plugin registers the server
 automatically), use them directly — do **not** register a duplicate;
 otherwise the server can be registered with
-`claude mcp add elate -- uvx elate mcp`. The 22 `elate_*` tools cover the core surface (`purge`,
-`resize`, `faces-at`, `export-script`, `snap`, and `matrix` stay
-CLI-only); sessions are shared between both (same names, same sandboxes),
-so you can mix.
+`claude mcp add elate -- uvx elate mcp`. The 24 `elate_*` tools cover the core surface (`resize`,
+`export-script`, `snap`, and `matrix` stay CLI-only); sessions are shared
+between both (same names, same sandboxes), so you can mix.
 
 ## Cleanup checklist (always)
 
