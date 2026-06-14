@@ -163,6 +163,8 @@ Byte-compile + checkdoc each FILE inside the live session, against its load-path
 
 - `FILE...` (repeatable)
 - `--timeout SECS` (default: 60) -- per-file in-Emacs timeout (default 60); a lint whose compile-time code hangs is interrupted and reported as a clean error
+- `--package-lint` -- ALSO run package-lint (additive; items tagged tool=package-lint). package-lint is installed into the sandbox elpa/ on demand. Without --archive-dir it refreshes the standard archives over the NETWORK (non-deterministic); a setup failure aborts with a clear error and the session survives
+- `--archive-dir DIR` -- for --package-lint: a local directory holding an archive-contents index, used directly as a package archive (a plain path, not a file:// URL) -- offline and REPRODUCIBLE (the recommended/CI path; the answer to package-lint's archive non-determinism)
 
 ## elate profile
 

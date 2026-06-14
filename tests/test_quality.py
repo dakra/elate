@@ -7,6 +7,7 @@ against a real Emacs in a real tmux; each test resets what it needs.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import shutil
@@ -171,6 +172,89 @@ LINT_USE_MAC = """\
 (provide 'usemac)
 ;;; usemac.el ends here
 """
+
+# package-lint test approach (read this before touching the fixtures
+# below).  The default suite must be HERMETIC -- no live MELPA -- so the
+# happy-path test builds a tiny local `archive-contents' package archive
+# and lints with --archive-dir, which keeps everything offline.
+#
+# The package the archive provides is a STUB, not the real package-lint:
+# it `provide's `package-lint' and defines `package-lint-buffer' to
+# return a canned (LINE COL TYPE MESSAGE) finding list, exactly the
+# shape the real package-lint-buffer returns (verified against
+# package-lint 0.26's `package-lint-buffer' docstring/source).  This
+# proves the full elate plumbing end to end -- configure a file://-style
+# local archive, package-install it into the sandbox elpa/, populate
+# package-archive-contents, call package-lint-buffer over a visited
+# emacs-lisp-mode buffer, map each tuple to a {tool:"package-lint", ...}
+# item with a normalized severity -- WITHOUT vendoring third-party GPL
+# code into the repo or depending on a machine-local package cache that
+# CI would not have.  Whether the real package-lint's *checks* are
+# correct is package-lint's own test suite's job, not elate's; elate
+# owns the install/call/map/error-handling glue, which the stub
+# exercises completely.
+PL_STUB_EL = """\
+;;; package-lint.el --- stub package-lint for elate tests -*- lexical-binding: t; -*-
+;; Version: 9.9
+;; Package-Requires: ((emacs "24.1"))
+;;; Commentary:
+;; A stand-in `package-lint' used only by elate's offline test archive.
+;;; Code:
+(defun package-lint-buffer (&optional buffer)
+  "Return a canned (LINE COL TYPE MESSAGE) finding list for BUFFER.
+Mirrors the real `package-lint-buffer' return shape: a list whose
+elements are (LINE COL TYPE MESSAGE) with TYPE in (error warning info)."
+  (ignore buffer)
+  (list (list 1 0 'error "stub: \\"lexical-binding\\" should be set")
+        (list 3 2 'warning "stub: example warning")
+        (list 5 4 'info "stub: example info")))
+(provide 'package-lint)
+;;; package-lint.el ends here
+"""
+
+# The on-disk package archive index.  Format: (1 (NAME . [VERSION-LIST
+# REQS DOC KIND PROPS])); KIND `single' = a one-file package.
+PL_ARCHIVE_CONTENTS = """\
+(1
+ (package-lint . [(9 9) ((emacs (24 1))) "stub package-lint" single nil]))
+"""
+
+# A clean .el to lint: it has zero byte-compile/checkdoc findings, so any
+# finding in the happy-path result must have come from package-lint.
+PL_FIXTURE_EL = """\
+;;; plfix.el --- package-lint fixture -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026  elate
+
+;; Author: elate <elate@example.com>
+
+;;; Commentary:
+
+;; A clean fixture (no bytecomp/checkdoc findings) for package-lint.
+
+;;; Code:
+
+(defun plfix-add-one (n)
+  "Return N plus one."
+  (1+ n))
+
+(provide 'plfix)
+;;; plfix.el ends here
+"""
+
+
+def _make_pl_archive(root: Path) -> Path:
+    """Build a local package archive providing the stub package-lint.
+
+    ROOT/archive holds package-lint-9.9.el + archive-contents; returns
+    that archive directory (suitable as --archive-dir).
+    """
+    archive = root / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    (archive / "package-lint-9.9.el").write_text(PL_STUB_EL, encoding="utf-8")
+    (archive / "archive-contents").write_text(
+        PL_ARCHIVE_CONTENTS, encoding="utf-8")
+    return archive
 
 
 @pytest.fixture(scope="module")
@@ -565,6 +649,161 @@ def test_cli_lint_command(sess: S.Session, fixtures: dict[str, Path],
     code = cli.main(["--json", "-s", NAME, "lint", str(fixtures["clean"])])
     out = json.loads(capsys.readouterr().out)
     assert code == 0 and out["ok"] is True and out["clean"] is True
+
+
+# -- opt-in package-lint ----------------------------------------------------------
+#
+# Hermetic by construction: every test below installs the STUB
+# package-lint from a local archive via --archive-dir, so nothing
+# touches the network.  See the PL_* fixtures above for why a stub is
+# used.  Each test that needs a *fresh* install state uses its own
+# throwaway session (the install is cached per session by the agent's
+# fboundp guard), so the happy-path and the no-install error paths don't
+# interfere.
+
+
+@contextlib.contextmanager
+def _pl_session(name: str) -> Iterator[S.Session]:
+    session = S.start_session(name, cols=100, rows=30)
+    try:
+        yield session
+    finally:
+        try:
+            S.stop_session(name)
+        except Exception:
+            session.raw().kill_server()
+
+
+def test_lint_package_lint_offline_archive_happy(
+        elate_home: str, tmp_path: Path) -> None:
+    archive = _make_pl_archive(tmp_path)
+    fixture = tmp_path / "plfix.el"
+    fixture.write_text(PL_FIXTURE_EL, encoding="utf-8")
+    with _pl_session(f"{NAME}pl1") as session:
+        # Default lint (no flag) is unchanged: no package-lint items, and
+        # this clean fixture has no bytecomp/checkdoc findings either.
+        base = S.lint_files(session, [str(fixture)])
+        assert base["clean"] is True
+        assert not any(i["tool"] == "package-lint" for i in base["items"])
+
+        # Opt-in, offline, via the local archive: package-lint is
+        # installed into the sandbox elpa/ and its findings surface.
+        data = S.lint_files(session, [str(fixture)],
+                            package_lint=True, archive_dir=str(archive))
+        pls = [i for i in data["items"] if i["tool"] == "package-lint"]
+        assert pls, "expected package-lint items from the stub"
+        assert all({"file", "tool", "line", "col", "severity", "message"}
+                   <= set(i) for i in pls)
+        assert all(i["file"] == str(fixture.resolve()) for i in pls)
+        # The stub's canned (LINE COL TYPE MESSAGE) tuples mapped through,
+        # severities normalized from package-lint's error/warning/info.
+        sev_by_line = {i["line"]: i["severity"] for i in pls}
+        assert sev_by_line[1] == "error"
+        assert sev_by_line[3] == "warning"
+        assert sev_by_line[5] == "info"
+        assert any("lexical-binding" in i["message"] for i in pls)
+        assert data["clean"] is False  # package-lint added findings
+
+        # Idempotent: a second opt-in lint reuses the install (no
+        # re-install) and still yields the items.
+        again = S.lint_files(session, [str(fixture)],
+                             package_lint=True, archive_dir=str(archive))
+        assert len([i for i in again["items"]
+                    if i["tool"] == "package-lint"]) == len(pls)
+
+        # The notes document the opt-in availability and the
+        # archive/network tradeoff.
+        notes = " ".join(data["notes"])
+        assert "package-lint" in notes and "--archive-dir" in notes
+        assert "opt-in" in notes and "reproducible" in notes
+
+
+def test_lint_package_lint_empty_archive_structured_error(
+        elate_home: str, tmp_path: Path) -> None:
+    # The offline/missing path, kept network-free: an --archive-dir with
+    # no archive-contents -> a structured error naming the cause and
+    # pointing at --archive-dir, with the session + channel surviving.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    fixture = tmp_path / "plfix.el"
+    fixture.write_text(PL_FIXTURE_EL, encoding="utf-8")
+    with _pl_session(f"{NAME}pl2") as session:
+        with pytest.raises(RpcError) as ei:
+            S.lint_files(session, [str(fixture)],
+                         package_lint=True, archive_dir=str(empty))
+        msg = str(ei.value)
+        assert "archive-contents" in msg
+        assert "--archive-dir" in msg
+        # The semantic channel and the session survive the failure: other
+        # tools keep working, and a follow-up DEFAULT lint is clean.
+        assert session.semantic().eval_form("(+ 21 21)")["value"] == "42"
+        post = S.lint_files(session, [str(fixture)])
+        assert post["clean"] is True
+        assert not any(i["tool"] == "package-lint" for i in post["items"])
+
+
+def test_lint_package_lint_session_guards(
+        elate_home: str, tmp_path: Path) -> None:
+    # Controller-side guards, no Emacs work needed beyond a live session.
+    fixture = tmp_path / "plfix.el"
+    fixture.write_text(PL_FIXTURE_EL, encoding="utf-8")
+    with _pl_session(f"{NAME}pl3") as session:
+        with pytest.raises(ElateError, match="applies to --package-lint"):
+            S.lint_files(session, [str(fixture)],
+                         package_lint=False, archive_dir=str(tmp_path))
+        with pytest.raises(ElateError, match="not a directory"):
+            S.lint_files(session, [str(fixture)],
+                         package_lint=True, archive_dir="/no/such/archive/dir")
+
+
+def test_cli_lint_package_lint(elate_home: str, tmp_path: Path,
+                               capsys: pytest.CaptureFixture[str]) -> None:
+    archive = _make_pl_archive(tmp_path)
+    fixture = tmp_path / "plfix.el"
+    fixture.write_text(PL_FIXTURE_EL, encoding="utf-8")
+    name = f"{NAME}pl4"
+    with _pl_session(name):
+        # Default CLI lint of the clean fixture: exit 0, no package-lint.
+        code = cli.main(["--json", "-s", name, "lint", str(fixture)])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 0 and out["clean"] is True
+
+        # Opt-in via the CLI flags: package-lint items appear, exit 1
+        # (findings present).
+        code = cli.main(["--json", "-s", name, "lint", "--package-lint",
+                         "--archive-dir", str(archive), str(fixture)])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 1 and out["ok"] is False
+        assert any(i["tool"] == "package-lint" for i in out["items"])
+
+        # Human output tags the tool.
+        code = cli.main(["-s", name, "lint", "--package-lint",
+                         "--archive-dir", str(archive), str(fixture)])
+        human = capsys.readouterr().out
+        assert "[package-lint]" in human
+
+        # --archive-dir without --package-lint is a loud usage-ish error
+        # (ElateError -> exit 1), network never touched.
+        code = cli.main(["--json", "-s", name, "lint",
+                         "--archive-dir", str(archive), str(fixture)])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 1 and out["ok"] is False
+        assert "--package-lint" in out["error"]
+
+
+@pytest.mark.skip(reason=(
+    "network-gated: installs the REAL package-lint from live MELPA; "
+    "the default suite is hermetic and must not hit the network. "
+    "Unskip and run manually to qualify against the real package-lint."))
+def test_lint_package_lint_live_melpa(
+        elate_home: str, tmp_path: Path) -> None:  # pragma: no cover
+    # Opt-in WITHOUT --archive-dir: configures the standard archives and
+    # refreshes them over the network. Deliberately skipped by default.
+    fixture = tmp_path / "plfix.el"
+    fixture.write_text(PL_FIXTURE_EL, encoding="utf-8")
+    with _pl_session(f"{NAME}pllive") as session:
+        data = S.lint_files(session, [str(fixture)], package_lint=True)
+        assert any(i["tool"] == "package-lint" for i in data["items"])
 
 
 # -- faces / text properties / overlays -------------------------------------------

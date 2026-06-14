@@ -533,6 +533,25 @@ def elate_lint(
         "Per-file in-Emacs timeout in seconds (0 < timeout <= 120); a "
         "lint whose compile-time code hangs is interrupted and reported "
         "as a clean error, leaving no residue."))] = 60.0,
+    package_lint: Annotated[bool, Field(description=(
+        "ALSO run package-lint (off by default; additive -- items are "
+        "tagged tool='package-lint'). package-lint is an external "
+        "package installed into the sandbox elpa/ on first use. Without "
+        "'archive_dir' it refreshes the standard archives (GNU + nongnu "
+        "+ MELPA) over the NETWORK, which is non-deterministic (archive "
+        "contents move over time); prefer 'archive_dir' for reproducible "
+        "results. A setup failure (offline, package-lint not in the "
+        "archive, an indexless archive) aborts the lint with a clear "
+        "error and a state snapshot -- the session and channel "
+        "survive."))] = False,
+    archive_dir: Annotated[str | None, Field(description=(
+        "For package_lint=true: a local directory holding an "
+        "archive-contents index, used directly as a package archive (a "
+        "plain path, not a file:// URL). This is the OFFLINE, "
+        "REPRODUCIBLE path (the recommended way to run package-lint, and "
+        "the answer to its archive non-determinism); without it the "
+        "network archives are refreshed live. Ignored unless "
+        "package_lint is true."))] = None,
 ) -> str:
     """Lint elisp files inside the session: byte-compile + checkdoc.
 
@@ -547,17 +566,22 @@ def elate_lint(
     undefined-function warnings a fresh session would emit).
 
     Returns "items": a list of {file, tool, line, col, severity,
-    message} ('tool' is byte-compile or checkdoc; line/col may be null
-    for file-level findings), plus "clean" (true when there are none).
-    The byte-compilation writes its .elc into the sandbox and deletes
-    it -- never next to the source. native-comp warnings and
-    package-lint are not run; "notes" says why.
+    message} ('tool' is byte-compile, checkdoc, or -- with
+    package_lint=true -- package-lint; line/col may be null for
+    file-level findings), plus "clean" (true when there are none). The
+    byte-compilation writes its .elc into the sandbox and deletes it --
+    never next to the source. native-comp warnings are not collected;
+    "notes" explains the omissions and the package-lint
+    network/archive tradeoff.
     """
     sess = None
     try:
         sess = _load(session)
-        sess.log("lint", files=files, timeout=timeout, via="mcp")
-        data = S.lint_files(sess, files, timeout=timeout)
+        sess.log("lint", files=files, timeout=timeout,
+                 package_lint=package_lint, archive_dir=archive_dir,
+                 via="mcp")
+        data = S.lint_files(sess, files, timeout=timeout,
+                            package_lint=package_lint, archive_dir=archive_dir)
         sess.log("lint-result", files=len(data["files"]),
                  items=len(data["items"]))
         return _ok(data)

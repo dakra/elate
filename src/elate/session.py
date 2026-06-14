@@ -677,8 +677,22 @@ LINT_NOTES = [
     "do NOT leak; their definitions stay compile-local)",
     "native-comp warnings are not collected (native compilation is "
     "asynchronous; its warnings would race the lint run)",
-    "package-lint is not run (it needs the package archives, and the "
-    "sandbox deliberately has no network access)",
+    "package-lint is available opt-in via --package-lint (it is NOT in "
+    "the default lint): it needs a package archive index, which the "
+    "hermetic sandbox does not carry, and it is an external package "
+    "installed into the sandbox elpa/ on demand",
+    "--package-lint without --archive-dir refreshes the standard "
+    "archives (GNU + nongnu + MELPA) over the NETWORK, which is "
+    "non-deterministic -- archive contents move over time, so the same "
+    "file can lint differently on different days",
+    "--archive-dir DIR points package-lint at a local directory holding "
+    "an archive-contents index, used directly as a package archive (a "
+    "plain path, not a file:// URL): offline and reproducible, the "
+    "recommended path for CI and for stable lint verdicts",
+    "--package-lint installs into a sandbox-local elpa/ and may leave "
+    "package-install / native-comp artifacts (e.g. an "
+    "*Async-native-compile-log* buffer, eln-cache) in the session -- "
+    "all contained to the sandbox, unlike the residue-free default lint",
 ]
 
 
@@ -717,6 +731,8 @@ def lint_files(
     sess: Session,
     files: Sequence[str],
     timeout: float = 60.0,
+    package_lint: bool = False,
+    archive_dir: str | None = None,
 ) -> dict[str, Any]:
     """Byte-compile + checkdoc each of FILES inside the session.
 
@@ -732,9 +748,32 @@ def lint_files(
     in-Emacs with-timeout per file (fires while the compile services
     timers); the subprocess timeout sits ERT_RPC_SLACK above it as the
     hard backstop for tight-loop compiles.
+
+    PACKAGE_LINT (opt-in) additionally runs package-lint, appending
+    items tagged tool "package-lint". It is installed into the sandbox
+    elpa/ on first use: ARCHIVE_DIR, when given, is a local directory
+    holding an archive-contents index used directly as a package
+    archive (a plain path, not a file:// URL) -- offline + reproducible,
+    the recommended/CI path; without it the standard archives (GNU +
+    nongnu + MELPA) are refreshed over the network (non-deterministic).
+    Setup failures (offline, package-lint not in the archive, an
+    indexless archive) abort the lint with a clear RpcError carrying a
+    state snapshot; the session and the semantic channel survive. The
+    setup runs once per session and is cached (idempotent once
+    package-lint is loadable). Unlike the residue-free default lint,
+    the install may leave package-install / native-comp artifacts (an
+    *Async-native-compile-log* buffer, eln-cache) in the session --
+    all contained to the sandbox.
     """
     if not files:
         raise ElateError("lint needs at least one file")
+    if archive_dir is not None and not package_lint:
+        raise ElateError("--archive-dir applies to --package-lint only")
+    if archive_dir is not None:
+        adir = Path(archive_dir).expanduser().resolve()
+        if not adir.is_dir():
+            raise ElateError(f"--archive-dir is not a directory: {archive_dir}")
+        archive_dir = str(adir)
     sem = sess.semantic()
     items: list[dict[str, Any]] = []
     checked: list[str] = []
@@ -743,6 +782,7 @@ def lint_files(
         if not path.is_file():
             raise ElateError(f"lint file does not exist: {entry}")
         data = sem.rpc("lint", str(path), round(float(timeout), 3),
+                       package_lint, archive_dir,
                        timeout=timeout + ERT_RPC_SLACK)
         checked.append(data.get("file") or str(path))
         items.extend(data.get("items") or [])

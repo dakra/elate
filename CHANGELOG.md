@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0
+
+- `elate lint --package-lint [--archive-dir DIR]` (MCP: `elate_lint`'s
+  `package_lint` / `archive_dir`): opt-in package-lint pass, additive on
+  top of the default byte-compile + checkdoc. Items are tagged
+  `tool: "package-lint"`. package-lint is installed into a sandbox-local
+  `elpa/`; `--archive-dir` points at a local package archive directory
+  (a plain path containing `archive-contents`, not a `file://` URL) for
+  an offline, reproducible run -- without it the standard archives are
+  refreshed live (network, non-deterministic). A missing/empty/offline
+  archive fails with a clear structured error; the session and the
+  semantic channel survive. The default lint stays offline, deterministic,
+  and residue-free; the package-lint path may leave sandbox-contained
+  install/native-comp artifacts.
+- `elate --version` now derives from the installed distribution metadata.
+  The published 0.2.0 wheel mistakenly reported `elate 0.1.0` (a hardcoded
+  `__version__` the release bump missed); functionality was unaffected. The
+  version-sync test now covers the runtime string.
+
 ## 0.2.0
 
 - `elate purge`: delete the sandboxes of stopped/dead sessions (the

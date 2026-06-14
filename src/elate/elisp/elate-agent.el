@@ -50,6 +50,15 @@
 (declare-function package-desc-dir "package")
 (declare-function tar-mode "tar-mode")
 (declare-function dired-mode "dired")
+;; package-lint is OPTIONAL: only the opt-in `elate lint --package-lint'
+;; path installs and requires it (`elate--ensure-package-lint').  These
+;; declarations keep the agent byte-compiling clean without the package
+;; on the build machine.
+(defvar package-archives)
+(defvar package-archive-contents)
+(declare-function package-refresh-contents "package")
+(declare-function package-install "package")
+(declare-function package-lint-buffer "package-lint")
 
 (defvar elate--clean-installed nil
   "Plists describing the packages `elate-clean-install' installed.
@@ -1199,8 +1208,139 @@ list stays clean."
         (kill-buffer checkdoc-diagnostic-buffer)))
     (nreverse items)))
 
-(defun elate--lint-file (file)
-  "Byte-compile + checkdoc FILE; return the combined item list."
+(defun elate--package-lint-severity (type)
+  "Normalize a package-lint TYPE symbol to the lint severity vocabulary.
+package-lint reports `error', `warning', or `info'; the first two map
+onto the existing byte-compile/checkdoc severities, and `info' passes
+through (a strictly informational finding).  An unknown type degrades
+to \"warning\" rather than dropping the finding."
+  (pcase type
+    ('error "error")
+    ('warning "warning")
+    ('info "info")
+    (_ "warning")))
+
+(defun elate--ensure-package-lint (archive-dir)
+  "Make `package-lint' loadable in this session, installing it if needed.
+Idempotent: a no-op once `package-lint-buffer' is `fboundp'.  Otherwise
+package.el is pointed at a sandbox-local `package-user-dir' (the same
+prelude pattern `elate-clean-install' uses), the archives are
+configured, `package-archive-contents' is populated, and package-lint
+is installed into the sandbox elpa/.
+
+ARCHIVE-DIR, when non-nil, is a local directory holding an
+`archive-contents' index.  package.el treats any archive location that
+is not an http(s): URL as a plain absolute directory path (it reads the
+index with `insert-file-contents-literally'), so the directory is used
+directly -- the whole operation is offline and reproducible.  When
+ARCHIVE-DIR is nil the standard archives (GNU + nongnu + MELPA) are
+configured and `package-refresh-contents' fetches their indexes over
+the network (convenient but non-deterministic; cached for the session
+by the `fboundp' guard above).
+
+Any failure -- offline, an empty/indexless archive, package-lint not
+in the archive -- is signalled as a clear `error'.  It travels back
+through `elate-rpc's `condition-case' as the flat {ok:false, error}
+shape with a state snapshot, so the semantic channel and the session
+survive and every other tool keeps working."
+  (unless (fboundp 'package-lint-buffer)
+    (require 'package)
+    (let ((dir (and archive-dir (expand-file-name archive-dir))))
+      (when (and dir (not (file-readable-p
+                           (expand-file-name "archive-contents" dir))))
+        (error "elate: --archive-dir %s has no readable archive-contents (point it at a directory built as a package archive)"
+               (or archive-dir dir)))
+      ;; Sandbox-local install, explicit custom-file (Custom would
+      ;; otherwise rewrite the generated init.el), nil archives so only
+      ;; what we configure below can be reached.
+      (setq package-user-dir (expand-file-name "elpa" elate-session-dir)
+            package-archives nil
+            custom-file (expand-file-name "custom.el" elate-session-dir))
+      (if dir
+          ;; A bare absolute path, NOT a file:// URL: package.el routes a
+          ;; non-http(s) location through `insert-file-contents-literally'
+          ;; and rejects "file://..." as "not a url nor an absolute file
+          ;; name".
+          (setq package-archives (list (cons "elate-local" dir)))
+        (setq package-archives
+              '(("gnu"    . "https://elpa.gnu.org/packages/")
+                ("nongnu" . "https://elpa.nongnu.org/nongnu/")
+                ("melpa"  . "https://melpa.org/packages/"))))
+      (package-initialize)
+      ;; `package-refresh-contents' populates `package-archive-contents'
+      ;; (which package-lint's dependency checks read, so it MUST be set
+      ;; before `package-lint-buffer' runs).  For a local archive the
+      ;; refresh is a pure offline file copy of the on-disk index; for
+      ;; the standard archives it fetches over the network.
+      (condition-case err
+          (let ((inhibit-message t))
+            (package-refresh-contents))
+        (error
+         (error "elate: could not load package archives%s: %s (use --archive-dir for an offline, reproducible run)"
+                (if dir (format " from %s" dir) " (network)")
+                (error-message-string err))))
+      (unless (assq 'package-lint package-archive-contents)
+        (error "elate: package-lint is not in the configured archive%s (use --archive-dir pointing at an archive that provides it)"
+               (if dir (format " %s" dir) "s")))
+      (condition-case err
+          (let ((inhibit-message t))
+            (package-install 'package-lint))
+        (error
+         (error "elate: installing package-lint failed: %s (use --archive-dir for an offline, reproducible run)"
+                (error-message-string err))))
+      (require 'package-lint)
+      (unless (fboundp 'package-lint-buffer)
+        (error "elate: package-lint installed but package-lint-buffer is unavailable")))))
+
+(defun elate--lint-package-lint (file)
+  "Run package-lint over FILE; return item plists tagged :tool \"package-lint\".
+`package-lint-buffer' returns (LINE COL TYPE MESSAGE) tuples over a
+visited buffer that MUST be in `emacs-lisp-mode'.  Same buffer hygiene
+as `elate--lint-checkdoc': an existing visit is reused and left alone;
+a buffer we had to create is killed afterwards.  `package-lint-buffer'
+reads `package-archive-contents', which `elate--ensure-package-lint'
+populates before this runs."
+  (let* ((items nil)
+         (existing (find-buffer-visiting file)))
+    (unwind-protect
+        (let ((buf (or existing (find-file-noselect file))))
+          (unwind-protect
+              (with-current-buffer buf
+                ;; package-lint-buffer errors unless the buffer is in
+                ;; emacs-lisp-mode; a freshly visited .el already is, but
+                ;; enforce it so an existing visit in some other mode (or
+                ;; fundamental-mode) does not break the run.
+                (unless (derived-mode-p 'emacs-lisp-mode)
+                  (delay-mode-hooks (emacs-lisp-mode)))
+                (let ((inhibit-message t))
+                  (dolist (tuple (package-lint-buffer buf))
+                    (let ((line (nth 0 tuple))
+                          (col (nth 1 tuple))
+                          (type (nth 2 tuple))
+                          (msg (nth 3 tuple)))
+                      (push (list :file file :tool "package-lint"
+                                  :line (if (integerp line) line :null)
+                                  :col (if (integerp col) col :null)
+                                  :severity (elate--package-lint-severity type)
+                                  :message (format "%s" msg))
+                            items)))))
+            (unless existing (kill-buffer buf))))
+      nil)
+    (nreverse items)))
+
+(defun elate--lint-file (file &optional package-lint archive-dir)
+  "Byte-compile + checkdoc FILE; return the combined item list.
+When PACKAGE-LINT is non-nil, package-lint is run additively and its
+items (tagged :tool \"package-lint\") are appended.  ARCHIVE-DIR is an
+optional local directory holding an `archive-contents' index, used
+directly as a package archive (a plain path, not a file:// URL) for
+installing package-lint (see `elate--ensure-package-lint').  package-lint
+is set up once before
+the per-file work; a setup failure aborts the whole lint with a clear
+error (the session and channel survive -- it travels as the flat error
+shape), rather than silently degrading to bytecomp+checkdoc only."
+  (when package-lint
+    (elate--ensure-package-lint archive-dir))
   (append (elate--lint-byte-compile file)
           (condition-case err
               (elate--lint-checkdoc file)
@@ -1208,9 +1348,17 @@ list stays clean."
              (list (list :file file :tool "checkdoc"
                          :line :null :col :null
                          :severity "error"
-                         :message (error-message-string err)))))))
+                         :message (error-message-string err)))))
+          (when package-lint
+            (condition-case err
+                (elate--lint-package-lint file)
+              (error
+               (list (list :file file :tool "package-lint"
+                           :line :null :col :null
+                           :severity "error"
+                           :message (error-message-string err))))))))
 
-(defun elate--rpc-lint (path &optional timeout)
+(defun elate--rpc-lint (path &optional timeout package-lint archive-dir)
   "Lint the file at PATH: byte-compile + checkdoc, as structured items.
 Each item is {file, tool, line, col, severity, message}.  PATH is a
 path on purpose: file contents must never travel over the (~1 MiB)
@@ -1222,7 +1370,17 @@ linting against the session's load-path.  TIMEOUT (seconds) arms a
 it can only fire while the compile-time code services timers; a hard
 elisp loop falls to the controller's subprocess timeout.  Cleanup
 \(log buffer, .elc, visit buffers) runs in `unwind-protect's, so a
-timed-out or quit-interrupted lint leaves no residue."
+timed-out or quit-interrupted lint leaves no residue.
+
+When PACKAGE-LINT is non-nil, package-lint is run additively (items
+tagged :tool \"package-lint\"); ARCHIVE-DIR is an optional local
+directory holding an `archive-contents' index, used directly as a
+package archive (a plain path, not a file:// URL) to install
+package-lint offline and reproducibly (see
+`elate--ensure-package-lint').  package-lint setup
+runs inside the same `with-timeout', so a wedged network refresh is
+bounded too; a setup failure aborts the lint with a clear error and
+the channel survives (it travels as the flat {ok:false} error shape)."
   (let ((file (expand-file-name path)))
     (unless (file-readable-p file)
       (error "elate: cannot read file %s" file))
@@ -1232,8 +1390,8 @@ timed-out or quit-interrupted lint leaves no residue."
                       (with-timeout (timeout
                                      (error "elate: lint of %s timed out after %gs (likely stuck compile-time code; lint untrusted files in a throwaway session)"
                                             file timeout))
-                        (elate--lint-file file))
-                    (elate--lint-file file))))))
+                        (elate--lint-file file package-lint archive-dir))
+                    (elate--lint-file file package-lint archive-dir))))))
 
 ;;;; Profiler
 

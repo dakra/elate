@@ -182,6 +182,14 @@ def test_list_tools(elate_home: str) -> None:
         assert lint_params["timeout"]["maximum"] == 120
         assert "path" in lint_params["files"]["description"].lower()
         assert "checkdoc" in tools["elate_lint"].description
+        # Opt-in package-lint: a bool flag + an optional archive_dir,
+        # both schema-bounded and documenting the network/reproducible
+        # tradeoff.
+        assert lint_params["package_lint"]["type"] == "boolean"
+        assert lint_params["package_lint"]["default"] is False
+        assert "network" in lint_params["package_lint"]["description"].lower()
+        assert lint_params["archive_dir"]["default"] is None
+        assert "reproducible" in lint_params["archive_dir"]["description"].lower()
         # elate_buffer grew the props flag; popups is read-only.
         buf_props = tools["elate_buffer"].inputSchema["properties"]["props"]
         assert "overlay" in buf_props["description"]

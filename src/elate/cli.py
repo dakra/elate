@@ -175,6 +175,21 @@ def build_parser() -> argparse.ArgumentParser:
                     help="per-file in-Emacs timeout (default 60); a lint "
                          "whose compile-time code hangs is interrupted "
                          "and reported as a clean error")
+    sp.add_argument("--package-lint", action="store_true",
+                    help="ALSO run package-lint (additive; items tagged "
+                         "tool=package-lint). package-lint is installed "
+                         "into the sandbox elpa/ on demand. Without "
+                         "--archive-dir it refreshes the standard "
+                         "archives over the NETWORK (non-deterministic); "
+                         "a setup failure aborts with a clear error and "
+                         "the session survives")
+    sp.add_argument("--archive-dir", metavar="DIR",
+                    help="for --package-lint: a local directory holding "
+                         "an archive-contents index, used directly as a "
+                         "package archive (a plain path, not a file:// "
+                         "URL) -- offline and REPRODUCIBLE (the "
+                         "recommended/CI path; the answer to "
+                         "package-lint's archive non-determinism)")
 
     sp = sub.add_parser(
         "profile",
@@ -649,8 +664,11 @@ def cmd_test(args: argparse.Namespace) -> Result:
 
 def cmd_lint(args: argparse.Namespace) -> Result:
     sess = _require_session(args)
-    sess.log("lint", files=args.files, timeout=args.timeout)
-    data = S.lint_files(sess, args.files, timeout=args.timeout)
+    sess.log("lint", files=args.files, timeout=args.timeout,
+             package_lint=args.package_lint, archive_dir=args.archive_dir)
+    data = S.lint_files(sess, args.files, timeout=args.timeout,
+                        package_lint=args.package_lint,
+                        archive_dir=args.archive_dir)
     sess.log("lint-result", files=len(data["files"]), items=len(data["items"]))
     clean = data["clean"]
     lines = []
