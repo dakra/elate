@@ -18,7 +18,8 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   sessions); `elate purge --all --stopped-older-than 1h` GCs only stale
   ones (`elate list` shows each stopped session's idle age).
 - The loop is **act → wait → observe**: `keys`/`type`/`mouse`/`eval`/
-  `send-process`, then `wait stable --buffer B --quiet-ms N`
+  `send-process` (and `focus`/`send-events` for window-system focus events,
+  ordered against clicks/keys), then `wait stable --buffer B --quiet-ms N`
   (subprocess/REPL output settled) / `wait idle` (command-loop idle) /
   `wait text REGEXP` / `wait prompt` (never sleep-and-poll), then `state`
   (one-call scene snapshot — run it first when confused) or

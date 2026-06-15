@@ -62,8 +62,8 @@ MAX_STEP_TIMEOUT = 600.0
 
 _SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
 
-VERBS = ("keys", "type", "eval", "wait", "mouse", "test", "lint",
-         "screenshot", "resize", "assert")
+VERBS = ("keys", "type", "eval", "wait", "mouse", "focus", "send_events",
+         "test", "lint", "screenshot", "resize", "assert")
 
 # Keys allowed on every step besides the verb itself.
 _COMMON_KEYS = {"comment", "skip"}
@@ -77,6 +77,8 @@ _STEP_OPTIONS: dict[str, set[str]] = {
     "mouse": {"button", "buffer", "pos", "line", "col", "part", "to_pos",
               "to_line", "to_col", "direction", "count", "delivery",
               "timeout"},
+    "focus": {"frame", "set_focus_state", "timeout"},
+    "send_events": {"buffer", "frame", "set_focus_state", "timeout"},
     "test": {"load_files", "timeout", "allow_unexpected"},
     "lint": {"timeout", "allow_findings"},
     "screenshot": {"ansi"},
@@ -114,7 +116,8 @@ _SESSION_KEYS = {"ui", "size", "config", "init_file", "load", "eval",
                  "emacs", "headless", "allow_init_error"}
 
 _DEFAULT_TIMEOUTS = {"keys": 15.0, "eval": 15.0, "wait": 10.0,
-                     "mouse": 15.0, "test": 60.0, "lint": 60.0}
+                     "mouse": 15.0, "focus": 15.0, "send_events": 15.0,
+                     "test": 60.0, "lint": 60.0}
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +331,24 @@ def _validate_step(step: Any, index: int) -> None:
             _check_int(step, key, where, minimum=1)
         for key in ("col", "to_col"):
             _check_int(step, key, where, minimum=0)
+    if verb == "focus":
+        if val not in ("in", "out"):
+            raise ElateError(f'{where}: focus must be "in" or "out", got {val!r}')
+        _check_str(step, "frame", where)
+        _check_bool(step, "set_focus_state", where)
+    if verb == "send_events":
+        if not (isinstance(val, list) and val
+                and all(isinstance(x, str) for x in val)):
+            raise ElateError(
+                f'{where}: "send_events" takes a non-empty list of event tokens')
+        for tok in val:
+            try:
+                S.parse_event_token(tok)
+            except ElateError as exc:
+                raise ElateError(f"{where}: {exc}") from exc
+        _check_str(step, "buffer", where)
+        _check_str(step, "frame", where)
+        _check_bool(step, "set_focus_state", where)
     if verb == "test" and not isinstance(val, str):
         raise ElateError(f'{where}: "test" takes an ERT selector string')
     if verb == "test":
@@ -728,6 +749,24 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
         return S.mouse_event(
             sess, timeout=float(step.get("timeout", _DEFAULT_TIMEOUTS["mouse"])),
             **kwargs)
+
+    if verb == "focus":
+        timeout = float(step.get("timeout", _DEFAULT_TIMEOUTS["focus"]))
+        set_state = bool(step.get("set_focus_state"))
+        sess.log("focus", direction=step["focus"], frame=step.get("frame"),
+                 set_focus_state=set_state, via="script")
+        return S.focus_event(sess, step["focus"], frame=step.get("frame"),
+                             set_focus_state=set_state, timeout=timeout)
+
+    if verb == "send_events":
+        timeout = float(step.get("timeout", _DEFAULT_TIMEOUTS["send_events"]))
+        set_state = bool(step.get("set_focus_state"))
+        sess.log("send-events", events=step["send_events"],
+                 buffer=step.get("buffer"), frame=step.get("frame"),
+                 set_focus_state=set_state, via="script")
+        return S.send_events(sess, step["send_events"], buffer=step.get("buffer"),
+                             frame=step.get("frame"), set_focus_state=set_state,
+                             timeout=timeout)
 
     if verb == "test":
         timeout = float(step.get("timeout", _DEFAULT_TIMEOUTS["test"]))

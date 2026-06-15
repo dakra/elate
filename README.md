@@ -667,6 +667,38 @@ clean-install variant of this loop (install a package for real, then
 drive its autoloaded entry point), see `examples/clean-install.json`
 and the [Clean-install sessions](#clean-install-sessions) section.
 
+### Reproduce a focus-vs-click ordering bug
+
+Window systems deliver a focus change and a click as separate, ordered
+events: `focus-in` → `after-focus-change-function` → the click's command.
+That ordering distinguishes a click that *refocuses* a frame from a plain
+click (click-to-refocus vs click-to-select, paste-on-focus, …) and is
+invisible to batch ERT. `send-events` injects them as one ordered stream:
+
+```sh
+elate start --name foc --ui gui --load ./my-term.el
+# … open the package's buffer in its click-to-select ("semi-char") mode …
+
+# focus-in THEN the click (one turn) — @LINE,COL is 1-based line, 0-based col:
+elate -s foc send-events 'focus-in' 'down-mouse-1@10,5' 'mouse-1@10,5'
+elate -s foc wait idle
+elate -s foc state                 # a focus click — no mode change
+
+# the byte-identical click with NO preceding focus-in:
+elate -s foc send-events 'down-mouse-1@10,5' 'mouse-1@10,5'
+elate -s foc wait idle
+elate -s foc state                 # now switched to copy mode
+elate stop foc
+```
+
+A focus event only fires at the head of a command-loop turn, so focus
+tokens are auto-split into separate, drained batches — the reverse order
+(mouse-down *before* the focus-in, a distinct code path) is just
+`send-events 'down-mouse-1@10,5' 'mouse-1@10,5' 'focus-in'`. `focus in` /
+`focus out` flip focus standalone; `--set-focus-state` additionally shims
+`(frame-focus-state)` (which an injected event cannot otherwise move).
+Script equivalent: `elate run examples/focus-ordering.json` (self-contained).
+
 ## Using elate from AI harnesses
 
 elate is built to be driven by AI agents. Pick the integration by harness:
@@ -863,6 +895,8 @@ responses embed a compact state snapshot so the model sees why):
 | `elate_type` | literal text: raw terminal bytes (TTY) or queued events (GUI) |
 | `elate_send_process` | send raw input to a buffer's subprocess (comint/REPL/shell/terminal): `char` (e.g. `C-c` → ^C/SIGINT), `text`, or `file` — drives the *process*, not Emacs |
 | `elate_mouse` | semantic mouse for both UIs: click/double/drag/wheel at a buffer position, line/column, or the mode line; fires real bindings (buttons, follow-link, mwheel) |
+| `elate_focus` | inject a `focus-in`/`focus-out` event: runs `handle-focus-in`/`-out` through `special-event-map` (fires `after-focus-change-function`, sets `last-focus-update`); `set_focus_state` also shims `(frame-focus-state)` |
+| `elate_send_events` | inject an ordered stream of focus/mouse/key tokens that drains through the command loop in order (a focus event's hooks run before a following click); focus events auto-split into drained batches, so any ordering — including a mouse-down before a focus-in — is faithful |
 | `elate_eval` | elisp eval with value, *Messages* delta, error + backtrace |
 | `elate_test` | interactive ERT run: selector support, per-test status/duration/messages/condition/backtrace; failures are data (`ok` stays true — check `unexpected`) |
 | `elate_lint` | byte-compile + checkdoc by file path: `{file, tool, line, col, severity, message}` items; **executes the file's compile-time code in the session** (see Lint warning above) |

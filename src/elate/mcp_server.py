@@ -560,6 +560,95 @@ def elate_mouse(
 
 @server.tool(annotations=_MUTATING)
 @_threaded
+def elate_focus(
+    session: Annotated[str, Field(description="Session name.")],
+    direction: Annotated[Literal["in", "out"], Field(description=(
+        "'in' injects a focus-in event, 'out' a focus-out event."))],
+    frame: Annotated[str | None, Field(description=(
+        "Target the frame with this name (its 'name' frame parameter). "
+        "Default: the selected frame."))] = None,
+    set_focus_state: Annotated[bool, Field(description=(
+        "Also make (frame-focus-state) report the injected state. This is a "
+        "NON-NATIVE shim (advice on frame-focus-state): an injected event "
+        "cannot move the real C-owned focus state, though it always fires "
+        "after-focus-change-function and sets the last-focus-update frame "
+        "parameter. Enable only if the code under test reads "
+        "(frame-focus-state)."))] = False,
+    timeout: Annotated[float, Field(gt=0, le=120, description=(
+        "Seconds before delivery/drain is declared blocked."))] = 15.0,
+) -> str:
+    """Inject a window-system focus-in/focus-out event.
+
+    Runs handle-focus-in / handle-focus-out through special-event-map
+    exactly as a real window-system focus change would -- firing
+    after-focus-change-function and setting the last-focus-update frame
+    parameter -- by queueing the (focus-in FRAME) / (focus-out FRAME) event
+    on unread-command-events and draining it. Works for TTY and GUI
+    sessions. For an event ordered against clicks/keys, use
+    elate_send_events. After it returns the event has fired; observe with
+    elate_state.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        sess.log("focus", via="mcp", direction=direction, frame=frame,
+                 set_focus_state=set_focus_state)
+        return _ok(S.focus_event(sess, direction, frame=frame,
+                                 set_focus_state=set_focus_state,
+                                 timeout=timeout))
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_send_events(
+    session: Annotated[str, Field(description="Session name.")],
+    events: Annotated[list[str], Field(description=(
+        "Ordered event tokens. Each is one of: 'focus-in' / 'focus-out'; a "
+        "mouse event 'down-mouse-N' / 'mouse-N' / 'up-mouse-N' / "
+        "'double-mouse-N' / 'wheel-up' / 'wheel-down' (N=1..3) with an "
+        "optional location '@LINE,COL' (1-based line, 0-based col) or '#POS' "
+        "(1-based buffer position; default: the window's point); or 'key:KBD' "
+        "for a key sequence, e.g. 'key:RET', 'key:C-x'. Example: "
+        "['focus-in', 'down-mouse-1@10,5', 'mouse-1@10,5']."))],
+    buffer: Annotated[str | None, Field(description=(
+        "Target the window displaying this buffer for mouse events (it must "
+        "be visible). Default: the selected window."))] = None,
+    frame: Annotated[str | None, Field(description=(
+        "Target frame for focus events. Default: the selected frame."))] = None,
+    set_focus_state: Annotated[bool, Field(description=(
+        "Also make (frame-focus-state) report injected focus (non-native "
+        "shim; see elate_focus)."))] = False,
+    timeout: Annotated[float, Field(gt=0, le=120, description=(
+        "Seconds before delivery/drain of a batch is declared blocked."))] = 15.0,
+) -> str:
+    """Inject an ordered stream of focus/mouse/key events.
+
+    The events drain through the real command loop in order, so a focus
+    event's after-focus-change-function hooks run before a following click's
+    command -- the ordering that distinguishes a click-to-refocus from a
+    plain click. A focus event only fires at the head of a command-loop
+    turn, so any focus events are delivered in separate, drained batches
+    automatically; this makes any ordering faithful, including a mouse-down
+    dispatched before a focus-in. Lower-level than elate_mouse: each mouse
+    token is exactly one event (no implicit down+click pair). Works for TTY
+    and GUI sessions; observe the effect afterwards with elate_state.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        sess.log("send-events", via="mcp", events=events, buffer=buffer,
+                 frame=frame, set_focus_state=set_focus_state)
+        return _ok(S.send_events(sess, events, buffer=buffer, frame=frame,
+                                 set_focus_state=set_focus_state,
+                                 timeout=timeout))
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_MUTATING)
+@_threaded
 def elate_eval(
     session: Annotated[str, Field(description="Session name.")],
     form: Annotated[str, Field(description=(
@@ -892,7 +981,8 @@ def elate_run_script(
         "Path to a JSON scenario file (see the README's 'Scenario "
         "scripts' section): {\"name\": ..., \"session\": {ui, size, "
         "config, load, eval}, \"steps\": [...]}. Steps mirror the other "
-        "tools (keys/type/eval/wait/mouse/test/lint/screenshot/resize) "
+        "tools (keys/type/eval/wait/mouse/focus/send_events/test/lint/"
+        "screenshot/resize) "
         "plus \"assert\" steps (buffer_contains, buffer_matches, state, "
         "messages_match, popup, tests, lint_clean, eval). Pass a file "
         "path -- the server reads the file; relative paths inside the "

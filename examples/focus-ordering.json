@@ -1,0 +1,21 @@
+{
+  "name": "focus-vs-click ordering",
+  "comment": "A focus-in delivered before a click is a refocusing click (handled, no mode change); the byte-identical click without a preceding focus-in changes mode. Only the ordered focus event distinguishes them -- the exact case send-events makes testable.",
+  "session": {"config": "minimal", "size": "80x24"},
+  "steps": [
+    {"eval": "(progn (defvar my-state \"semi-char\") (defvar my-focus-pending nil) (setq my-state \"semi-char\" my-focus-pending nil) (unless (get 'my-focus 'armed) (add-function :after after-focus-change-function (lambda () (setq my-focus-pending t))) (put 'my-focus 'armed t)) (with-current-buffer (get-buffer-create \"play\") (erase-buffer) (insert \"hello world\") (goto-char (point-min)) (use-local-map (make-sparse-keymap)) (local-set-key [down-mouse-1] #'ignore) (local-set-key [mouse-1] (lambda (e) (interactive \"e\") (if my-focus-pending (setq my-focus-pending nil) (setq my-state \"copy\"))))) (switch-to-buffer \"play\") t)",
+     "comment": "fixture: after-focus-change-function arms a 'focus pending' flag; the mouse-1 command keeps semi-char on a focus click but enters copy mode otherwise"},
+
+    {"send_events": ["focus-in", "down-mouse-1@1,0", "mouse-1@1,0"], "buffer": "play",
+     "comment": "focus-in THEN the click, one ordered stream: the focus hook runs before the click command"},
+    {"wait": "idle"},
+    {"assert": {"eval": "(equal my-state \"semi-char\")"},
+     "comment": "treated as a focus click -- no mode change"},
+
+    {"send_events": ["down-mouse-1@1,0", "mouse-1@1,0"], "buffer": "play",
+     "comment": "the byte-identical click with NO preceding focus-in"},
+    {"wait": "idle"},
+    {"assert": {"eval": "(equal my-state \"copy\")"},
+     "comment": "switched to copy mode -- the only difference was the ordered focus event"}
+  ]
+}

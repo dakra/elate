@@ -177,6 +177,48 @@ uvx elate -s sh faces-at --pos 12 --run 4 --buffer '*shell*'
 uvx elate stop sh
 ```
 
+## Reproduce a focus-vs-click ordering bug
+
+Window systems deliver a focus change and a click as separate, ordered
+events: `focus-in` → `after-focus-change-function` hooks → the click's
+command. That ordering distinguishes a click that *refocuses* a frame from
+a plain click (click-to-refocus vs click-to-select, paste-on-focus, …) and
+is invisible to batch ERT. `send-events` injects them into one input stream
+so they drain through the real command loop, in order:
+
+```sh
+uvx elate start --name foc --ui gui --load ./my-term.el
+# … open the package's buffer in its click-to-select ("semi-char") mode …
+
+# A refocusing click: focus-in, THEN the click (one command-loop turn).
+# @LINE,COL is 1-based line, 0-based col.
+uvx elate -s foc send-events 'focus-in' 'down-mouse-1@10,5' 'mouse-1@10,5'
+uvx elate -s foc wait idle
+uvx elate -s foc state            # treated as a focus click? point at the live cursor?
+
+# The byte-identical click WITHOUT a preceding focus-in.
+uvx elate -s foc send-events 'down-mouse-1@10,5' 'mouse-1@10,5'
+uvx elate -s foc wait idle
+uvx elate -s foc state            # now switched to copy mode
+
+uvx elate stop foc
+```
+
+A focus event only fires at the head of a command-loop turn, so any focus
+tokens are auto-split into separate, drained batches — the reverse order
+(mouse-down dispatched *before* the focus-in, a distinct code path) is just
+`send-events 'down-mouse-1@10,5' 'mouse-1@10,5' 'focus-in'`. Standalone,
+`focus in` / `focus out` flip focus on their own. `send-events` is
+lower-level than `mouse`: each mouse token is exactly one event (no implicit
+down+click pair), and `key:KBD` tokens (e.g. `key:RET`) interleave keys.
+
+Injected focus runs `handle-focus-in`/`-out` through `special-event-map`,
+firing `after-focus-change-function` and setting the `last-focus-update`
+frame parameter. It cannot move the C-owned `(frame-focus-state)`; add
+`--set-focus-state` if the code under test reads it (a non-native shim that
+derives the state from `last-focus-update`). Works in TTY and GUI sessions;
+`examples/focus-ordering.json` is a self-contained, runnable version.
+
 `type` and `keys` run through Emacs's command loop (so they obey the
 buffer's keymaps); `send-process` bypasses it and writes raw bytes to the
 buffer's process — the right tool for shells/REPLs that read from a PTY.

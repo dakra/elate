@@ -1329,6 +1329,149 @@ def mouse_event(
     return sess.semantic().rpc("mouse", b64, timeout=timeout)
 
 
+# --- Focus and ordered-event injection ------------------------------------
+#
+# send_events delivers an ordered stream of focus / mouse / key events
+# through the same unread-command-events queue the mouse and type channels
+# use, so they drain through the real command loop (and, for focus,
+# special-event-map) in order. Two empirical constraints shape it:
+#   * A focus event only fires when it is at the HEAD of the queue for a
+#     command-loop turn; queued behind a non-special event it is silently
+#     dropped. So a mixed sequence is split into per-turn batches (each
+#     focus event leading its batch) and we drain between batches.
+#   * focus has no synchronous (execute-kbd-macro) delivery -- it rings the
+#     bell -- so delivery is always via unread-command-events + a drain.
+
+_MOUSE_EVENT_RE = re.compile(
+    r"^(?P<event>down-mouse|up-mouse|double-mouse|mouse)-(?P<button>[1-3])$")
+_WHEEL_RE = re.compile(r"^(?:wheel-up|wheel-down)$")
+_LOC_RE = re.compile(r"^(?:@(?P<line>\d+),(?P<col>\d+)|#(?P<pos>\d+))$")
+
+
+def _parse_event_loc(text: str) -> dict[str, int | None]:
+    m = _LOC_RE.match(text)
+    if not m:
+        raise ElateError(
+            f"bad event location {text!r}; use @LINE,COL (1-based line, "
+            "0-based col) or #POS (1-based buffer position)")
+    if m.group("pos") is not None:
+        return {"pos": int(m.group("pos")), "line": None, "col": None}
+    return {"pos": None, "line": int(m.group("line")),
+            "col": int(m.group("col"))}
+
+
+def parse_event_token(tok: str) -> dict[str, Any]:
+    """One send-events token -> a spec dict for elate--event-from-spec.
+
+    Tokens: focus-in / focus-out; down-mouse-N / mouse-N / up-mouse-N /
+    double-mouse-N / wheel-up / wheel-down (N=1..3), each with an optional
+    @LINE,COL or #POS location (default: the window's point); key:KBD
+    (e.g. key:RET, key:C-x) for an Emacs key sequence.
+    """
+    if tok.startswith("key:"):
+        keys = tok[len("key:"):]
+        if not keys:
+            raise ElateError("empty key token; use key:KBD, e.g. key:RET")
+        return {"type": "key", "keys": keys}
+    if tok in ("focus-in", "focus-out"):
+        return {"type": "focus", "dir": tok[len("focus-"):]}
+    base, loc = tok, None
+    cut = min((i for i in (tok.find("@"), tok.find("#")) if i >= 0), default=-1)
+    if cut >= 0:
+        base, loc = tok[:cut], _parse_event_loc(tok[cut:])
+    mm = _MOUSE_EVENT_RE.match(base)
+    if mm:
+        return {"type": "mouse", "event": mm.group("event"),
+                "button": int(mm.group("button")), "loc": loc}
+    if _WHEEL_RE.match(base):
+        return {"type": "mouse", "event": base, "button": 1, "loc": loc}
+    raise ElateError(
+        f"unknown event token {tok!r}; expected focus-in/focus-out, "
+        "down-mouse-N/mouse-N/up-mouse-N/double-mouse-N/wheel-up/wheel-down "
+        "(N=1..3, optional @LINE,COL or #POS), or key:KBD")
+
+
+def _split_event_batches(specs: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Split SPECS into per-command-loop-turn batches.
+
+    A focus event only fires at the head of unread-command-events, so each
+    focus event starts a new batch; leading non-focus events form a batch
+    of their own. Events after a focus event ride the same turn (they run
+    as ordinary commands once the focus event has been dispatched).
+    """
+    batches: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    for s in specs:
+        if s["type"] == "focus" and cur:
+            batches.append(cur)
+            cur = []
+        cur.append(s)
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def send_events(
+    sess: Session,
+    tokens: Sequence[str],
+    *,
+    buffer: str | None = None,
+    frame: str | None = None,
+    set_focus_state: bool = False,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Inject an ordered stream of focus/mouse/key events into the session.
+
+    TOKENS is a sequence of send-events tokens (see parse_event_token). The
+    events drain through the command loop in order; focus events run
+    handle-focus-in/out via special-event-map (firing
+    after-focus-change-function and setting the last-focus-update frame
+    parameter). With SET_FOCUS_STATE, a non-native shim also makes
+    (frame-focus-state) report the injected state.
+
+    Works for TTY and GUI sessions. The sequence is split into per-turn
+    batches around focus events and drained between them, so any ordering
+    is faithful -- including a mouse-down dispatched before a focus-in.
+    """
+    specs = [parse_event_token(t) for t in tokens]
+    if not specs:
+        raise ElateError("send-events needs at least one event token")
+    batches = _split_event_batches(specs)
+    queued = 0
+    data: dict[str, Any] = {}
+    for i, batch in enumerate(batches):
+        if i:  # the previous batch must fire before the next focus can lead
+            _wait_type_drained(sess, timeout)
+        payload = {"events": batch, "buffer": buffer, "frame": frame,
+                   "set_focus_state": set_focus_state}
+        b64 = base64.b64encode(
+            json.dumps(payload).encode("utf-8")).decode("ascii")
+        data = sess.semantic().rpc("send-events", b64, timeout=timeout)
+        queued += int(data.get("queued") or 0)
+    # Settle so the whole sequence has fired and the queue is empty for any
+    # following call (a focus event leading that call must land at the head).
+    _wait_type_drained(sess, timeout)
+    return {**data, "queued": queued, "specs": len(specs),
+            "batches": len(batches)}
+
+
+def focus_event(
+    sess: Session,
+    direction: str,
+    *,
+    frame: str | None = None,
+    set_focus_state: bool = False,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Inject a single focus-in / focus-out event (a send_events of one token)."""
+    if direction not in ("in", "out"):
+        raise ElateError(
+            f"focus direction must be 'in' or 'out', got {direction!r}")
+    data = send_events(sess, [f"focus-{direction}"], frame=frame,
+                       set_focus_state=set_focus_state, timeout=timeout)
+    return {**data, "focus": direction}
+
+
 def resize_session(sess: Session, cols: int, rows: int) -> dict[str, Any]:
     """Resize the live session to COLS x ROWS characters."""
     if cols < 10 or rows < 4:

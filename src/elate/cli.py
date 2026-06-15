@@ -210,6 +210,42 @@ def build_parser() -> argparse.ArgumentParser:
                          "command itself reads input)")
     sp.add_argument("--timeout", type=float, default=15.0, metavar="SECS")
 
+    sp = sub.add_parser("focus", help="inject a window-system focus event "
+                                      "(focus-in/out; semantic, tty and gui)")
+    sp.add_argument("direction", choices=["in", "out"],
+                    help="'in' (focus-in) or 'out' (focus-out)")
+    sp.add_argument("--frame", metavar="NAME",
+                    help="target the frame with this name (default: selected)")
+    sp.add_argument("--set-focus-state", action="store_true",
+                    help="also make (frame-focus-state) report the injected "
+                         "state -- a non-native shim, since injected events "
+                         "cannot move the real C-owned focus state (they do "
+                         "fire after-focus-change-function regardless)")
+    sp.add_argument("--timeout", type=float, default=15.0, metavar="SECS")
+
+    sp = sub.add_parser("send-events",
+                        help="inject an ordered stream of focus/mouse/key "
+                             "events (drains through the command loop in order)")
+    sp.add_argument("events", nargs="+", metavar="EVENT",
+                    help="event tokens in order: focus-in, focus-out, "
+                         "down-mouse-N, mouse-N, up-mouse-N, double-mouse-N, "
+                         "wheel-up, wheel-down (N=1..3, each with optional "
+                         "@LINE,COL [1-based line, 0-based col] or #POS), or "
+                         "key:KBD (e.g. key:RET). A focus event only fires at "
+                         "the head of a command-loop turn, so any focus events "
+                         "are delivered in separate drained batches "
+                         "automatically -- making any ordering faithful, "
+                         "including a mouse-down before a focus-in")
+    sp.add_argument("--buffer", metavar="NAME",
+                    help="target the window showing this buffer for mouse "
+                         "events (default: selected window)")
+    sp.add_argument("--frame", metavar="NAME",
+                    help="target frame for focus events (default: selected)")
+    sp.add_argument("--set-focus-state", action="store_true",
+                    help="also make (frame-focus-state) report injected focus "
+                         "(non-native shim; see 'elate focus')")
+    sp.add_argument("--timeout", type=float, default=15.0, metavar="SECS")
+
     sp = sub.add_parser("resize", help="resize a live session (tmux window "
                                        "or GUI frame)")
     sp.add_argument("size", type=_parse_size, metavar="COLSxROWS")
@@ -752,6 +788,33 @@ def cmd_mouse(args: argparse.Namespace) -> Result:
     where = data.get("area") or f"pos {data.get('pos')}"
     human = (f"{args.action} mouse-{args.button} at {where} "
              f"in {data.get('buffer')} ({data.get('delivered')})")
+    return data, human, 0
+
+
+def cmd_focus(args: argparse.Namespace) -> Result:
+    sess = _require_session(args)
+    sess.log("focus", direction=args.direction, frame=args.frame,
+             set_focus_state=args.set_focus_state)
+    data = S.focus_event(sess, args.direction, frame=args.frame,
+                         set_focus_state=args.set_focus_state,
+                         timeout=args.timeout)
+    human = (f"focus-{args.direction} on frame "
+             f"{data.get('frame') or '(selected)'} "
+             f"({data.get('queued')} event queued)")
+    return data, human, 0
+
+
+def cmd_send_events(args: argparse.Namespace) -> Result:
+    sess = _require_session(args)
+    sess.log("send-events", events=args.events, buffer=args.buffer,
+             frame=args.frame, set_focus_state=args.set_focus_state)
+    data = S.send_events(sess, args.events, buffer=args.buffer,
+                         frame=args.frame,
+                         set_focus_state=args.set_focus_state,
+                         timeout=args.timeout)
+    human = (f"queued {data.get('queued')} event(s) from "
+             f"{data.get('specs')} token(s) in {data.get('batches')} "
+             f"batch(es) -> {data.get('buffer')}")
     return data, human, 0
 
 
@@ -1634,6 +1697,8 @@ _COMMANDS = {
     "keys": cmd_keys,
     "type": cmd_type,
     "mouse": cmd_mouse,
+    "focus": cmd_focus,
+    "send-events": cmd_send_events,
     "resize": cmd_resize,
     "eval": cmd_eval,
     "buffer": cmd_buffer,

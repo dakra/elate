@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.7.0
+
+Inject window-system focus events, ordered against mouse/key input -- so
+focus/click ordering behaviour (click-to-refocus vs click-to-select,
+paste-on-focus, input-mode switches) is testable through Emacs's real
+command loop, not just by calling handlers in isolation.
+
+- **`focus in` / `focus out`** (CLI + `elate_focus`): inject a `focus-in` /
+  `focus-out` event. It runs `handle-focus-in` / `handle-focus-out` through
+  `special-event-map` exactly as a real window-system focus change would --
+  firing `after-focus-change-function` and setting the `last-focus-update`
+  frame parameter. Works in TTY and GUI sessions. `--frame NAME` targets a
+  named frame.
+- **`send-events`** (CLI + `elate_send_events`): inject an ordered stream of
+  focus / mouse / key tokens that drains through the command loop in order,
+  so a focus event's hooks run before a following click's command. Tokens:
+  `focus-in`/`focus-out`, `down-mouse-N`/`mouse-N`/`up-mouse-N`/
+  `double-mouse-N`/`wheel-up`/`wheel-down` (N=1..3, optional `@LINE,COL` or
+  `#POS`), and `key:KBD`. A focus event only fires at the head of a
+  command-loop turn, so focus tokens are auto-split into separate, drained
+  batches -- making any ordering faithful, including a mouse-down dispatched
+  *before* a focus-in. Lower-level than `mouse`: each mouse token is exactly
+  one event (no implicit down+click pair).
+- **`--set-focus-state`** (on both): also make `(frame-focus-state)` report
+  the injected focus. A non-native shim (advice on `frame-focus-state`
+  deriving from `last-focus-update`), since an injected event cannot move the
+  C-owned focus state. Enable only when the code under test reads
+  `(frame-focus-state)`.
+- **Scenario scripts** gain `focus` and `send_events` verbs; see
+  `examples/focus-ordering.json` for a self-contained, runnable demo of the
+  focus-vs-click ordering case.
+
 ## 0.6.1
 
 - **Packaging fix:** the sdist now ships a default-deny `only-include`

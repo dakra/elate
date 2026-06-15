@@ -852,6 +852,82 @@ def test_trace_errors_on_macro_and_undefined(sess: S.Session) -> None:
     assert sess.semantic().eval_form("(+ 2 2)")["value"] == "4"
 
 
+# -- focus and ordered-event injection ---------------------------------------
+
+EVT_SETUP = (
+    '(progn '
+    '(setq el-seq 0 el-focus-seq nil el-down-seq nil el-click-seq nil) '
+    '(setq after-focus-change-function '
+    '  (lambda () (setq el-focus-seq (setq el-seq (1+ el-seq))))) '
+    '(with-current-buffer (get-buffer-create "evt") '
+    '  (erase-buffer) (insert "hello world") (goto-char (point-min)) '
+    '  (use-local-map (make-sparse-keymap)) '
+    '  (local-set-key [down-mouse-1] '
+    '    (lambda () (interactive) (setq el-down-seq (setq el-seq (1+ el-seq))))) '
+    '  (local-set-key [mouse-1] '
+    '    (lambda (e) (interactive "e") '
+    '      (setq el-click-seq (setq el-seq (1+ el-seq)))))) '
+    '(switch-to-buffer "evt") t)'
+)
+
+
+def _seq(sess: S.Session, var: str) -> int | None:
+    v = sess.semantic().eval_form(var)["value"]
+    return None if v == "nil" else int(v)
+
+
+def test_focus_event_fires_hook(sess: S.Session) -> None:
+    sess.semantic().eval_form(EVT_SETUP)
+    data = S.focus_event(sess, "in")
+    assert data["focus"] == "in" and data["queued"] == 1
+    S.wait_idle(sess, timeout=5.0)
+    # The (focus-in FRAME) event ran handle-focus-in via special-event-map:
+    # after-focus-change-function fired and last-focus-update flipped.
+    assert _seq(sess, "el-focus-seq") == 1
+    assert sess.semantic().eval_form(
+        "(frame-parameter nil 'last-focus-update)")["value"] == "t"
+
+
+def test_send_events_focus_then_click_ordering(sess: S.Session) -> None:
+    sess.semantic().eval_form(EVT_SETUP)
+    data = S.send_events(sess, ["focus-in", "down-mouse-1@1,0", "mouse-1@1,0"],
+                         buffer="evt")
+    assert data["batches"] == 1 and data["queued"] == 3
+    S.wait_idle(sess, timeout=5.0)
+    f, d, c = (_seq(sess, v)
+               for v in ("el-focus-seq", "el-down-seq", "el-click-seq"))
+    # Focus hook ran before the click command.
+    assert f and d and c and f < d < c
+
+
+def test_send_events_reverse_focus_last(sess: S.Session) -> None:
+    sess.semantic().eval_form(EVT_SETUP)
+    data = S.send_events(sess, ["down-mouse-1@1,0", "mouse-1@1,0", "focus-in"],
+                         buffer="evt")
+    # A trailing focus event only fires at the head of a turn, so it is
+    # split into a second, drained batch -- the click runs first.
+    assert data["batches"] == 2
+    S.wait_idle(sess, timeout=5.0)
+    f, d, c = (_seq(sess, v)
+               for v in ("el-focus-seq", "el-down-seq", "el-click-seq"))
+    assert f and d and c and d < c < f
+
+
+def test_focus_set_focus_state_shim(sess: S.Session) -> None:
+    # The shim derives (frame-focus-state) from last-focus-update.
+    S.focus_event(sess, "out", set_focus_state=True)
+    S.wait_idle(sess, timeout=5.0)
+    assert sess.semantic().eval_form("(frame-focus-state)")["value"] == "nil"
+    S.focus_event(sess, "in", set_focus_state=True)
+    S.wait_idle(sess, timeout=5.0)
+    assert sess.semantic().eval_form("(frame-focus-state)")["value"] == "t"
+
+
+def test_send_events_bad_token_raises(sess: S.Session) -> None:
+    with pytest.raises(ElateError, match="unknown event token"):
+        S.send_events(sess, ["definitely-bogus"])
+
+
 def test_stop_session(sess: S.Session) -> None:
     result = S.stop_session(NAME)
     assert result["stopped"] is True

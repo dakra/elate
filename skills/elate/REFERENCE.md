@@ -27,6 +27,8 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 - [`elate type`](#elate-type)
 - [`elate send-process`](#elate-send-process)
 - [`elate mouse`](#elate-mouse)
+- [`elate focus`](#elate-focus)
+- [`elate send-events`](#elate-send-events)
 - [`elate resize`](#elate-resize)
 - [`elate attach`](#elate-attach)
 - [`elate eval`](#elate-eval)
@@ -145,6 +147,25 @@ synthesize a mouse interaction (semantic; works for tty and gui)
 - `--direction {up,down}` (default: down) -- wheel: scroll direction
 - `--count N` (default: 1) -- wheel: number of notches
 - `--events` -- queue on unread-command-events instead of the synchronous default (use when the triggered command itself reads input)
+- `--timeout SECS` (default: 15)
+
+## elate focus
+
+inject a window-system focus event (focus-in/out; semantic, tty and gui)
+
+- `{in,out}` -- 'in' (focus-in) or 'out' (focus-out)
+- `--frame NAME` -- target the frame with this name (default: selected)
+- `--set-focus-state` -- also make (frame-focus-state) report the injected state -- a non-native shim, since injected events cannot move the real C-owned focus state (they do fire after-focus-change-function regardless)
+- `--timeout SECS` (default: 15)
+
+## elate send-events
+
+inject an ordered stream of focus/mouse/key events (drains through the command loop in order)
+
+- `EVENT...` (repeatable) -- event tokens in order: focus-in, focus-out, down-mouse-N, mouse-N, up-mouse-N, double-mouse-N, wheel-up, wheel-down (N=1..3, each with optional @LINE,COL [1-based line, 0-based col] or #POS), or key:KBD (e.g. key:RET). A focus event only fires at the head of a command-loop turn, so any focus events are delivered in separate drained batches automatically -- making any ordering faithful, including a mouse-down before a focus-in
+- `--buffer NAME` -- target the window showing this buffer for mouse events (default: selected window)
+- `--frame NAME` -- target frame for focus events (default: selected)
+- `--set-focus-state` -- also make (frame-focus-state) report injected focus (non-native shim; see 'elate focus')
 - `--timeout SECS` (default: 15)
 
 ## elate resize

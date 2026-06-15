@@ -960,6 +960,111 @@ when the triggered command itself reads input)."
           :events (length events)
           :delivered delivery)))
 
+;;;; Focus and ordered-event injection
+;;
+;; Focus events are window-system events: a real focus change is delivered
+;; as the list event (focus-in FRAME) / (focus-out FRAME), bound in
+;; `special-event-map' to `handle-focus-in' / `handle-focus-out' (which set
+;; the `last-focus-update' frame parameter and run
+;; `after-focus-change-function').  We reproduce that by pushing the same
+;; list event onto `unread-command-events', so it drains through the command
+;; loop and `special-event-map' exactly as the real thing does.
+;;
+;; Two hard constraints, established empirically, shape this:
+;;   * A bare symbol (focus-in) is NOT dispatched; the second element must
+;;     be a live frame or `handle-focus-in' skips its body.
+;;   * Only the special event at the HEAD of `unread-command-events' fires
+;;     per command-loop turn; a focus event queued behind a non-special
+;;     event is silently dropped.  The Python side therefore splits a mixed
+;;     sequence into per-turn batches (each focus event leading its batch)
+;;     and drains between them -- one `send-events' RPC delivers one batch.
+;;   * `execute-kbd-macro' rings the bell on a focus event (it routes through
+;;     normal key lookup, where focus-in is unbound), so there is no
+;;     synchronous "macro" delivery for focus: events delivery only.
+
+(defun elate--resolve-frame (name)
+  "The frame named NAME (its `name' frame parameter), or the selected frame.
+NAME nil selects the current frame; a non-matching NAME errors."
+  (if (and name (stringp name))
+      (or (seq-find (lambda (f) (equal (frame-parameter f 'name) name))
+                    (frame-list))
+          (error "elate: no frame named %S" name))
+    (selected-frame)))
+
+(defun elate--focus-state-override (&optional frame)
+  "Override for `frame-focus-state' deriving focus from `last-focus-update'.
+A NON-NATIVE shim: an injected focus event cannot move the C-owned focus
+state `frame-focus-state' normally reports, so once this advice is
+installed the state is read from the `last-focus-update' frame parameter
+that `handle-focus-in' / `handle-focus-out' set (t after focus-in, nil
+after focus-out)."
+  (and (frame-parameter (or frame (selected-frame)) 'last-focus-update) t))
+
+(defun elate--ensure-focus-state-shim ()
+  "Install the `frame-focus-state' shim once (idempotent)."
+  (unless (advice-member-p #'elate--focus-state-override 'frame-focus-state)
+    (advice-add 'frame-focus-state :override #'elate--focus-state-override)))
+
+(defun elate--event-from-spec (spec win frame)
+  "The Emacs event(s) for one decoded SPEC (an alist), as a list.
+WIN is the target window for mouse locations; FRAME the frame for focus
+events.  Mouse locations reuse `elate--mouse-posn' (a nil location means
+the window's point).  A key spec expands to several events; the others to
+exactly one, so the caller `append's the results into one ordered stream."
+  (pcase (alist-get 'type spec)
+    ("focus"
+     (list (list (intern (concat "focus-" (alist-get 'dir spec))) frame)))
+    ("key"
+     (listify-key-sequence (kbd (alist-get 'keys spec))))
+    ("mouse"
+     (let* ((event (alist-get 'event spec))
+            (button (or (alist-get 'button spec) 1))
+            (posn (elate--mouse-posn win (alist-get 'loc spec))))
+       (pcase event
+         ((or "wheel-up" "wheel-down")
+          (list (list (intern event) posn)))
+         ("double-mouse"
+          (list (list (intern (format "double-mouse-%d" button)) posn 2)))
+         (_ (list (list (intern (format "%s-%d" event button)) posn 1))))))
+    (other (error "elate: unknown event spec type %S" other))))
+
+(defun elate--rpc-send-events (payload-b64)
+  "Queue one ordered batch of events described by PAYLOAD-B64 (base64 JSON).
+Payload: {events:[spec...], buffer, frame, set_focus_state}.  Each spec is
+{type:\"focus\"|\"mouse\"|\"key\", ...} (see `elate--event-from-spec').  The
+built events are appended to `unread-command-events' in order, draining
+through the command loop on the next turn; observe the effect with `wait'
+/ `state'.  Focus injection sets the `last-focus-update' frame parameter
+and runs `after-focus-change-function'; with set_focus_state, it also
+installs the (non-native) `frame-focus-state' shim."
+  (let* ((payload (json-parse-string (elate--decode-string payload-b64)
+                                     :object-type 'alist
+                                     :null-object nil :false-object nil))
+         (specs (append (alist-get 'events payload) nil))
+         (bufname (alist-get 'buffer payload))
+         (frame (elate--resolve-frame (alist-get 'frame payload)))
+         (win (if bufname
+                  (or (get-buffer-window bufname)
+                      (error (concat "elate: buffer %S is not displayed in "
+                                     "any window; show it first, e.g. eval "
+                                     "(pop-to-buffer %S)")
+                             bufname bufname))
+                (selected-window)))
+         (events (apply #'append
+                        (mapcar (lambda (s) (elate--event-from-spec s win frame))
+                                specs))))
+    (when (alist-get 'set_focus_state payload)
+      (elate--ensure-focus-state-shim))
+    (setq unread-command-events
+          (nconc unread-command-events (copy-sequence events)))
+    (list :queued (length events)
+          :specs (length specs)
+          :buffer (buffer-name (window-buffer win))
+          :frame (elate--jnull (frame-parameter frame 'name))
+          :focus-state-shim (elate--jbool
+                             (alist-get 'set_focus_state payload))
+          :delivered "events")))
+
 (defun elate--rpc-echo ()
   "Echo area and active minibuffer only: the cheap targeted read.
 A fraction of the cost of `state', which marshals every window's
