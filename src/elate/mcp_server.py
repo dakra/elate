@@ -19,6 +19,7 @@ import re
 import sys
 import time
 import traceback
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import anyio.to_thread
@@ -566,20 +567,26 @@ def elate_eval(
     timeout: Annotated[float, Field(gt=0, le=600, description=(
         "Hard timeout in seconds (0 < timeout <= 600). A blocking form is "
         "interrupted (or, if truly wedged, reported as busy)."))] = 15.0,
+    backtrace: Annotated[bool, Field(description=(
+        "On error, also return structured 'frames' (each: function name + "
+        "printed args) alongside the rendered 'backtrace' string. Off by "
+        "default to keep replies small."))] = False,
 ) -> str:
     """Evaluate elisp in the session; the precision instrument.
 
     Returns the printed value, the *Messages* delta it produced, and on
-    failure "error" + a full "backtrace" plus a state snapshot. Values
-    longer than 64 KiB come back with truncated=true and the full
-    value-length -- narrow your form instead of re-fetching. The form runs
-    in the live interactive Emacs (not batch), so UI side effects are real.
+    failure "error" + a full "backtrace" plus a state snapshot (with
+    backtrace=true, also structured "frames"). Values longer than 64 KiB
+    come back with truncated=true and the full value-length -- narrow your
+    form instead of re-fetching. The form runs in the live interactive
+    Emacs (not batch), so UI side effects are real.
     """
     sess = None
     try:
         sess = _load(session)
         sess.log("eval", form=form, timeout=timeout, via="mcp")
-        data = sess.semantic().eval_form(form, timeout=timeout)
+        data = sess.semantic().eval_form(form, timeout=timeout,
+                                         backtrace=backtrace)
         sess.log("eval-result", **data)
         if data.get("error"):
             payload: dict[str, Any] = {"ok": False, **data}
@@ -832,6 +839,49 @@ def elate_bench(
         return _fail(exc, sess)
 
 
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_trace(
+    session: Annotated[str, Field(description="Session name.")],
+    action: Annotated[Literal["on", "off", "read"], Field(description=(
+        "'on': start tracing the named functions (functions required). "
+        "'off': untrace the named functions, or ALL of them when none "
+        "named. 'read': return the accumulated call/arg/return log and "
+        "(unless keep=true) clear it, so the next read sees only new "
+        "calls. Typical flow: trace on -> drive the session "
+        "(elate_keys/elate_eval) -> trace read."))],
+    functions: Annotated[list[str] | None, Field(description=(
+        "Function names. Required for action='on'; for 'off' the functions "
+        "to untrace (omit to untrace everything); ignored for 'read'."))]
+        = None,
+    keep: Annotated[bool, Field(description=(
+        "For action='read': keep the log instead of clearing it."))] = False,
+    timeout: Annotated[float, Field(gt=0, le=120, description=(
+        "Seconds before the call is declared blocked (0 < timeout <= "
+        "120)."))] = 15.0,
+) -> str:
+    """Trace elisp functions: log each call's args and return value.
+
+    'on' wraps trace-function around the named functions; drive the
+    session, then 'read' returns the *trace-output* log (and clears it
+    unless keep=true, so each read sees only new calls). 'off' untraces
+    the named functions or all of them. Surfaces internals you cannot see
+    on screen -- why an advice fires twice, what args a hook receives.
+    Tracing a macro or an undefined function is an error; already-traced
+    functions are reported under 'already', not re-armed.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        sess.log("trace", action=action, functions=functions, keep=keep,
+                 via="mcp")
+        data = S.trace_functions(sess, action, functions=functions,
+                                 keep=keep, timeout=timeout)
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
 # ---------------------------------------------------------------------------
 # Scenario scripts & recording (Phase 5)
 
@@ -862,6 +912,15 @@ def elate_run_script(
         "Override the script's emacs binary: an absolute path or a bare "
         "PATH name. Call once per installed Emacs to version-matrix a "
         "script (the CLI's 'matrix' verb wraps exactly this)."))] = None,
+    update_snapshots: Annotated[bool, Field(description=(
+        "For 'snapshot' assert steps: write/overwrite the golden artifacts "
+        "instead of comparing (the run still executes every step). This "
+        "writes files under the scenario's __snapshots__ directory in the "
+        "repo -- review the diff and commit deliberately."))] = False,
+    snapshot_dir: Annotated[str | None, Field(description=(
+        "Base directory for golden snapshots; resolved against the "
+        "scenario's directory. Default: <scenario-dir>/__snapshots__."))]
+        = None,
 ) -> str:
     """Execute a whole scenario script in one call: fresh session, steps,
     assertions, teardown.
@@ -885,10 +944,14 @@ def elate_run_script(
         from . import script as SC
 
         sc, base = SC.load_script(script)
+        sdir = (base / snapshot_dir) if snapshot_dir else None
         result = SC.run_script(sc, base_dir=base, emacs=emacs,
                                keep_on_failure=keep_on_failure,
                                deadline=time.monotonic() + timeout,
-                               origin="mcp")
+                               origin="mcp",
+                               update_snapshots=update_snapshots,
+                               snapshot_dir=sdir,
+                               snapshot_stem=Path(script).stem)
         return _ok(result)
     except Exception as exc:
         return _fail(exc)
@@ -946,6 +1009,15 @@ def elate_record(
 @_threaded
 def elate_state(
     session: Annotated[str, Field(description="Session name.")],
+    since: Annotated[str | None, Field(description=(
+        "Opaque token from a prior elate_state result. When given, return "
+        "only what changed since then -- buffers added/removed/modified, "
+        "point and selected-buffer movement, new *Messages* lines, and "
+        "minibuffer open/close/prompt changes -- as a compact 'delta' "
+        "(much cheaper than a full snapshot; 'changed':false means your "
+        "last action did nothing observable). Every result carries a fresh "
+        "'token' for the next call; an unknown/stale token degrades to a "
+        "full snapshot with since_status='unknown'."))] = None,
 ) -> str:
     """Full scene snapshot in one round-trip -- the main observation tool.
 
@@ -966,8 +1038,9 @@ def elate_state(
     sess = None
     try:
         sess = _load(session)
-        data = sess.semantic().rpc("state")
-        sess.log("state", buffer=data.get("buffer"), via="mcp")
+        data = sess.semantic().rpc("state", since)
+        sess.log("state", buffer=data.get("buffer"), via="mcp",
+                 since=bool(since), mode=data.get("mode"))
         return _ok(data)
     except Exception as exc:
         return _fail(exc, sess)

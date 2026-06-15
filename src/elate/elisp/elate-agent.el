@@ -22,6 +22,7 @@
 (require 'help-fns)
 (require 'ert)
 (require 'profiler)
+(require 'trace)
 
 (defvar internal-when-entered-debugger)  ; eval.c (Emacs 28+)
 
@@ -321,6 +322,34 @@ satisfying CUT-PRED are dropped as elate machinery."
         (backtrace-to-string frames))
     (error nil)))
 
+(defconst elate--max-frame-args 16 "Cap on printed args per backtrace frame.")
+(defconst elate--max-frames 100 "Cap on captured structured backtrace frames.")
+
+(defun elate--backtrace-frames (&optional base cut-pred)
+  "Structured backtrace: a vector of (:fun :args) plists, or :null.
+Same BASE / CUT-PRED discipline as `elate--backtrace-string'.  Each
+frame's :fun is the printed function and :args a vector of printed
+argument strings (capped); a frame whose args are not a proper list
+reports :args :null."
+  (condition-case nil
+      (let* ((frames (backtrace-get-frames (or base 'elate--backtrace-frames)))
+             (frames (if base (cdr frames) frames))
+             (cut (and cut-pred (seq-position frames nil
+                                              (lambda (fr _) (funcall cut-pred fr)))))
+             (frames (seq-take (if cut (seq-take frames cut) frames)
+                               elate--max-frames)))
+        (vconcat
+         (mapcar
+          (lambda (fr)
+            (let ((args (backtrace-frame-args fr)))
+              (list :fun (elate--clip-print (backtrace-frame-fun fr))
+                    :args (if (proper-list-p args)
+                              (vconcat (mapcar #'elate--clip-print
+                                               (seq-take args elate--max-frame-args)))
+                            :null))))
+          frames)))
+    (error :null)))
+
 ;;;; RPC functions
 
 (defun elate--rpc-ping ()
@@ -395,7 +424,176 @@ side by side) and a :children vector."
         (forward-line (- n))
         (buffer-substring-no-properties (point) (point-max))))))
 
-(defun elate--rpc-state ()
+(defconst elate--max-token-bufs 500
+  "Cap on buffers recorded in a `state --since' token.
+Bounds token size; sessions with more buffers lose per-buffer change
+detection past the cap (rare -- most sessions have far fewer).")
+
+(defun elate--messages-since (pos)
+  "New *Messages* text since POS (a char position) as (TEXT . END).
+END is the current widened `point-max'; a POS outside the buffer (e.g.
+after `message-log-max' truncation) resets to the beginning."
+  (with-current-buffer (messages-buffer)
+    (save-restriction
+      (widen)
+      (let* ((max (point-max))
+             (start (if (and (numberp pos) (>= pos (point-min)) (<= pos max))
+                        pos (point-min))))
+        (cons (buffer-substring-no-properties start max) max)))))
+
+(defun elate--state-snapshot ()
+  "Cheap monotonic change signals -- the contents of a state token.
+A plist of per-buffer `buffer-chars-modified-tick', point, selected
+buffer, *Messages* end, and minibuffer depth/prompt; cheap to recompute
+and to diff against a decoded token."
+  (let ((bufs (make-hash-table :test 'equal :size 128))
+        (cur (elate--current-buffer))
+        (n 0))
+    (catch 'cap
+      (dolist (b (buffer-list))
+        (let ((name (buffer-name b)))
+          ;; Skip internal " *...*" buffers (mutated by Emacs machinery
+          ;; such as code-conversion on every RPC -> spurious "modified")
+          ;; and *Messages* (tracked via the dedicated messages tail).
+          (unless (or (= (length name) 0)
+                      (eq (aref name 0) ?\s)
+                      (equal name "*Messages*"))
+            (when (>= n elate--max-token-bufs) (throw 'cap nil))
+            (puthash name (buffer-chars-modified-tick b) bufs)
+            (setq n (1+ n))))))
+    (let ((mb (active-minibuffer-window)))
+      (list :v 1
+            :ep (emacs-pid)
+            :sel (buffer-name cur)
+            :point (with-current-buffer cur (point))
+            :ctick (buffer-chars-modified-tick cur)
+            :msg (with-current-buffer (messages-buffer)
+                   (save-restriction (widen) (point-max)))
+            :mb (if mb
+                    (list :depth (minibuffer-depth)
+                          :prompt (with-current-buffer (window-buffer mb)
+                                    (or (minibuffer-prompt) :null)))
+                  (list :depth 0 :prompt :null))
+            :bufs bufs))))
+
+(defun elate--mint-token (snap)
+  "Encode SNAP (an `elate--state-snapshot' plist) as an opaque token."
+  (base64-encode-string
+   (encode-coding-string (json-serialize snap) 'utf-8) t))
+
+(defun elate--decode-token (s)
+  "Decode token S to a hash-table, or nil when undecodable / wrong version.
+Hash-table (string keys) keeps buffer-name lookups straightforward --
+`json-parse-string' interns alist/plist keys as symbols, which would
+mangle buffer names like \"*scratch*\"."
+  (condition-case nil
+      (let ((obj (json-parse-string
+                  (decode-coding-string (base64-decode-string s) 'utf-8)
+                  :object-type 'hash-table :array-type 'list
+                  :null-object nil :false-object nil)))
+        (and (hash-table-p obj) (equal (gethash "v" obj) 1) obj))
+    (error nil)))
+
+(defun elate--state-delta (base snap)
+  "Delta plist of what changed between decoded BASE and fresh SNAP.
+BASE is the `elate--decode-token' hash-table; SNAP an `elate--state-snapshot'.
+Always carries :changed; the other keys appear only when non-empty so a
+caller pays for what moved.  Point/current-buffer changes are reported
+only while the selected buffer is unchanged (a switch shows as
+:selection instead)."
+  (let ((base-bufs (gethash "bufs" base))    ; hash name -> tick
+        (cur-bufs (plist-get snap :bufs))       ; hash name -> tick
+        (added '()) (removed '()) (modified '())
+        (out '()) (changed nil))
+    (maphash
+     (lambda (name tick)
+       (let ((bt (gethash name base-bufs 'absent)))
+         (cond ((eq bt 'absent) (push name added))
+               ((not (equal bt tick)) (push name modified)))))
+     cur-bufs)
+    (maphash
+     (lambda (name _tick)
+       (when (eq (gethash name cur-bufs 'absent) 'absent)
+         (push name removed)))
+     base-bufs)
+    (let ((b (append
+              (and added (list :added (vconcat (nreverse added))))
+              (and removed (list :removed (vconcat (nreverse removed))))
+              (and modified (list :modified (vconcat (nreverse modified)))))))
+      (when b (setq changed t out (nconc out (list :buffers b)))))
+    (let* ((cur-sel (plist-get snap :sel))
+           (base-sel (gethash "sel" base))
+           (same (equal cur-sel base-sel))
+           (cur-point (plist-get snap :point))
+           (base-point (gethash "point" base))
+           (cur-ctick (plist-get snap :ctick))
+           (base-ctick (gethash "ctick" base))
+           (cur '()))
+      (unless same
+        (setq changed t
+              out (nconc out (list :selection
+                                   (list :buffer (list :from base-sel
+                                                       :to cur-sel))))))
+      (when (and same (not (equal cur-point base-point)))
+        (setq cur (nconc cur
+                         (with-current-buffer (elate--current-buffer)
+                           (save-excursion
+                             (goto-char (min cur-point (point-max)))
+                             (list :point (list :from base-point :to cur-point
+                                                :line (line-number-at-pos (point) t)
+                                                :column (current-column))))))))
+      (when (and same (not (equal cur-ctick base-ctick)))
+        (setq cur (nconc cur (list :modified t))))
+      (when cur
+        (setq changed t
+              out (nconc out (list :current (cons :buffer (cons cur-sel cur)))))))
+    (let ((md (elate--messages-since (gethash "msg" base))))
+      (when (> (length (car md)) 0)
+        (setq changed t out (nconc out (list :messages (car md))))))
+    (let* ((cur-mb (plist-get snap :mb))
+           (base-mb (gethash "mb" base))
+           (cur-depth (or (plist-get cur-mb :depth) 0))
+           (base-depth (or (and base-mb (gethash "depth" base-mb)) 0))
+           (cur-prompt (let ((p (plist-get cur-mb :prompt)))
+                         (if (eq p :null) nil p)))
+           (base-prompt (and base-mb (gethash "prompt" base-mb)))
+           (mbchg (cond ((and (= base-depth 0) (> cur-depth 0)) "opened")
+                        ((and (> base-depth 0) (= cur-depth 0)) "closed")
+                        ((and (> cur-depth 0)
+                              (not (equal cur-prompt base-prompt)))
+                         "prompt-changed"))))
+      (when mbchg
+        (setq changed t
+              out (nconc out
+                         (list :minibuffer
+                               (append (list :change mbchg)
+                                       (and (> cur-depth 0)
+                                            (list :prompt (or cur-prompt :null)
+                                                  :depth cur-depth))))))))
+    (cons :changed (cons (elate--jbool changed) out))))
+
+(defun elate--rpc-state (&optional since)
+  "Full scene snapshot, or a delta when SINCE (a prior token) is given.
+Both forms carry a fresh :token and a :mode (\"full\" or \"delta\").  An
+undecodable token, or one minted by a since-restarted Emacs, degrades to
+a full snapshot tagged with :since-status (\"unknown\"/\"stale-session\")
+plus a fresh token, so the caller is never left without usable state."
+  (let* ((snap (elate--state-snapshot))
+         (token (elate--mint-token snap)))
+    (if (not since)
+        (append (elate--state-full) (list :mode "full" :token token))
+      (let ((base (elate--decode-token since)))
+        (cond
+         ((null base)
+          (append (elate--state-full)
+                  (list :mode "full" :since-status "unknown" :token token)))
+         ((not (equal (gethash "ep" base) (emacs-pid)))
+          (append (elate--state-full)
+                  (list :mode "full" :since-status "stale-session" :token token)))
+         (t (append (elate--state-delta base snap)
+                    (list :mode "delta" :token token))))))))
+
+(defun elate--state-full ()
   "One-call snapshot of the full interactive scene.
 Everything an outside driver needs for situational awareness: the
 current buffer and its modes/point/region/narrowing, the window layout
@@ -493,17 +691,8 @@ the range first so a never-displayed buffer is still fontified."
   "Tail of *Messages* since CURSOR (a char position); returns new cursor.
 A CURSOR beyond the current buffer end (e.g. after truncation) resets
 to the beginning."
-  (with-current-buffer (messages-buffer)
-    (save-restriction
-      (widen)
-      (let* ((max (point-max))
-             (start (if (and (numberp cursor)
-                             (>= cursor (point-min))
-                             (<= cursor max))
-                        cursor
-                      (point-min))))
-        (list :text (buffer-substring-no-properties start max)
-              :cursor max)))))
+  (let ((md (elate--messages-since cursor)))
+    (list :text (car md) :cursor (cdr md))))
 
 (defconst elate--max-value-len 65536
   "Cap on the printed length of an eval result.
@@ -512,32 +701,36 @@ multi-megabyte value would blow the controller's subprocess timeout and
 masquerade as a busy/blocked Emacs.  Truncated results carry
 :truncated t and the full :value-length.")
 
-(defun elate--rpc-eval (form-b64 &optional timeout)
+(defun elate--rpc-eval (form-b64 &optional timeout want-frames)
   "Evaluate the elisp source decoded from FORM-B64.
 Returns printed value (truncated at `elate--max-value-len'), *Messages*
 delta, and error + backtrace on failure.  TIMEOUT (seconds) arms a
 `with-timeout' guard; note that it can only fire if the evaluated code
-reaches a timer-servicing point."
+reaches a timer-servicing point.  With WANT-FRAMES, the error reply also
+carries structured :frames (function + printed args per backtrace frame)
+captured from the same live stack as the rendered :backtrace string."
   (let* ((src (elate--decode-string form-b64))
          (form (read (concat "(progn\n" src "\n)")))
          (msg-start (with-current-buffer (messages-buffer)
                       (save-restriction (widen) (point-max))))
          (backtrace nil)
+         (frames :null)
          (value nil)
          (errstr nil))
-    (letrec ((capture
+    (letrec ((cut-pred
+              (lambda (fr)
+                (let ((fun (backtrace-frame-fun fr)))
+                  (or (eq fun 'elate--rpc-eval)
+                      (and (eq fun 'eval)
+                           (equal (backtrace-frame-args fr)
+                                  (list form t)))))))
+             (capture
               (lambda (&rest _args)
                 (elate--rearm-debugger)
                 (unless backtrace
-                  (setq backtrace
-                        (elate--backtrace-string
-                         capture
-                         (lambda (fr)
-                           (let ((fun (backtrace-frame-fun fr)))
-                             (or (eq fun 'elate--rpc-eval)
-                                 (and (eq fun 'eval)
-                                      (equal (backtrace-frame-args fr)
-                                             (list form t))))))))))))
+                  (setq backtrace (elate--backtrace-string capture cut-pred))
+                  (when want-frames
+                    (setq frames (elate--backtrace-frames capture cut-pred)))))))
       (let ((debugger capture))
         (condition-case err
           (setq value
@@ -558,6 +751,7 @@ reaches a timer-servicing point."
             :value-length vlen
             :error (elate--jnull errstr)
             :backtrace (elate--jnull backtrace)
+            :frames frames
             :messages (with-current-buffer (messages-buffer)
                         (save-restriction
                           (widen)
@@ -1864,6 +2058,83 @@ fresh session for authoritative numbers."
        (list :gcs-done-delta (- gcs-done gcs0)
              :gc-elapsed-delta (- gc-elapsed gc-el0)
              :memory-deltas (elate--memory-delta mem0 (memory-use-counts)))))))
+
+(defconst elate--max-trace-output 65536
+  "Cap on the *trace-output* text one `trace read' returns.
+Truncated head-first with :truncated t and the full :output-length; the
+reply travels the same ~50 KB/s emacsclient print path as eval.")
+
+(defun elate--trace-resolve (name)
+  "Intern NAME and verify it is a traceable function symbol, else signal."
+  (let ((sym (intern-soft name)))
+    (unless (and sym (fboundp sym))
+      (error "elate: cannot trace %s: no such function" name))
+    (when (macrop sym)
+      (error "elate: cannot trace %s: it is a macro, not a function" name))
+    sym))
+
+(defun elate--trace-active-names ()
+  "Sorted names of currently traced functions (best effort; nil pre-Emacs 30)."
+  (when (fboundp 'trace-is-traced)
+    (let (out)
+      (mapatoms (lambda (s)
+                  (when (and (fboundp s) (trace-is-traced s))
+                    (push (symbol-name s) out))))
+      (sort out #'string<))))
+
+(defun elate--rpc-trace (action &optional names keep)
+  "Drive function tracing.  ACTION is \"on\", \"off\", or \"read\".
+NAMES is a whitespace-separated string of function names.  \"on\" traces
+each via `trace-function' (already-traced is a no-op re-arm, reported
+under :already, never an error); all names are resolved before any is
+traced, so a bad name leaves nothing half-traced.  \"off\" untraces the
+named functions, or ALL of them when NAMES is empty.  \"read\" returns
+the accumulated `*trace-output*' text and, unless KEEP, clears it so each
+read sees only new calls."
+  (let ((names (split-string (or names "") nil t)))
+    (pcase action
+      ("on"
+       (unless names
+         (error "elate: trace on needs at least one function name"))
+       (let ((syms (mapcar #'elate--trace-resolve names))   ; resolve all first
+             (traced '()) (already '()) (ss nil) (ns names))
+         (setq ss syms)
+         (while ns
+           (let ((sym (car ss)) (name (car ns)))
+             (if (and (fboundp 'trace-is-traced) (trace-is-traced sym))
+                 (push name already)
+               (trace-function sym)
+               (push name traced)))
+           (setq ns (cdr ns) ss (cdr ss)))
+         (list :traced (vconcat (nreverse traced))
+               :already (vconcat (nreverse already)))))
+      ("off"
+       (if names
+           (let ((off '()))
+             (dolist (name names)
+               (let ((sym (intern-soft name)))
+                 (when sym (untrace-function sym) (push name off))))
+             (list :untraced (vconcat (nreverse off)) :all :false))
+         (untrace-all)
+         (list :untraced :null :all t)))
+      ("read"
+       (let* ((buf (get-buffer trace-buffer))
+              (text (if (buffer-live-p buf)
+                        (with-current-buffer buf
+                          (buffer-substring-no-properties (point-min) (point-max)))
+                      ""))
+              (len (length text))
+              (truncated (> len elate--max-trace-output)))
+         (unless keep
+           (when (buffer-live-p buf)
+             (with-current-buffer buf
+               (let ((inhibit-read-only t)) (erase-buffer)))))
+         (list :output (if truncated (substring text 0 elate--max-trace-output) text)
+               :truncated (elate--jbool truncated)
+               :output-length len
+               :cleared (elate--jbool (not keep))
+               :active (vconcat (elate--trace-active-names)))))
+      (_ (error "elate: unknown trace action %S (use on/off/read)" action)))))
 
 ;;;; clean-install
 

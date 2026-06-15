@@ -44,6 +44,7 @@ snapshot, matching the error convention everywhere else in elate.
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 import sys
@@ -102,7 +103,12 @@ _ASSERT_KINDS: dict[str, set[str]] = {
     "tests": set(),
     "lint_clean": set(),
     "eval": {"timeout"},
+    "snapshot": set(),  # options live inside the value object, not as siblings
 }
+
+_SNAPSHOT_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_SNAPSHOT_OF = ("screen", "faces", "state")
+_SNAPSHOT_KEYS = {"name", "of", "buffer", "from", "to", "ansi"}
 
 _SESSION_KEYS = {"ui", "size", "config", "init_file", "load", "eval",
                  "emacs", "headless", "allow_init_error"}
@@ -387,6 +393,50 @@ def _validate_assert(spec: Any, where: str) -> None:
             'count-field -> expected value, e.g. {{"unexpected": 0}}')
     if kind == "lint_clean" and not isinstance(val, bool):
         raise ElateError(f'{where}: assert "lint_clean" takes true or false')
+    if kind == "snapshot":
+        _validate_snapshot(val, where)
+
+
+def _validate_snapshot(val: Any, where: str) -> None:
+    """Validate a snapshot assert value (a name string, or an options object)."""
+    if isinstance(val, str):
+        name, obj = val, {}
+    elif isinstance(val, dict):
+        name, obj = val.get("name"), val
+    else:
+        raise ElateError(
+            f'{where}: assert "snapshot" takes a name string or an object '
+            'with at least "name"')
+    if not (isinstance(name, str) and _SNAPSHOT_NAME_RE.match(name)):
+        raise ElateError(
+            f'{where}: snapshot "name" must be a string matching '
+            "[A-Za-z0-9._-]+ (it becomes a filename)")
+    if not obj:
+        return
+    unknown = set(obj) - _SNAPSHOT_KEYS
+    if unknown:
+        raise ElateError(
+            f"{where} (assert snapshot): unknown key(s) {sorted(unknown)}")
+    of = obj.get("of", "screen")
+    if of not in _SNAPSHOT_OF:
+        raise ElateError(
+            f'{where}: snapshot "of" must be one of {list(_SNAPSHOT_OF)}')
+    if of != "faces" and ({"buffer", "from", "to"} & set(obj)):
+        raise ElateError(
+            f'{where}: snapshot "buffer"/"from"/"to" apply only to of="faces"')
+    if of != "screen" and "ansi" in obj:
+        raise ElateError(
+            f'{where}: snapshot "ansi" applies only to of="screen"')
+    if "buffer" in obj and not isinstance(obj["buffer"], str):
+        raise ElateError(f'{where}: snapshot "buffer" must be a string')
+    if "ansi" in obj and not isinstance(obj["ansi"], bool):
+        raise ElateError(f'{where}: snapshot "ansi" must be true or false')
+    for k in ("from", "to"):
+        if k in obj and not (isinstance(obj[k], int)
+                             and not isinstance(obj[k], bool) and obj[k] >= 1):
+            raise ElateError(f'{where}: snapshot "{k}" must be an integer >= 1')
+    if "from" in obj and "to" in obj and obj["from"] > obj["to"]:
+        raise ElateError(f'{where}: snapshot "from" must be <= "to"')
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +461,9 @@ def run_script(
     deadline: float | None = None,
     on_step: Callable[[dict[str, Any]], None] | None = None,
     origin: str | None = None,
+    update_snapshots: bool = False,
+    snapshot_dir: Path | None = None,
+    snapshot_stem: str | None = None,
 ) -> dict[str, Any]:
     """Execute SCRIPT; return the structured run result.
 
@@ -473,6 +526,14 @@ def run_script(
              **({"origin": origin} if origin else {}))
 
     ctx: dict[str, Any] = {}
+    snap_root = (Path(snapshot_dir) if snapshot_dir is not None
+                 else base / "__snapshots__")
+    ctx["_snapshot"] = {
+        "dir": snap_root,
+        "stem": snapshot_stem or _safe_stem(script.get("name")) or "scenario",
+        "update": update_snapshots,
+        "emacs_version": sess.emacs_version,
+    }
     records: list[dict[str, Any]] = []
     try:
         for index, step in enumerate(steps, 1):
@@ -828,6 +889,9 @@ def _eval_assert(sess: S.Session, spec: dict[str, Any],
                 {"items": last.get("items")})
         return {"clean": last.get("clean")}
 
+    if kind == "snapshot":
+        return _eval_snapshot(sess, val, ctx)
+
     # kind == "eval": passes when the form evaluates without error to non-nil
     timeout = float(spec.get("timeout", 10.0))
     data = sess.semantic().eval_form(val, timeout=timeout)
@@ -837,6 +901,138 @@ def _eval_assert(sess: S.Session, spec: dict[str, Any],
     if data.get("value") == "nil":
         raise _StepFailure(f"assertion form returned nil: {val}")
     return {"value": data.get("value")}
+
+
+# ---------------------------------------------------------------------------
+# Golden snapshots
+
+def _safe_stem(name: Any) -> str | None:
+    """A scenario name reduced to the golden-filename charset, or None."""
+    if not isinstance(name, str) or not name.strip():
+        return None
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or None
+
+
+_STATE_VOLATILE = {"idle", "last-command", "echo", "input-pending", "unread",
+                   "messages-tail", "popups", "token", "mode", "since-status",
+                   "minibuffer-depth",
+                   # absolute path inside the per-run sandbox $HOME -- machine-
+                   # and run-specific, so it would make an of:state golden
+                   # non-portable for any file-visiting buffer.
+                   "file"}
+
+
+def _canon_json(obj: Any) -> str:
+    return json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def _normalize_faces(data: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic projection of a buffer --props result for a golden."""
+    return {k: data[k] for k in ("text", "props", "overlays") if k in data}
+
+
+def _strip_window_text(node: Any) -> Any:
+    """Drop geometry/scroll-dependent fields from a window-layout tree."""
+    drop = {"text", "text-truncated", "mode-line", "start-line", "end-line",
+            "width", "height"}
+    if isinstance(node, dict):
+        return {k: _strip_window_text(v) for k, v in node.items()
+                if k not in drop}
+    if isinstance(node, list):
+        return [_strip_window_text(n) for n in node]
+    return node
+
+
+def _normalize_state(data: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic projection of a state snapshot for a golden."""
+    out = {k: v for k, v in data.items() if k not in _STATE_VOLATILE}
+    if "windows" in out:
+        out["windows"] = _strip_window_text(out["windows"])
+    return out
+
+
+def _capture_snapshot(sess: S.Session, of: str,
+                      spec: dict[str, Any]) -> tuple[Any, str]:
+    """Capture the current render for OF; return (payload, file-extension).
+
+    Payload is str for text goldens (screen TTY, faces/state JSON) and
+    bytes for a GUI PNG.
+    """
+    if of == "screen":
+        if sess.ui == "gui":
+            from . import screenshot as shot
+            path = sess.dir / "log" / "snapshot-capture.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shot.capture_gui(sess, path)
+            return path.read_bytes(), ".png"
+        if sess.raw().pane_info() is None:
+            raise _StepFailure("no tmux pane left to snapshot")
+        screen = sess.raw().capture_pane(ansi=bool(spec.get("ansi")))
+        return screen.rstrip("\n") + "\n", ".txt"
+    if of == "faces":
+        data = sess.semantic().rpc("buffer", spec.get("buffer"),
+                                   spec.get("from"), spec.get("to"), True)
+        return _canon_json(_normalize_faces(data)), ".faces.json"
+    data = sess.semantic().rpc("state")
+    return _canon_json(_normalize_state(data)), ".state.json"
+
+
+def _eval_snapshot(sess: S.Session, val: Any,
+                   ctx: dict[str, Any]) -> dict[str, Any]:
+    sopts = ctx.get("_snapshot") or {}
+    snap_dir = sopts.get("dir")
+    if snap_dir is None:
+        raise _StepFailure(
+            "snapshot assertions need a snapshot directory (run via "
+            "`elate run`/`elate matrix`)")
+    spec = {"name": val} if isinstance(val, str) else dict(val)
+    name = spec["name"]
+    of = spec.get("of", "screen")
+    verkey = str(sopts.get("emacs_version") or "0").split(".")[0]
+    payload, ext = _capture_snapshot(sess, of, spec)
+    path = Path(snap_dir) / sopts.get("stem", "scenario") / f"{name}@{verkey}{ext}"
+
+    if sopts.get("update"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(payload, bytes):
+            path.write_bytes(payload)
+        else:
+            path.write_text(payload, encoding="utf-8")
+        return {"snapshot": name, "of": of, "path": str(path), "updated": True}
+
+    if not path.exists():
+        raise _StepFailure(
+            f"no golden snapshot {name!r} for emacs {verkey} at {path}; "
+            "create it with `elate run --update-snapshots`",
+            {"snapshot": name, "of": of, "path": str(path)})
+
+    if path.suffix == ".png":
+        golden = path.read_bytes()
+        if golden == payload:
+            return {"snapshot": name, "of": of, "status": "match"}
+        actual_path = path.with_name(path.stem + ".actual.png")
+        try:
+            actual_path.write_bytes(payload)
+        except OSError:
+            actual_path = None
+        raise _StepFailure(
+            f"snapshot {name!r} (of {of}) differs from golden",
+            {"snapshot": name, "golden_bytes": len(golden),
+             "actual_bytes": len(payload),
+             "actual_written": str(actual_path) if actual_path else None})
+
+    golden = path.read_text(encoding="utf-8")
+    if golden == payload:
+        return {"snapshot": name, "of": of, "status": "match"}
+    diff = list(difflib.unified_diff(
+        golden.splitlines(), payload.splitlines(),
+        fromfile="golden", tofile="actual", lineterm=""))
+    clipped = diff[:200]
+    text = "\n".join(clipped)
+    if len(diff) > 200:
+        text += f"\n... ({len(diff) - 200} more diff lines)"
+    raise _StepFailure(f"snapshot {name!r} (of {of}) differs from golden",
+                       {"snapshot": name, "diff": text})
 
 
 # ---------------------------------------------------------------------------

@@ -44,7 +44,7 @@ EXPECTED_TOOLS = {
     "elate_wait", "elate_describe",
     "elate_test", "elate_lint", "elate_popups", "elate_faces_at",
     "elate_run_script", "elate_record",
-    "elate_profile", "elate_bench", "elate_purge",
+    "elate_profile", "elate_bench", "elate_trace", "elate_purge",
 }
 
 
@@ -313,6 +313,48 @@ def test_eval_non_unicode_value_keeps_json_contract(
     # The session must stay fully observable afterwards.
     state = one_call(elate_home, "elate_state", {"session": NAME})
     assert state["ok"] is True and state["buffer"]
+
+
+def test_state_since_delta_round_trips(
+        elate_home: str, mcp_session: dict[str, Any]) -> None:
+    full = one_call(elate_home, "elate_state", {"session": NAME})
+    assert full["ok"] is True
+    assert full["mode"] == "full" and isinstance(full.get("token"), str)
+    delta = one_call(elate_home, "elate_state",
+                     {"session": NAME, "since": full["token"]})
+    assert delta["ok"] is True and delta["mode"] == "delta" and "changed" in delta
+    # An unknown token degrades to a full snapshot rather than erroring.
+    bad = one_call(elate_home, "elate_state",
+                   {"session": NAME, "since": "garbage!!"})
+    assert bad["ok"] is True and bad["mode"] == "full"
+    assert bad.get("since-status") == "unknown"
+
+
+def test_eval_backtrace_frames_tool(
+        elate_home: str, mcp_session: dict[str, Any]) -> None:
+    out = one_call(elate_home, "elate_eval",
+                   {"session": NAME, "form": "(elate-no-such-fn 1)",
+                    "backtrace": True})
+    assert out["ok"] is False
+    assert isinstance(out.get("frames"), list) and out["frames"]
+
+
+def test_trace_tool(elate_home: str, mcp_session: dict[str, Any]) -> None:
+    one_call(elate_home, "elate_eval",
+             {"session": NAME, "form": "(defun elate-mcp-tr (x) (1+ x))"})
+    on = one_call(elate_home, "elate_trace",
+                  {"session": NAME, "action": "on",
+                   "functions": ["elate-mcp-tr"]})
+    assert on["ok"] is True and on["traced"] == ["elate-mcp-tr"]
+    one_call(elate_home, "elate_eval",
+             {"session": NAME, "form": "(elate-mcp-tr 41)"})
+    r = one_call(elate_home, "elate_trace", {"session": NAME, "action": "read"})
+    assert r["ok"] is True and "elate-mcp-tr" in r["output"] and "42" in r["output"]
+    off = one_call(elate_home, "elate_trace", {"session": NAME, "action": "off"})
+    assert off["ok"] is True and off["all"] is True
+    bad = one_call(elate_home, "elate_trace",
+                   {"session": NAME, "action": "on", "functions": ["when"]})
+    assert bad["ok"] is False and "macro" in bad["error"]
 
 
 def test_info_tool(elate_home: str, mcp_session: dict[str, Any]) -> None:

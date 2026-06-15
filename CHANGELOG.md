@@ -13,6 +13,36 @@ is opt-in.
   opt-in keeps the plugin's tools out of every turn's context until you ask
   for them, and avoids a second project-scope `elate` server when you open
   the repo in Claude Code.
+- **`attach`** (CLI-only): hand a TTY session off to a human -- `elate attach
+  NAME` exec's into the session's tmux so a person can drive Emacs directly,
+  then detach with `C-b d` (the session keeps running). `--read-only` watches
+  without sending input; `--print-command` prints the tmux command without
+  attaching. GUI sessions point at their visible window; a non-interactive
+  stdio is a usage error (exit 2) rather than an exec into nothing.
+- **`state --since TOKEN`** (CLI and `elate_state`): a delta observation. Every
+  `state` result now carries an opaque `token`; pass it back as `--since` to get
+  only what changed -- buffers added/removed/modified, point and selected-buffer
+  movement, new *Messages* lines, minibuffer open/close/prompt -- much cheaper
+  than a full snapshot, with `"changed": false` meaning your last action did
+  nothing observable. The token is self-describing (no server-side state); an
+  unknown or since-restarted-session token degrades to a full snapshot.
+- **`trace`** (CLI `trace`; MCP `elate_trace`): `trace on FUNC...` wraps
+  `trace-function` around functions; drive the session, then `trace read`
+  returns the call/args/return log and clears it (so each read sees only new
+  calls), `trace off [FUNC...]` untraces. Surfaces internals you cannot see on
+  screen -- why an advice fires twice, what args a hook receives.
+- **`eval --backtrace`** (and `elate_eval(backtrace=true)`): on error, return
+  structured `frames` (each frame's function + printed args) alongside the
+  rendered backtrace string -- off by default to keep replies small.
+- **Golden snapshots** in the scenario layer: a new `snapshot` assertion
+  compares the current render against a committed golden and fails with a diff
+  on mismatch. `of: screen` (text/PNG), `of: faces` (the deterministic choice:
+  text + face/property runs + overlays), or `of: state`. Goldens are
+  version-keyed under `<scenario-dir>/__snapshots__/<stem>/<name>@<major>.<ext>`,
+  so `matrix` gets one per Emacs ("renders identically on 29/30/31, diff when
+  not"). Create/refresh with `elate run --update-snapshots` (also on `matrix`
+  and `elate_run_script(update_snapshots=true)`); a missing golden in compare
+  mode is a hard failure (CI never passes on an absent golden).
 
 ## 0.5.0
 

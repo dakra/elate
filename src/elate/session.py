@@ -25,7 +25,7 @@ from .errors import (
     WaitTimeout,
 )
 from .paths import sessions_root
-from .raw import RawChannel
+from .raw import SESSION as TMUX_SESSION, RawChannel
 from .semantic import SemanticChannel
 from .transcript import log_event
 
@@ -117,6 +117,28 @@ class Session:
                 "the semantic channel, stop the session."
             )
         return RawChannel(self.tmux_socket)
+
+    def tmux_attach_argv(self, read_only: bool = False) -> list[str]:
+        """argv for ``tmux attach`` into this session's private server.
+
+        Single source of the attach command (mirrors :meth:`raw` owning the
+        socket). Raises for GUI sessions (no tmux) and for a tty session
+        with no recorded socket (corrupt registry).
+        """
+        if self.ui == "gui":
+            raise ElateError(
+                f"session {self.name!r} is a GUI session: there is no tmux "
+                "to attach to. Its Emacs window is already on screen; "
+                f"capture it with: elate -s {self.name} screenshot"
+            )
+        if not self.tmux_socket:
+            raise ElateError(
+                f"session {self.name!r} has no tmux socket recorded"
+            )
+        argv = ["tmux", "-S", self.tmux_socket, "attach", "-t", TMUX_SESSION]
+        if read_only:
+            argv.append("-r")
+        return argv
 
     def semantic(self) -> SemanticChannel:
         return SemanticChannel(self.emacsclient, self.socket_path)
@@ -966,6 +988,26 @@ def bench_form(
                                round(float(timeout), 3),
                                timeout=timeout + ERT_RPC_SLACK)
     return {**data, "note": PROFILE_NOTE}
+
+
+def trace_functions(
+    sess: Session,
+    action: str,
+    functions: Sequence[str] | None = None,
+    keep: bool = False,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Drive `trace-function` over the session.
+
+    ACTION is "on" (trace each name; needs >=1), "off" (untrace the named
+    functions, or all when none given), or "read" (return the accumulated
+    *trace-output* log and, unless KEEP, clear it). Function names travel
+    as one whitespace-joined string (elisp splits them).
+    """
+    names = " ".join(functions or [])
+    if action == "on" and not names.strip():
+        raise ElateError("trace on needs at least one function name")
+    return sess.semantic().rpc("trace", action, names, keep, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------

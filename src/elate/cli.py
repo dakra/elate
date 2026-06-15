@@ -7,12 +7,13 @@ import base64
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
 
 from . import __version__, session as S
-from .errors import ElateError, EvalTimeout, RpcError, WaitTimeout
+from .errors import ElateError, EvalTimeout, RpcError, UsageError, WaitTimeout
 
 
 def _parse_size(value: str) -> tuple[int, int]:
@@ -213,8 +214,52 @@ def build_parser() -> argparse.ArgumentParser:
                                        "or GUI frame)")
     sp.add_argument("size", type=_parse_size, metavar="COLSxROWS")
 
+    sp = sub.add_parser(
+        "attach",
+        help="attach a human terminal to a live TTY session (hand off / "
+             "take over)",
+        description="Drop into the session's tmux client so a human can "
+                    "drive Emacs directly, then detach with C-b d to hand "
+                    "back -- the session keeps running (do NOT use C-x C-c, "
+                    "which kills Emacs). TTY sessions only: a GUI session's "
+                    "Emacs window is already on screen (use screenshot). "
+                    "Requires a real terminal; this replaces the elate "
+                    "process with `tmux attach`. Your terminal size "
+                    "temporarily drives the frame while attached.")
+    sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
+    sp.add_argument("--read-only", "-r", action="store_true",
+                    help="attach read-only: watch without sending input "
+                         "(detach still works with C-b d)")
+    sp.add_argument("--print-command", action="store_true",
+                    help="print the tmux command that would run, without "
+                         "attaching (scripting/tests)")
+
     sp = sub.add_parser("eval", help="evaluate an elisp form")
     sp.add_argument("form")
+    sp.add_argument("--timeout", type=float, default=15.0, metavar="SECS")
+    sp.add_argument("--backtrace", action="store_true",
+                    help="on error, also return structured backtrace frames "
+                         "(each frame's function + printed args), not just "
+                         "the rendered backtrace string")
+
+    sp = sub.add_parser(
+        "trace",
+        help="trace elisp functions (log calls/args/returns), then read "
+             "the accumulated log",
+        description="Wrap trace-function around one or more functions so "
+                    "each call records its args and return value. 'on "
+                    "FUNC...' starts tracing; drive the session "
+                    "(keys/eval/...); 'read' returns and clears the log so "
+                    "each read sees only new calls; 'off [FUNC...]' "
+                    "untraces the named functions (or all). Drives Emacs "
+                    "internals you cannot see on screen -- why an advice "
+                    "fires twice, what args a hook receives.")
+    sp.add_argument("action", choices=["on", "off", "read"])
+    sp.add_argument("functions", nargs="*", metavar="FUNC",
+                    help="function name(s): required for 'on', optional for "
+                         "'off' (default: untrace all), unused for 'read'")
+    sp.add_argument("--keep", action="store_true",
+                    help="trace read: keep the log instead of clearing it")
     sp.add_argument("--timeout", type=float, default=15.0, metavar="SECS")
 
     sp = sub.add_parser("buffer", help="print buffer contents")
@@ -350,8 +395,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("echo", help="current echo area / minibuffer line")
 
-    sub.add_parser("state", help="one-call scene snapshot (layout, prompt, "
-                                 "point, modes, messages tail)")
+    sp = sub.add_parser("state", help="one-call scene snapshot (layout, "
+                                      "prompt, point, modes, messages tail)")
+    sp.add_argument("--since", metavar="TOKEN",
+                    help="return only what changed since the TOKEN from a "
+                         "prior state call (new/killed/modified buffers, "
+                         "point/selection movement, new *Messages* lines, "
+                         "minibuffer change) -- much cheaper than a full "
+                         "snapshot, and 'changed':false means your last "
+                         "action did nothing observable. Every state result "
+                         "carries a fresh 'token'; an unknown/stale one "
+                         "degrades to a full snapshot.")
 
     sp = sub.add_parser("describe", help="structured docs/binding lookup")
     sp.add_argument("kind", choices=["key", "function", "variable", "mode"])
@@ -405,6 +459,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "stop it)")
     sp.add_argument("--emacs", metavar="PATH",
                     help="override the script's emacs binary (CI matrix)")
+    sp.add_argument("--update-snapshots", action="store_true",
+                    help="write/overwrite golden artifacts for snapshot "
+                         "assertions instead of comparing them; the run still "
+                         "executes every step (review the diff before "
+                         "committing)")
+    sp.add_argument("--snapshot-dir", metavar="DIR",
+                    help="base directory for golden snapshots "
+                         "(default: <scenario-dir>/__snapshots__)")
 
     sp = sub.add_parser(
         "export-script",
@@ -463,6 +525,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--emacs-glob", metavar="GLOB",
                     help="glob matching emacs binaries, e.g. "
                          "'/opt/emacs-*/bin/emacs'")
+    sp.add_argument("--update-snapshots", action="store_true",
+                    help="write/overwrite golden snapshots (per Emacs "
+                         "version) instead of comparing")
+    sp.add_argument("--snapshot-dir", metavar="DIR",
+                    help="base directory for golden snapshots "
+                         "(default: <scenario-dir>/__snapshots__)")
     sp.add_argument("script", help="path to the scenario file (JSON)")
 
     return p
@@ -491,6 +559,37 @@ def _name_arg(args: argparse.Namespace) -> str:
     if not name:
         raise ElateError(f"{args.command} needs a session name: elate {args.command} NAME")
     return name
+
+
+def run_attach(args: argparse.Namespace) -> int:
+    """Hand off to a human by exec'ing `tmux attach` into the session.
+
+    Handled outside the normal command dispatch (like `mcp`): on success it
+    replaces the process and never returns. GUI/dead sessions raise
+    ElateError (exit 1); a non-interactive stdio raises UsageError (exit 2)
+    rather than exec'ing into nothing.
+    """
+    sess = S.load_session(_name_arg(args))
+    # Raises ElateError for GUI (no tmux) or a missing socket. Built before
+    # the liveness check so a GUI error wins over a "not running" one.
+    argv = sess.tmux_attach_argv(read_only=args.read_only)
+    if args.print_command:
+        # Dry run: still surfaces the GUI/socket error above, but never
+        # touches liveness or the terminal -- the testable seam.
+        print(" ".join(shlex.quote(a) for a in argv))
+        return 0
+    sess.require_alive()  # a wedged-but-alive Emacs is fine (send it C-g)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise UsageError(
+            "attach needs a real terminal; it hands you an interactive tmux "
+            "client. Run it from a terminal, or observe non-interactively "
+            f"with: elate -s {sess.name} screenshot / record")
+    sess.log("attach", read_only=bool(args.read_only))
+    try:
+        os.execvp("tmux", argv)  # replaces this process; does not return
+    except OSError as exc:
+        raise ElateError(f"cannot exec tmux: {exc}") from exc
+    return 0  # unreachable; keeps the type checker happy
 
 
 def cmd_start(args: argparse.Namespace) -> Result:
@@ -667,7 +766,8 @@ def cmd_eval(args: argparse.Namespace) -> Result:
     sess = _require_session(args)
     sess.log("eval", form=args.form, timeout=args.timeout)
     try:
-        data = sess.semantic().eval_form(args.form, timeout=args.timeout)
+        data = sess.semantic().eval_form(args.form, timeout=args.timeout,
+                                          backtrace=args.backtrace)
     except EvalTimeout as exc:
         busy = sess.is_busy()
         sess.log("eval-timeout", form=args.form)
@@ -687,6 +787,12 @@ def cmd_eval(args: argparse.Namespace) -> Result:
         parts.append(f"error: {data['error']}")
         if data.get("backtrace"):
             parts.append(f"backtrace:\n{data['backtrace']}")
+        if data.get("frames"):
+            parts.append("frames:")
+            for fr in data["frames"]:
+                a = fr.get("args")
+                shown = " ".join(a) if a else ""
+                parts.append(f"  {fr.get('fun')}{(' ' + shown) if shown else ''}")
         # Exit 1 below; make the JSON "ok" flag agree with the exit code.
         data = {**data, "ok": False}
     else:
@@ -957,6 +1063,38 @@ def cmd_bench(args: argparse.Namespace) -> Result:
     return data, "\n".join(lines), 0
 
 
+def cmd_trace(args: argparse.Namespace) -> Result:
+    sess = _require_session(args)
+    sess.log("trace", action=args.action, functions=args.functions,
+             keep=args.keep)
+    data = S.trace_functions(sess, args.action, functions=args.functions,
+                             keep=args.keep, timeout=args.timeout)
+    if args.action == "read":
+        lines = []
+        out = (data.get("output") or "").rstrip("\n")
+        if out:
+            lines.append(out)
+        else:
+            lines.append("(no trace output)")
+        if data.get("truncated"):
+            lines.append(f"(output truncated to {len(data.get('output') or '')}"
+                         f" of {data.get('output-length')} chars)")
+        if data.get("active"):
+            lines.append("tracing: " + " ".join(data["active"]))
+        return data, "\n".join(lines), 0
+    if args.action == "on":
+        bits = []
+        if data.get("traced"):
+            bits.append("traced " + " ".join(data["traced"]))
+        if data.get("already"):
+            bits.append("already traced " + " ".join(data["already"]))
+        return data, "; ".join(bits) or "nothing to trace", 0
+    # off
+    if data.get("all"):
+        return data, "untraced all functions", 0
+    return data, "untraced " + " ".join(data.get("untraced") or []), 0
+
+
 def _faces_cell_human(data: dict[str, Any]) -> list[str]:
     """Human lines for one faces cell (a faces-at result, or a range cell)."""
     head = (f"{data.get('line')}:{data.get('column')} "
@@ -1119,9 +1257,44 @@ def _human_state(data: dict[str, Any]) -> str:
 
 def cmd_state(args: argparse.Namespace) -> Result:
     sess = _require_session(args)
-    data = sess.semantic().rpc("state")
-    sess.log("state", buffer=data.get("buffer"))
-    return data, _human_state(data), 0
+    data = sess.semantic().rpc("state", args.since)
+    sess.log("state", buffer=data.get("buffer"), since=bool(args.since),
+             mode=data.get("mode"))
+    human = (_human_delta(data) if data.get("mode") == "delta"
+             else _human_state(data))
+    return data, human, 0
+
+
+def _human_delta(data: dict[str, Any]) -> str:
+    """Compact human view of a `state --since` delta."""
+    if not data.get("changed"):
+        return "no change"
+    lines: list[str] = []
+    bufs = data.get("buffers") or {}
+    marks = ([f"+{b}" for b in bufs.get("added") or []]
+             + [f"-{b}" for b in bufs.get("removed") or []]
+             + [f"~{b}" for b in bufs.get("modified") or []])
+    if marks:
+        lines.append("buffers: " + " ".join(marks))
+    sel = (data.get("selection") or {}).get("buffer")
+    if sel:
+        lines.append(f"selected: {sel.get('from')} -> {sel.get('to')}")
+    cur = data.get("current") or {}
+    pt = cur.get("point")
+    if pt:
+        lines.append(f"point: {pt.get('from')} -> {pt.get('to')} "
+                     f"({pt.get('line')}:{pt.get('column')})")
+    if cur.get("modified"):
+        lines.append(f"modified: {cur.get('buffer')}")
+    mb = data.get("minibuffer") or {}
+    if mb.get("change"):
+        prompt = f" {mb['prompt']!r}" if mb.get("prompt") else ""
+        lines.append(f"minibuffer: {mb['change']}{prompt}")
+    tail = (data.get("messages") or "").rstrip("\n")
+    if tail:
+        lines.append("messages:")
+        lines.extend(f"  {ln}" for ln in tail.splitlines())
+    return "\n".join(lines)
 
 
 def cmd_describe(args: argparse.Namespace) -> Result:
@@ -1226,6 +1399,14 @@ def _step_line(rec: dict[str, Any], total: int) -> str:
         line += f" ({rec['duration']:.2f}s)"
     if rec["status"] == "failed":
         line += f"\n  error: {rec.get('error')}"
+        detail = rec.get("detail") or {}
+        if detail.get("diff"):
+            line += "\n" + "\n".join(f"  {ln}"
+                                     for ln in detail["diff"].splitlines())
+        elif detail.get("actual_written"):
+            line += (f"\n  golden {detail.get('golden_bytes')} bytes vs actual "
+                     f"{detail.get('actual_bytes')} bytes; wrote "
+                     f"{detail['actual_written']}")
     return line
 
 
@@ -1271,6 +1452,10 @@ def cmd_run(args: argparse.Namespace) -> Result:
         script, base_dir=base, session=target, emacs=args.emacs,
         keep=args.keep, keep_on_failure=args.keep_on_failure,
         on_step=on_step,
+        update_snapshots=args.update_snapshots,
+        snapshot_dir=(base / Path(args.snapshot_dir).expanduser()
+                      if args.snapshot_dir else None),
+        snapshot_stem=Path(args.script).stem,
     )
     return result, _run_summary(result), 0 if result["success"] else 1
 
@@ -1403,7 +1588,11 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
             print(f"=== {b} ===", flush=True)
         try:
             run = SC.run_script(script, base_dir=base, emacs=b,
-                                on_step=on_step)
+                                on_step=on_step,
+                                update_snapshots=args.update_snapshots,
+                                snapshot_dir=(base / Path(args.snapshot_dir).expanduser()
+                                             if args.snapshot_dir else None),
+                                snapshot_stem=Path(args.script).stem)
             entry = {
                 "emacs": b,
                 "version": run.get("emacs_version"),
@@ -1452,6 +1641,7 @@ _COMMANDS = {
     "lint": cmd_lint,
     "profile": cmd_profile,
     "bench": cmd_bench,
+    "trace": cmd_trace,
     "faces-at": cmd_faces_at,
     "send-process": cmd_send_process,
     "popups": cmd_popups,
@@ -1484,6 +1674,18 @@ def main(argv: list[str] | None = None) -> int:
 
         run_stdio()
         return 0
+    if args.command == "attach":
+        # Interactive terminal takeover: bypasses the Result/JSON path (an
+        # exec leaves nothing to print) with its own error handling so a
+        # usage mistake maps to exit 2.
+        try:
+            return run_attach(args)
+        except UsageError as exc:
+            print(f"elate: {exc}", file=sys.stderr)
+            return 2
+        except ElateError as exc:
+            print(f"elate: {exc}", file=sys.stderr)
+            return 1
     try:
         result, human, code = _COMMANDS[args.command](args)
     except WaitTimeout as exc:

@@ -43,3 +43,7 @@ class WaitTimeout(ElateError):
     def __init__(self, message: str, state: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.state = state or {}
+
+
+class UsageError(ElateError):
+    """A usage mistake (wrong context or arguments). Maps to CLI exit 2."""

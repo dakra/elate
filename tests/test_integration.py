@@ -733,6 +733,125 @@ def test_dead_session_detected_and_restartable(elate_home: str) -> None:
     finally:
         S.stop_session(name)
 
+
+# -- state --since deltas -----------------------------------------------------
+
+def test_state_returns_token_and_mode(sess: S.Session) -> None:
+    data = sess.semantic().rpc("state")
+    assert data["mode"] == "full"
+    assert isinstance(data.get("token"), str) and data["token"]
+    assert "since-status" not in data
+
+
+def test_state_delta_nothing_changed(sess: S.Session) -> None:
+    sem = sess.semantic()
+    s1 = sem.rpc("state")
+    d = sem.rpc("state", s1["token"])
+    assert d["mode"] == "delta"
+    assert d["changed"] is False
+    assert isinstance(d.get("token"), str) and d["token"]
+
+
+def test_state_delta_new_and_killed_buffer(sess: S.Session) -> None:
+    sem = sess.semantic()
+    tok = sem.rpc("state")["token"]
+    sem.eval_form('(get-buffer-create "*delta-new*")')
+    d = sem.rpc("state", tok)
+    assert d["changed"] is True
+    assert "*delta-new*" in (d.get("buffers", {}).get("added") or [])
+    sem.eval_form('(kill-buffer "*delta-new*")')
+    d2 = sem.rpc("state", d["token"])
+    assert "*delta-new*" in (d2.get("buffers", {}).get("removed") or [])
+
+
+def test_state_delta_modified_buffer(sess: S.Session) -> None:
+    sem = sess.semantic()
+    sem.eval_form('(get-buffer-create "*delta-mod*")')
+    tok = sem.rpc("state")["token"]
+    sem.eval_form('(with-current-buffer "*delta-mod*" (insert "hello"))')
+    d = sem.rpc("state", tok)
+    assert "*delta-mod*" in (d.get("buffers", {}).get("modified") or [])
+
+
+def test_state_delta_messages_tail_only(sess: S.Session) -> None:
+    sem = sess.semantic()
+    tok = sem.rpc("state")["token"]
+    sem.eval_form('(message "delta-msg-xyz")')
+    d = sem.rpc("state", tok)
+    assert "delta-msg-xyz" in (d.get("messages") or "")
+    # A fresh token re-anchors: the same message is not re-reported.
+    d2 = sem.rpc("state", d["token"])
+    assert "delta-msg-xyz" not in (d2.get("messages") or "")
+
+
+def test_state_delta_point_move(sess: S.Session) -> None:
+    sem = sess.semantic()
+    sem.eval_form(
+        '(progn (switch-to-buffer (get-buffer-create "*delta-pt*"))'
+        ' (erase-buffer) (insert "abc\\ndef\\nghi")'
+        ' (goto-char (point-min)) (set-window-point (selected-window) (point-min)))')
+    tok = sem.rpc("state")["token"]
+    sem.eval_form(
+        '(let ((w (selected-window)))'
+        ' (with-current-buffer (window-buffer w)'
+        '  (goto-char (point-max)) (set-window-point w (point-max))))')
+    d = sem.rpc("state", tok)
+    assert d["changed"] is True
+    pt = (d.get("current") or {}).get("point")
+    assert pt and pt["to"] > pt["from"]
+
+
+def test_state_delta_unknown_token_degrades(sess: S.Session) -> None:
+    data = sess.semantic().rpc("state", "not-a-real-token!!!")
+    assert data["mode"] == "full"
+    assert data.get("since-status") == "unknown"
+    assert data.get("buffer")  # the full snapshot is present
+    assert isinstance(data.get("token"), str) and data["token"]
+
+
+# -- eval --backtrace + trace -------------------------------------------------
+
+def test_eval_backtrace_frames(sess: S.Session) -> None:
+    data = sess.semantic().eval_form("(elate-no-such-fn 42)", backtrace=True)
+    assert data["error"]
+    frames = data.get("frames")
+    assert isinstance(frames, list) and frames
+    assert any("elate-no-such-fn" in (fr.get("fun") or "") for fr in frames)
+    top = frames[0]
+    assert top.get("args") == ["42"]
+    # The rendered string backtrace is still present (no regression).
+    assert data.get("backtrace")
+
+
+def test_eval_no_frames_without_flag(sess: S.Session) -> None:
+    assert sess.semantic().eval_form("(elate-no-such-fn 42)").get("frames") is None
+    assert sess.semantic().eval_form("(+ 1 2)", backtrace=True).get("frames") is None
+
+
+def test_trace_on_eval_read_cycle(sess: S.Session) -> None:
+    sem = sess.semantic()
+    sem.eval_form("(defun elate-tr-sq (x) (* x x))")
+    on = S.trace_functions(sess, "on", ["elate-tr-sq"])
+    assert on["traced"] == ["elate-tr-sq"]
+    sem.eval_form("(elate-tr-sq 7)")
+    r = S.trace_functions(sess, "read")
+    assert "elate-tr-sq" in r["output"] and "49" in r["output"]
+    assert r["cleared"] is True
+    # Read-and-clear: a second read sees no new calls.
+    assert S.trace_functions(sess, "read")["output"] == ""
+    off = S.trace_functions(sess, "off")
+    assert off["all"] is True
+
+
+def test_trace_errors_on_macro_and_undefined(sess: S.Session) -> None:
+    with pytest.raises(ElateError, match="no such function"):
+        S.trace_functions(sess, "on", ["elate-definitely-not-defined"])
+    with pytest.raises(ElateError, match="macro"):
+        S.trace_functions(sess, "on", ["when"])
+    # The session is still healthy afterwards.
+    assert sess.semantic().eval_form("(+ 2 2)")["value"] == "4"
+
+
 def test_stop_session(sess: S.Session) -> None:
     result = S.stop_session(NAME)
     assert result["stopped"] is True

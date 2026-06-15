@@ -250,10 +250,10 @@ This skill drives the CLI via shell — the full feature set with near-zero
 ambient cost. Prefer the MCP server only when there is **no shell access**
 (e.g. desktop apps), or when you want GUI screenshots returned **inline as
 images** instead of PNG files to read. If `elate_*` MCP tools are already
-available in your session (the Claude Code plugin registers the server
-automatically), use them directly — do **not** register a duplicate;
-otherwise the server can be registered with
-`claude mcp add elate -- uvx elate mcp`. The 25 `elate_*` tools cover the core surface (`resize`,
+available in your session (someone registered the server — the plugin is
+CLI-first and does not register it for you), use them directly — do **not**
+register a duplicate; otherwise register it with
+`claude mcp add elate -- uvx elate mcp`. The 26 `elate_*` tools cover the core surface (`attach`, `resize`,
 `export-script`, `snap`, and `matrix` stay CLI-only); sessions are shared
 between both (same names, same sandboxes), so you can mix.
 

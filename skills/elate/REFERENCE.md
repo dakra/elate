@@ -28,7 +28,9 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 - [`elate send-process`](#elate-send-process)
 - [`elate mouse`](#elate-mouse)
 - [`elate resize`](#elate-resize)
+- [`elate attach`](#elate-attach)
 - [`elate eval`](#elate-eval)
+- [`elate trace`](#elate-trace)
 - [`elate buffer`](#elate-buffer)
 - [`elate test`](#elate-test)
 - [`elate lint`](#elate-lint)
@@ -151,11 +153,33 @@ resize a live session (tmux window or GUI frame)
 
 - `COLSxROWS`
 
+## elate attach
+
+attach a human terminal to a live TTY session (hand off / take over)
+
+Drop into the session's tmux client so a human can drive Emacs directly, then detach with C-b d to hand back -- the session keeps running (do NOT use C-x C-c, which kills Emacs). TTY sessions only: a GUI session's Emacs window is already on screen (use screenshot). Requires a real terminal; this replaces the elate process with `tmux attach`. Your terminal size temporarily drives the frame while attached.
+
+- `[name]` -- session name (or use -s NAME)
+- `--read-only, -r` -- attach read-only: watch without sending input (detach still works with C-b d)
+- `--print-command` -- print the tmux command that would run, without attaching (scripting/tests)
+
 ## elate eval
 
 evaluate an elisp form
 
 - `form`
+- `--timeout SECS` (default: 15)
+- `--backtrace` -- on error, also return structured backtrace frames (each frame's function + printed args), not just the rendered backtrace string
+
+## elate trace
+
+trace elisp functions (log calls/args/returns), then read the accumulated log
+
+Wrap trace-function around one or more functions so each call records its args and return value. 'on FUNC...' starts tracing; drive the session (keys/eval/...); 'read' returns and clears the log so each read sees only new calls; 'off [FUNC...]' untraces the named functions (or all). Drives Emacs internals you cannot see on screen -- why an advice fires twice, what args a hook receives.
+
+- `{on,off,read}`
+- `[FUNC]` (repeatable) -- function name(s): required for 'on', optional for 'off' (default: untrace all), unused for 'read'
+- `--keep` -- trace read: keep the log instead of clearing it
 - `--timeout SECS` (default: 15)
 
 ## elate buffer
@@ -242,7 +266,7 @@ current echo area / minibuffer line
 
 one-call scene snapshot (layout, prompt, point, modes, messages tail)
 
-(no arguments)
+- `--since TOKEN` -- return only what changed since the TOKEN from a prior state call (new/killed/modified buffers, point/selection movement, new *Messages* lines, minibuffer change) -- much cheaper than a full snapshot, and 'changed':false means your last action did nothing observable. Every state result carries a fresh 'token'; an unknown/stale one degrades to a full snapshot.
 
 ## elate describe
 
@@ -284,6 +308,8 @@ Execute a JSON scenario script: create a fresh sandboxed session from the script
 - `--keep` -- keep the fresh session running afterwards
 - `--keep-on-failure` -- keep the fresh session running when the run fails (inspect it with state/screenshot, then stop it)
 - `--emacs PATH` -- override the script's emacs binary (CI matrix)
+- `--update-snapshots` -- write/overwrite golden artifacts for snapshot assertions instead of comparing them; the run still executes every step (review the diff before committing)
+- `--snapshot-dir DIR` -- base directory for golden snapshots (default: <scenario-dir>/__snapshots__)
 
 ## elate export-script
 
@@ -321,4 +347,6 @@ Run SCRIPT once per Emacs binary, each in a fresh session, and aggregate the per
 
 - `--emacs PATHS` (repeatable) -- emacs binary, or comma-separated list (repeatable)
 - `--emacs-glob GLOB` -- glob matching emacs binaries, e.g. '/opt/emacs-*/bin/emacs'
+- `--update-snapshots` -- write/overwrite golden snapshots (per Emacs version) instead of comparing
+- `--snapshot-dir DIR` -- base directory for golden snapshots (default: <scenario-dir>/__snapshots__)
 - `script` -- path to the scenario file (JSON)

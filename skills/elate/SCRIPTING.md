@@ -92,8 +92,46 @@ Failure semantics:
 | `tests` | non-empty object of count-field → expected (`{"unexpected": 0, "timed-out": false}`), checked against the **last `test` step** | — |
 | `lint_clean` | `true`/`false`, checked against the **last `lint` step** | — |
 | `eval` | elisp form; passes when it evaluates without error to non-`nil` (the catch-all) | `timeout` (10) |
+| `snapshot` | a name string, or `{"name", "of"}` — compare the current render against a committed golden (see below) | — |
 
 `tests`/`lint_clean` need a preceding `test`/`lint` step in the same run.
+
+## Golden snapshots
+
+A `snapshot` assert compares the current render against a stored golden and
+fails with a diff on mismatch — regression-testing for rendering, especially
+across Emacs versions with `matrix`.
+
+```json
+{"assert": {"snapshot": "font-lock-render"}}
+{"assert": {"snapshot": {"name": "fl", "of": "faces", "buffer": "demo.el"}}}
+```
+
+- A bare string is sugar for `{"name": <s>, "of": "screen"}`. `name` must match
+  `[A-Za-z0-9._-]+` (it becomes a filename).
+- **`of`** picks what is captured:
+  - `screen` (default) — the text screenshot (TTY) or a PNG (GUI). Pin
+    `session.size`; precede with `wait idle` so redisplay has settled. `ansi:
+    true` (TTY only) includes colour escapes.
+  - `faces` — buffer text + run-length face/property runs + overlays over
+    `buffer`/`from`/`to`. **The deterministic choice** (geometry- and
+    clock-independent; font-lock is ensured) — prefer it for theme/font-lock
+    regressions.
+  - `state` — a normalized scene snapshot (volatile fields, the absolute
+    buffer file path, and per-window visible text stripped). Use over
+    in-memory buffers; for file-visiting buffers prefer `faces`.
+- Goldens live at
+  `<scenario-dir>/__snapshots__/<scenario-stem>/<name>@<major-emacs-version>.<ext>`
+  — version-keyed, so `matrix` gets one golden per Emacs and "renders
+  identically on 29/30/31, diff when not" just works. Commit them.
+- **Create/update** goldens with `elate run --update-snapshots scenario.json`
+  (or `elate matrix --update-snapshots ...`); the run still executes every
+  step. Review the diff and commit deliberately.
+- In compare mode a **missing golden is a hard failure** (CI never passes on an
+  absent golden) — mint it with `--update-snapshots` first. `--snapshot-dir
+  DIR` overrides the base location.
+- GUI `of: screen` PNG goldens are brittle (fonts/AA/HiDPI/Xvfb) — prefer
+  `faces`/`state` for GUI sessions.
 
 ## Running
 
