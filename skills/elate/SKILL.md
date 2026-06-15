@@ -254,7 +254,7 @@ available in your session (someone registered the server — the plugin is
 CLI-first and does not register it for you), use them directly — do **not**
 register a duplicate; otherwise register it with
 `claude mcp add elate -- uvx elate mcp`. The 28 `elate_*` tools cover the core surface (`attach`, `resize`,
-`export-script`, `snap`, and `matrix` stay CLI-only); sessions are shared
+`export-script`, `snap`, `matrix`, and `install` stay CLI-only); sessions are shared
 between both (same names, same sandboxes), so you can mix.
 
 ## Cleanup checklist (always)

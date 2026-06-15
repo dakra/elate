@@ -39,6 +39,17 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/elate"]
 
+# Ship the Agent Skill inside the wheel so `elate install` can materialize it
+# for a PyPI install that has no checkout. The canonical copy stays at the repo
+# root (the Claude Code plugin/marketplace serves it from there); this is a
+# build-time copy placed under the package so it resolves via `__file__` at
+# runtime. Editable/dev installs don't run force-include, so paths.skill_dir
+# falls back to the repo-root copy. The key is the repo-relative source; the
+# value is the wheel-root (site-packages) destination under the installed
+# `elate/` package.
+[tool.hatch.build.targets.wheel.force-include]
+"skills/elate" = "elate/_bundled/skills/elate"
+
 # Default-deny allowlist: the sdist ships ONLY these paths. Hatchling's default
 # sdist includes everything not matched by .gitignore, and it does NOT read
 # .git/info/exclude -- so untracked-but-uncommitted files (.env, PLAN*/REVIEW*

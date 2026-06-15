@@ -1,6 +1,12 @@
-# elate — Emacs Lisp Automation Tool
+# elate - Emacs Lisp Automation Tool
+
+> **elate** /ɪˈleɪt/ *v.* - to fill (an AI) with joy by giving
+> it eyes and hands inside a live Emacs.
+> *"The agent was elated to find its keybinding actually fired."*
+> From Latin *ēlātus*, "lifted up."
 
 [![CI](https://github.com/dakra/elate/actions/workflows/ci.yml/badge.svg)](https://github.com/dakra/elate/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/elate.svg)](https://pypi.org/project/elate/)
 
 Spawn disposable, sandboxed Emacs sessions — terminal (tmux-hosted TTY) or
 windowed GUI — drive them with keys, mouse, and elisp, and observe the
@@ -39,6 +45,61 @@ uv tool install .
 ```
 
 ## Quick start
+
+elate is a CLI — an agent drives it by running `elate …` shell commands, and
+that CLI is the full feature set. Put `elate` on PATH, hand your agent the
+usage guide, then just ask. (elate spawns real Emacs + tmux, so both must be
+installed wherever the agent runs — see [Requirements](#requirements).)
+
+**1. Install the CLI** so it's on PATH — or skip this and let the agent call
+`uvx elate …` / `pipx run elate …` straight off:
+
+```sh
+uv tool install elate     # or: pip install elate
+```
+
+**2. Give your agent the usage guide** — `elate install` copies elate's Agent
+Skill (it teaches the CLI) into each harness's skills directory:
+
+```sh
+elate install                 # auto-detect installed harnesses
+elate install codex opencode  # …or name them: claude codex opencode pi antigravity (or all)
+elate install --mcp           # also register the optional MCP server where supported
+```
+
+The skill is the same SKILL.md format Claude Code, Codex CLI, opencode, pi,
+and Antigravity all read, so one command wires them all. Add `--project` to
+install into the current repo's skills dir instead of the user-global one;
+`--dry-run` previews without writing.
+
+Claude Code users can instead install the full **plugin** — same skill plus
+the `emacs-tester` subagent and leftover-session hooks:
+
+```sh
+claude plugin marketplace add dakra/elate
+claude plugin install elate
+```
+
+**3. Ask, in your agent's own prompt:**
+
+> Use elate to start a sandboxed Emacs, load `./my-pkg.el`, run my ERT suite,
+> and show me any failures.
+
+The agent runs the start → act → observe → stop loop for you.
+
+**Shell-less harness, or want typed tools / inline GUI screenshots?** The MCP
+server is an opt-in add-on that exposes the same commands 1:1 as MCP tools —
+`elate install --mcp` registers it where supported, or wire `uvx elate mcp`
+by hand. Per-harness setup (opencode, Codex CLI, Cursor, Zed, Gemini CLI,
+Claude Desktop) is in
+[Using elate from AI harnesses](#using-elate-from-ai-harnesses).
+
+To drive elate yourself from the shell, see the [CLI tour](#cli-tour) below.
+
+## CLI tour
+
+Driving elate by hand from the shell — the same commands an agent issues
+under the hood.
 
 The examples below assume `elate` is on PATH (`pip install elate` or
 `uv tool install elate`); if you run it without installing, prepend the
@@ -701,19 +762,23 @@ Script equivalent: `elate run examples/focus-ordering.json` (self-contained).
 
 ## Using elate from AI harnesses
 
-elate is built to be driven by AI agents. Pick the integration by harness:
+elate is built to be driven by AI agents, and it's CLI-centric: the
+integration that works everywhere is the **Agent Skill**, which teaches a
+harness to drive the `elate` CLI. Pick by harness:
 
-- **Claude Code** → install the [plugin](#claude-code-plugin) (two
-  commands; bundles the Agent Skill, the `emacs-tester` subagent, and the
-  leftover-session hooks). The MCP server is an optional add-on — one
-  command, see below.
-- **Any MCP-capable harness** (Codex CLI, Cursor, Zed, Gemini CLI, Claude
-  Desktop, …) → register the [MCP server](#mcp-server): one line, and the
-  server command is the same `uvx elate mcp` everywhere.
+- **One command for most harnesses** → `elate install` copies the skill into
+  Claude Code, Codex CLI, opencode, pi, and Antigravity (they share the
+  SKILL.md format, so one command wires them all); `--mcp` also registers the
+  MCP server where supported. See [Agent Skill](#agent-skill).
+- **Claude Code** → or install the full [plugin](#claude-code-plugin) (two
+  commands): the same skill plus the `emacs-tester` subagent and the
+  leftover-session hooks.
+- **Any MCP-capable harness** (also Cursor, Zed, Gemini CLI, Claude
+  Desktop, …) → register the [MCP server](#mcp-server): the server command
+  is the same `uvx elate mcp` everywhere.
 - **Any harness with shell access** → the plain CLI is the full feature
   set; `AGENTS.md` at the repo root is the ~40-line distillation most
-  agents-md-aware tools pick up automatically, and the
-  [Agent Skill](#agent-skill) files teach the complete workflow.
+  agents-md-aware tools pick up automatically.
 
 ### Claude Code plugin
 
@@ -792,15 +857,27 @@ with it).
 elate CLI well (the act → wait → observe loop, key-delivery decision tree,
 fresh-session rules, scenario scripts) at near-zero ambient token cost:
 `SKILL.md` plus progressively-disclosed `REFERENCE.md` (generated from the
-CLI — CI fails on drift), `RECIPES.md`, and `SCRIPTING.md`. Install it
-standalone by copying or symlinking:
+CLI — CI fails on drift), `RECIPES.md`, and `SCRIPTING.md`. The same SKILL.md
+format is read by Claude Code, Codex CLI, opencode, pi, and Antigravity.
+
+`elate install` puts it in place for you — it ships inside the package, so a
+plain `pip install elate` / `uvx` install can materialize it without a
+checkout:
 
 ```sh
-ln -s "$(pwd)/skills/elate" ~/.claude/skills/elate
+elate install                 # auto-detect installed harnesses
+elate install claude codex    # …or name them (claude codex opencode pi antigravity | all)
+elate install --project       # into the current repo's skills dir, not user-global
+elate install --mcp           # also register the MCP server where supported
+elate install --dry-run all   # preview the destinations without writing
 ```
 
-Harnesses without skill support get the same distillation from `AGENTS.md`
-at the repo root.
+Per-harness skill destinations (global): Claude Code `~/.claude/skills/`,
+Codex `~/.agents/skills/`, opencode `~/.config/opencode/skills/`, pi
+`~/.pi/agent/skills/`, Antigravity `~/.gemini/skills/`. Re-run after an elate
+upgrade to refresh the copy. From a checkout you can also just symlink it
+(`ln -s "$(pwd)/skills/elate" ~/.claude/skills/elate`). Harnesses without
+skill support get the same distillation from `AGENTS.md` at the repo root.
 
 ### MCP server
 
@@ -846,6 +923,22 @@ or in `~/.codex/config.toml`:
 command = "uvx"
 args = ["elate", "mcp"]
 ```
+
+**opencode** ([MCP docs](https://opencode.ai/docs/mcp-servers/)) —
+`opencode.json` (project) or `~/.config/opencode/opencode.json` (global):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "elate": { "type": "local", "command": ["uvx", "elate", "mcp"] }
+  }
+}
+```
+
+opencode's tool-fetch timeout defaults to 5 s; a cold `uvx` resolve of elate
+can exceed that on the first connect, so add `"timeout": 30000` to the
+`elate` entry if the tools don't appear at first.
 
 **Cursor** ([MCP docs](https://cursor.com/docs/context/mcp)) —
 `.cursor/mcp.json` in the project, or `~/.cursor/mcp.json` globally:

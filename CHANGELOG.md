@@ -2,10 +2,18 @@
 
 ## 0.7.0
 
-Inject window-system focus events, ordered against mouse/key input -- so
-focus/click ordering behaviour (click-to-refocus vs click-to-select,
-paste-on-focus, input-mode switches) is testable through Emacs's real
-command loop, not just by calling handlers in isolation.
+- **`elate install`**: wire elate into AI coding harnesses with one command.
+  It copies elate's Agent Skill (the SKILL.md that teaches the CLI) into each
+  harness's skills directory — Claude Code (`~/.claude/skills`), Codex CLI
+  (`~/.agents/skills`), opencode (`~/.config/opencode/skills`), pi
+  (`~/.pi/agent/skills`), and Antigravity (`~/.gemini/skills`), which all read
+  the same SKILL.md format. With no argument it auto-detects installed
+  harnesses; name them explicitly or pass `all`. `--project` installs into the
+  current repo's skills dir; `--dry-run` previews; `--mcp` additionally
+  registers the optional MCP server where supported (shells out to
+  `claude`/`codex mcp add`; prints a paste-ready snippet for opencode and
+  Antigravity; pi has no MCP). The skill now ships **inside the wheel**, so a
+  plain `pip install elate` / `uvx` can materialize it without a checkout.
 
 - **`focus in` / `focus out`** (CLI + `elate_focus`): inject a `focus-in` /
   `focus-out` event. It runs `handle-focus-in` / `handle-focus-out` through
@@ -41,10 +49,6 @@ command loop, not just by calling handlers in isolation.
   the published tarball. The 0.6.0 sdist is withdrawn; install 0.6.1.
 
 ## 0.6.0
-
-The Claude Code plugin is CLI-first. Installing it bundles the Agent Skill,
-the `emacs-tester` subagent, and the leftover-session hooks; the MCP server
-is opt-in.
 
 - **The plugin ships no `.mcp.json`.** Drive elate through the CLI -- the
   full feature set, and what the skill teaches. Register the MCP server
@@ -86,10 +90,6 @@ is opt-in.
 
 ## 0.5.0
 
-Follow-ups from a second heavy session -- this time driving the CLI directly
-with four parallel sub-agents. Mostly discoverability and agent-CLI
-ergonomics.
-
 - **JSON by default for non-interactive use.** The CLI now emits JSON
   automatically when stdout is not a TTY (a pipe or an agent), and the human
   table on a terminal -- so programmatic callers get structured output
@@ -125,9 +125,6 @@ ergonomics.
   restarts.
 
 ## 0.4.0
-
-Follow-ups from a heavy MCP-driven session that drove a subprocess/terminal
-package (rather than a static elisp package) -- the gaps that pattern hit.
 
 - `wait stable` (CLI `wait stable --buffer B --quiet-ms N`; MCP `elate_wait`
   `condition="stable"`, `quiet_ms`): wait until a buffer's text has not
@@ -208,10 +205,6 @@ package (rather than a static elisp package) -- the gaps that pattern hit.
 
 ## 0.1.0
 
-Everything below shipped in phases on the way to 0.1; one section per phase.
-
-### Phase 1 — TTY MVP
-
 - Sandboxed sessions: fresh fake `$HOME` + XDG dirs, generated init
   (`--init-directory`), per-session server.el socket, dedicated tmux
   server with its socket inside the sandbox.
@@ -228,9 +221,6 @@ Everything below shipped in phases on the way to 0.1; one section per phase.
   timeouts), `buffer`, `messages` (cursor-based delta), `echo`,
   `screenshot` (text/ANSI), `describe`, `wait idle|text|prompt`
   (timeouts embed a state snapshot; exit 3).
-
-### Phase 2 — MCP server
-
 - `elate mcp`: stdio server, tools 1:1 with the CLI, every response
   structured JSON with an `ok` flag; errors embed a compact state
   snapshot so the model sees why.
@@ -239,9 +229,6 @@ Everything below shipped in phases on the way to 0.1; one section per phase.
   completion candidates, echo area, pending input, *Messages* tail).
 - Non-Unicode payloads sanitized centrally (`elate--encode`); tool
   bodies run off the event loop (`_threaded`); timeouts schema-bounded.
-
-### Phase 3 — GUI sessions
-
 - `--ui gui`: windowed Emacs (macOS native; Linux X11 with `--headless`
   Xvfb), PNG screenshots (`screencapture` / `import`/`xwd`), live
   `resize`, frame geometry pinning.
@@ -252,9 +239,6 @@ Everything below shipped in phases on the way to 0.1; one section per phase.
   (dead-client replies can no longer wedge the channel), E2BIG argv
   errors converted to actionable messages, identity-checked pid
   handling against reuse, GUI `type` chunked + capped.
-
-### Phase 4 — Testing & quality tooling
-
 - `test` / `elate_test`: interactive ERT runs (selector support) with
   structural per-test results (status, duration, captured messages,
   condition, trimmed backtrace); in-Emacs run timeout with partial
@@ -266,9 +250,6 @@ Everything below shipped in phases on the way to 0.1; one section per phase.
   overlay dumps; `faces-at` point queries; `popups` capture
   (which-key, transient, hydra/lv, corfu, company,
   completion-preview, child frames).
-
-### Phase 5 — Recording & CI
-
 - JSON scenario scripts: strict up-front validation, steps mirroring
   the CLI verbs plus assertions; `elate run` executes them in a fresh
   throwaway session (exit 0/1, first failure stops the run, failed
@@ -276,9 +257,6 @@ Everything below shipped in phases on the way to 0.1; one section per phase.
 - `export-script`: transcript → editable scenario; `record`: asciicast
   v2 via tmux pipe-pane; `snap`: detached periodic frame series;
   `matrix`: one script across several Emacs binaries.
-
-### Phase 6 — Polish
-
 - `profile` / `elate_profile`: Emacs's native profiler with structured
   reports — top functions (self/total + percentages) and a
   depth-limited unified calltree; one-shot `profile run FORM`.

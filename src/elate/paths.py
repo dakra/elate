@@ -23,3 +23,28 @@ def sessions_root() -> Path:
 def agent_el_path() -> Path:
     """Path to the bundled elate-agent.el."""
     return Path(__file__).resolve().parent / "elisp" / "elate-agent.el"
+
+
+def _bundled_or_repo(rel: str) -> Path:
+    """Resolve a packaged data path, tolerating editable/dev checkouts.
+
+    A built wheel carries the file under ``elate/_bundled/<rel>`` (see the
+    force-include in pyproject.toml). An editable install / `uv run` from a
+    checkout does not, so fall back to the canonical copy at the repo root,
+    which sits two levels above this package (``src/elate`` -> repo).
+    """
+    bundled = Path(__file__).resolve().parent / "_bundled" / rel
+    if bundled.exists():
+        return bundled
+    repo_root = Path(__file__).resolve().parents[2]
+    dev = repo_root / rel
+    if dev.exists():
+        return dev
+    raise FileNotFoundError(
+        f"bundled resource {rel!r} not found (looked in {bundled} and {dev}); "
+        "the install may be incomplete")
+
+
+def skill_dir() -> Path:
+    """Directory of the bundled elate Agent Skill (SKILL.md + companions)."""
+    return _bundled_or_repo("skills/elate")

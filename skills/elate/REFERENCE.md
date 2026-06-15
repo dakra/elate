@@ -52,6 +52,7 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 - [`elate record`](#elate-record)
 - [`elate snap`](#elate-snap)
 - [`elate matrix`](#elate-matrix)
+- [`elate install`](#elate-install)
 
 ## elate start
 
@@ -371,3 +372,14 @@ Run SCRIPT once per Emacs binary, each in a fresh session, and aggregate the per
 - `--update-snapshots` -- write/overwrite golden snapshots (per Emacs version) instead of comparing
 - `--snapshot-dir DIR` -- base directory for golden snapshots (default: <scenario-dir>/__snapshots__)
 - `script` -- path to the scenario file (JSON)
+
+## elate install
+
+install the elate skill into AI coding harnesses
+
+Copy elate's Agent Skill (SKILL.md) into one or more AI coding harnesses so they learn to drive the elate CLI. Targets: claude, codex, opencode, pi, antigravity (or 'all'). With no target, installs for every harness detected on this machine. The skill is the CLI-centric integration that works everywhere; --mcp additionally registers the optional MCP server where it is supported.
+
+- `[HARNESS]` (repeatable) -- harness(es) to install for: claude codex opencode pi antigravity or 'all' (default: auto-detect)
+- `--project` -- install into the current project's skills dir (e.g. .claude/skills) instead of the user-global one
+- `--mcp` -- also wire the MCP server: `mcp add` where the harness has that CLI (Claude Code, Codex), a paste-ready snippet otherwise (opencode, Antigravity); pi has no MCP
+- `--dry-run` -- show what would be installed without writing anything

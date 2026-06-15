@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import __version__, session as S
+from . import __version__, install, session as S
 from .errors import ElateError, EvalTimeout, RpcError, UsageError, WaitTimeout
 
 
@@ -568,6 +568,31 @@ def build_parser() -> argparse.ArgumentParser:
                     help="base directory for golden snapshots "
                          "(default: <scenario-dir>/__snapshots__)")
     sp.add_argument("script", help="path to the scenario file (JSON)")
+
+    sp = sub.add_parser(
+        "install",
+        help="install the elate skill into AI coding harnesses",
+        description="Copy elate's Agent Skill (SKILL.md) into one or more AI "
+                    "coding harnesses so they learn to drive the elate CLI. "
+                    "Targets: " + ", ".join(install.HARNESS_KEYS) + " (or "
+                    "'all'). With no target, installs for every harness "
+                    "detected on this machine. The skill is the CLI-centric "
+                    "integration that works everywhere; --mcp additionally "
+                    "registers the optional MCP server where it is supported.")
+    sp.add_argument("harness", nargs="*", metavar="HARNESS",
+                    help="harness(es) to install for: "
+                         + " ".join(install.HARNESS_KEYS) + " or 'all' "
+                         "(default: auto-detect)")
+    sp.add_argument("--project", action="store_true",
+                    help="install into the current project's skills dir "
+                         "(e.g. .claude/skills) instead of the user-global one")
+    sp.add_argument("--mcp", action="store_true",
+                    help="also wire the MCP server: `mcp add` where the "
+                         "harness has that CLI (Claude Code, Codex), a "
+                         "paste-ready snippet otherwise (opencode, "
+                         "Antigravity); pi has no MCP")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="show what would be installed without writing anything")
 
     return p
 
@@ -1688,6 +1713,16 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
             "\n".join(lines), 0 if success else 1)
 
 
+def cmd_install(args: argparse.Namespace) -> Result:
+    result = install.run_install(
+        args.harness,
+        project=args.project,
+        with_mcp=args.mcp,
+        dry_run=args.dry_run,
+    )
+    return result, install.format_summary(result), 0
+
+
 _COMMANDS = {
     "start": cmd_start,
     "stop": cmd_stop,
@@ -1721,6 +1756,7 @@ _COMMANDS = {
     "record": cmd_record,
     "snap": cmd_snap,
     "matrix": cmd_matrix,
+    "install": cmd_install,
 }
 
 
