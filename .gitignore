@@ -1,14 +1,10 @@
-# Python
 __pycache__/
 *.py[co]
 .venv/
 dist/
 build/
 *.egg-info/
-
-# Tooling state
+.env
 .pytest_cache/
 .claude/scheduled_tasks.lock
-
-# Byte-compiled elisp (the agent ships as source)
 *.elc

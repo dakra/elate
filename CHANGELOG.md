@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.1
+
+- **Packaging fix:** the sdist now ships a default-deny `only-include`
+  allowlist (`[tool.hatch.build.targets.sdist]`). Hatchling's default sdist
+  includes everything not matched by `.gitignore` and does not read
+  `.git/info/exclude`, so untracked-but-uncommitted files were being swept into
+  the published tarball. The 0.6.0 sdist is withdrawn; install 0.6.1.
+
 ## 0.6.0
 
 The Claude Code plugin is CLI-first. Installing it bundles the Agent Skill,
