@@ -672,8 +672,9 @@ and the [Clean-install sessions](#clean-install-sessions) section.
 elate is built to be driven by AI agents. Pick the integration by harness:
 
 - **Claude Code** → install the [plugin](#claude-code-plugin) (two
-  commands; bundles the Agent Skill and the MCP server — everything below
-  in one step).
+  commands; bundles the Agent Skill, the `emacs-tester` subagent, and the
+  leftover-session hooks). The MCP server is an optional add-on — one
+  command, see below.
 - **Any MCP-capable harness** (Codex CLI, Cursor, Zed, Gemini CLI, Claude
   Desktop, …) → register the [MCP server](#mcp-server): one line, and the
   server command is the same `uvx elate mcp` everywhere.
@@ -685,7 +686,9 @@ elate is built to be driven by AI agents. Pick the integration by harness:
 ### Claude Code plugin
 
 The repo doubles as a Claude Code plugin (and hosts its own marketplace),
-bundling the Agent Skill and the MCP server below. Install in two commands:
+bundling the Agent Skill, the `emacs-tester` subagent, and the
+leftover-session hooks; the MCP server below is an optional add-on.
+Install in two commands:
 
 ```sh
 claude plugin marketplace add dakra/elate
@@ -696,13 +699,14 @@ You get:
 
 - the **skill**, namespaced as `/elate:elate` — triggers organically
   whenever the model needs to test-drive or debug Emacs Lisp;
-- the **MCP server**, auto-registered from the plugin's `.mcp.json` as
-  `uvx elate mcp` (always the latest PyPI release — the plugin clone stays
-  a thin config layer with no environment of its own). The first connect
-  may take a few seconds while `uvx` resolves elate from PyPI on a cold
-  cache. After `claude plugin update`, the running MCP server keeps the old
-  version until the client restarts, while the CLI (`uvx`/`uv tool`) picks
-  up the new release immediately — so mid-session the CLI is the live path;
+- **optionally, the MCP server** — the plugin is CLI-first; register the
+  server yourself if you want typed tools for a shell-less flow or inline
+  GUI screenshots: `claude mcp add elate -- uvx elate mcp` (always the
+  latest PyPI release; the first connect may lag a few seconds while `uvx`
+  resolves elate on a cold cache). After `claude plugin update`, a running
+  server keeps the old version until the client restarts, while the CLI
+  (`uvx`/`uv tool`) picks up the new release immediately — so mid-session
+  the CLI is the live path;
 - the **`emacs-tester` subagent** (`agents/emacs-tester.md`, invokable as
   `elate:emacs-tester`) — a test pilot preloaded with the skill, for
   delegating long interactive test-drives out of the main context; it
@@ -720,22 +724,10 @@ You get:
   cache), so sessions driven exclusively through `uv run` inside a
   checkout are invisible to them.
 
-Two notes on `.mcp.json`:
-
-- **Dual role:** because the repo root is also the plugin root, the same
-  `.mcp.json` acts as *project-scope* MCP config for anyone opening this
-  repo in Claude Code. That is fine — project-scope servers always require
-  per-user approval before they run. Two consequences: the project-scope
-  server runs the **latest PyPI release, not your checkout** — when hacking
-  on elate, register the checkout command from the
-  [MCP server](#mcp-server) section instead. And a maintainer with the
-  plugin installed who opens this repo gets **two** elate servers (project
-  `elate` plus `plugin:elate:elate`, 50 tools with ambiguous names) —
-  approve/enable at most one.
-- **Offline / pinned setups:** to run the MCP server from the plugin clone
-  itself instead of PyPI, change the server entry to
-  `uv run --directory ${CLAUDE_PLUGIN_ROOT} elate mcp`
-  (JSON has no comments, so this fallback lives here).
+The MCP server is opt-in: the plugin ships no `.mcp.json`, so register it
+explicitly when you want it — `claude mcp add elate -- uvx elate mcp`. To
+run it from a checkout or a pinned clone instead of the latest PyPI
+release, use `uv run --directory /path/to/elate elate mcp` as the command.
 
 **Pinned (reproducible) installs:** `marketplace add dakra/elate` serves
 GitHub HEAD, updating whenever the version label bumps. To pin instead,
@@ -785,8 +777,9 @@ right fit for harnesses without shell access, and for GUI screenshots
 returned inline as images. The server command is the same in every
 harness: `uvx elate mcp`. Registration per harness:
 
-**Claude Code** ([MCP docs](https://code.claude.com/docs/en/mcp)) —
-plugin users skip this, the plugin already registers the server:
+**Claude Code** ([MCP docs](https://code.claude.com/docs/en/mcp)) — the
+plugin is CLI-first and doesn't bundle this; run it if you want the MCP
+tools:
 
 ```sh
 claude mcp add elate -- uvx elate mcp

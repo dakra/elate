@@ -327,7 +327,7 @@ jobs:
         run: |
           claude plugin marketplace add "$PWD"
           claude plugin install elate@elate
-          for f in .claude-plugin/plugin.json .mcp.json \
+          for f in .claude-plugin/plugin.json \
                    skills/elate/SKILL.md skills/elate/REFERENCE.md \
                    agents/emacs-tester.md hooks/hooks.json \
                    hooks/check-running.sh; do

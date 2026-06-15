@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.0
+
+The Claude Code plugin is CLI-first. Installing it bundles the Agent Skill,
+the `emacs-tester` subagent, and the leftover-session hooks; the MCP server
+is opt-in.
+
+- **The plugin ships no `.mcp.json`.** Drive elate through the CLI -- the
+  full feature set, and what the skill teaches. Register the MCP server
+  explicitly when you want typed tools for a shell-less harness or inline
+  GUI screenshots: `claude mcp add elate -- uvx elate mcp`. Keeping it
+  opt-in keeps the plugin's tools out of every turn's context until you ask
+  for them, and avoids a second project-scope `elate` server when you open
+  the repo in Claude Code.
+
 ## 0.5.0
 
 Follow-ups from a second heavy session -- this time driving the CLI directly

@@ -4,9 +4,13 @@ Pure filesystem/unit tests -- no Emacs, tmux, or `claude` CLI needed.
 They pin the cross-file invariants the plugin relies on: one version
 everywhere (pyproject == plugin.json == marketplace.json), one name
 everywhere (plugin namespacing /elate:elate requires plugin name ==
-skills/ directory name), the .mcp.json launch command the docs promise
-(`uvx elate mcp`), and marketplace metadata that matches both
-plugin.json and pyproject's [project.urls].
+skills/ directory name), the `uvx elate mcp` launch command the docs
+promise for the opt-in MCP server, and marketplace metadata that matches
+both plugin.json and pyproject's [project.urls].
+
+The plugin is CLI-first: it ships NO `.mcp.json`, so installing it does
+not auto-register an MCP server (users opt in with `claude mcp add elate
+-- uvx elate mcp`). The README must keep documenting that command.
 
 Schema note (verified against `claude plugin validate` 2.1.175): the
 marketplace manifest wants top-level `name` + `owner`. The plugin source
@@ -27,7 +31,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 PLUGIN_MANIFEST = REPO / ".claude-plugin" / "plugin.json"
 MARKETPLACE = REPO / ".claude-plugin" / "marketplace.json"
-MCP_CONFIG = REPO / ".mcp.json"
+README = REPO / "README.md"
 PYPROJECT = REPO / "pyproject.toml"
 AGENT = REPO / "agents" / "emacs-tester.md"
 HOOKS_JSON = REPO / "hooks" / "hooks.json"
@@ -63,9 +67,19 @@ def _pyproject() -> dict:
 
 
 def test_manifests_are_valid_json():
-    for path in (PLUGIN_MANIFEST, MARKETPLACE, MCP_CONFIG):
+    for path in (PLUGIN_MANIFEST, MARKETPLACE):
         assert path.is_file(), f"missing {path}"
         _load(path)
+
+
+def test_no_mcp_json_so_the_plugin_is_cli_first():
+    """The plugin deliberately ships no `.mcp.json`: the MCP server is
+    opt-in (`claude mcp add elate -- uvx elate mcp`). A root `.mcp.json`
+    would auto-register it on install and, since the repo root is also the
+    plugin root, add a project-scope server whenever the repo is opened."""
+    assert not (REPO / ".mcp.json").exists(), (
+        "the plugin is CLI-first; drop the `.mcp.json` and keep the MCP "
+        "server opt-in via the documented `claude mcp add` command")
 
 
 def test_versions_are_in_sync():
@@ -109,16 +123,16 @@ def test_plugin_name_is_the_namespace():
         f"plugin name {plugin['name']!r} has no matching skills/ dir")
 
 
-def test_mcp_json_launches_uvx_elate_mcp():
-    """README + plugin docs promise `uvx elate mcp`; pin the exact shape."""
-    config = _load(MCP_CONFIG)
-    assert set(config) == {"mcpServers"}
-    servers = config["mcpServers"]
-    assert set(servers) == {"elate"}
-    server = servers["elate"]
-    assert server["type"] == "stdio"
-    assert server["command"] == "uvx"
-    assert server["args"] == ["elate", "mcp"]
+def test_readme_documents_the_opt_in_mcp_command():
+    """With no `.mcp.json`, the README is the only place that carries the
+    server launch command; the opt-in instructions must not rot. The
+    command is the same `uvx elate mcp` everywhere, added via
+    `claude mcp add elate -- uvx elate mcp` in Claude Code."""
+    text = README.read_text(encoding="utf-8")
+    assert "uvx elate mcp" in text, (
+        "README must keep the `uvx elate mcp` server command")
+    assert "claude mcp add elate -- uvx elate mcp" in text, (
+        "README must document the Claude Code opt-in command")
 
 
 def test_marketplace_source_is_same_repo_relative():

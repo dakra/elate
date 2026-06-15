@@ -20,9 +20,9 @@ observation over them. Run it with `uvx elate …` (PyPI; no install step),
 or `uv tool install elate` once to put `elate` on `PATH` (handy when many
 sub-agents each shell out). In a checkout of the elate repo itself, use
 `uv run elate …` instead. After `claude plugin update`, the CLI (`uvx`/`uv
-run`) is already on the new version while the registered MCP server stays
-on the old one until the client restarts — so mid-session the CLI is the
-live path.
+run`) is already on the new version while a registered MCP server (if you
+enabled one) stays on the old one until the client restarts — so
+mid-session the CLI is the live path.
 
 Supporting files (read on demand):
 - [REFERENCE.md](REFERENCE.md) — every command, option, default (generated from the CLI)
