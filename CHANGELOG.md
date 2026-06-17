@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.9.0
+
+Crash, hang, and lifecycle handling for heavy parallel / fuzz-testing runs,
+plus detection of a tiling window manager resizing a GUI frame.
+
+- **Crash & death reporting**: when a session's Emacs dies, `eval` returns
+  `session_died: true` with the fatal `signal` and the OS `crash_report` path
+  instead of an opaque transport error; `wait dead` blocks until the session
+  exits and returns the same; and `info`/`list` show a dead session's signal
+  (rendered `dead (SIGABRT)`). The signal is grepped from the Emacs stderr log
+  (so it appears even before the OS writes a report), and the macOS `.ips`
+  report is attributed by matching the recorded pid — correct even when several
+  sandboxed Emacsen crash in parallel.
+
+- **`eval --on-timeout sample`** (CLI + `elate_eval` `on_timeout`): on a timeout
+  with Emacs still busy, capture a thread backtrace of the wedged process
+  (macOS `sample`; Linux `eu-stack`/`gdb`) and attach it to the error as
+  `sample` — the fastest way to see *where* a hang is stuck.
+
+- **`elate logs`** (alias `stderr`; CLI + `elate_logs`): tail the driven
+  Emacs's stderr — native-module panics, GC/native-comp warnings, and the
+  fatal-signal line on a crash. TTY sessions now capture Emacs's stderr to a
+  file (off the tmux pane, so screenshots stay clean); GUI sessions log
+  stdout+stderr. Works on dead and stopped sessions too.
+
+- **GUI orphan reaping**: a GUI session's Emacs leads its own process group, so
+  a subprocess it backgrounds is now killed at `stop`/`purge` (filtered by
+  start time, so a recycled process group is never touched). `list`/`info` flag
+  a live session's leaked descendants as `orphans`.
+
+- **Lifecycle ergonomics for parallel runs**: `stop` is idempotent (stopping a
+  missing session is a no-op success) and gains `--all` to stop every running
+  session; `start` auto-generates a name when `--name` is omitted and gains
+  `--replace` to recreate a live session in place; `list --older-than DUR`
+  previews stale sandboxes; `prune` is an alias for `purge`.
+
+- **Window-manager resize detection**: a GUI frame resized out from under the
+  requested size (a tiling WM such as AeroSpace/yabai/Amethyst) is reported as
+  a `wm_warning` from `start`/`resize`; the frame is titled `elate:<session>`
+  so the WM can be configured to float just elate's windows (see the README).
+
 ## 0.8.0
 
 - **`elate interrupt`** (CLI + `elate_interrupt`): unblock a wedged-but-alive

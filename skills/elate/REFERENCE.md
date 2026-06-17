@@ -23,6 +23,7 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 - [`elate interrupt`](#elate-interrupt)
 - [`elate list`](#elate-list)
 - [`elate purge`](#elate-purge)
+- [`elate prune`](#elate-prune)
 - [`elate info`](#elate-info)
 - [`elate keys`](#elate-keys)
 - [`elate type`](#elate-type)
@@ -47,6 +48,8 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 - [`elate describe`](#elate-describe)
 - [`elate mcp`](#elate-mcp)
 - [`elate screenshot`](#elate-screenshot)
+- [`elate logs`](#elate-logs)
+- [`elate stderr`](#elate-stderr)
 - [`elate wait`](#elate-wait)
 - [`elate run`](#elate-run)
 - [`elate export-script`](#elate-export-script)
@@ -59,7 +62,8 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 
 start a new sandboxed session
 
-- `--name NAME` (required)
+- `--name NAME` -- session name (default: an auto-generated elate-<hex>; the chosen name is in the result, so later commands can reference it)
+- `--replace` -- if a session of this name is already running, stop and recreate it (dead/stopped sessions of that name are always replaced)
 - `--ui {tty,gui}` (default: tty) -- session UI: tty (tmux-hosted terminal Emacs, default) or gui (windowed Emacs; PNG screenshots)
 - `--headless` -- GUI only: run under a private Xvfb (Linux/CI)
 - `--emacs PATH` -- emacs binary to use
@@ -74,9 +78,10 @@ start a new sandboxed session
 
 ## elate stop
 
-stop a session
+stop a session (or --all)
 
 - `[name]` -- session name (or use -s NAME)
+- `--all` -- stop every running session (instead of a name)
 
 ## elate interrupt
 
@@ -93,6 +98,7 @@ list known sessions
 
 - `[name]` -- only this session (or use -s NAME)
 - `--status {running,stopped,all}` (default: all) -- filter by liveness: running, stopped (stopped/dead/corrupt), or all (default)
+- `--older-than DUR` -- only show sessions inert at least this long (e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- running sessions are excluded; pairs with `purge --stopped-older-than`
 
 ## elate purge
 
@@ -103,6 +109,16 @@ Delete the sandbox directories (transcripts included) of sessions that are no lo
 - `[NAME]` (repeatable) -- session to purge (repeatable)
 - `--all` -- purge every session that is not running
 - `--stopped-older-than DUR` -- only purge sessions inert at least this long (e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- keeps just-stopped sandboxes during heavy runs
+
+## elate prune
+
+alias for `purge` (delete stopped/dead sandboxes)
+
+Alias for `purge`: delete the sandbox directories of sessions that are no longer running. `purge` is the canonical spelling; `prune` exists for discoverability.
+
+- `[NAME]` (repeatable) -- session to prune (repeatable)
+- `--all` -- prune every session that is not running
+- `--stopped-older-than DUR` -- only prune sessions inert at least this long (e.g. 30s, 15m, 2h, 1d; bare number = seconds)
 
 ## elate info
 
@@ -203,6 +219,7 @@ evaluate an elisp form
 - `form`
 - `--timeout SECS` (default: 15)
 - `--backtrace` -- on error, also return structured backtrace frames (each frame's function + printed args), not just the rendered backtrace string
+- `--on-timeout {none,sample}` (default: none) -- on timeout with Emacs still busy: 'sample' captures a thread backtrace of the wedged Emacs (macOS `sample`; Linux eu-stack/gdb) and attaches it to the error; 'none' (default) does not
 
 ## elate trace
 
@@ -321,12 +338,28 @@ capture the screen: text for tty sessions, PNG for gui sessions
 - `-o, --output FILE` -- output file (tty default: stdout; gui default: ./elate-<session>-<time>.png)
 - `--ansi` -- tty only: include ANSI color escapes
 
+## elate logs
+
+tail the driven Emacs's stderr/stdout log
+
+Show the tail of the Emacs process log -- module panics, GC/native-comp warnings, and the fatal-signal line on a crash. TTY sessions capture stderr to a file (off the pane, so screenshots stay clean); GUI sessions log stdout+stderr. Works on dead/stopped sessions too.
+
+- `[name]` -- session name (or use -s NAME)
+- `-n, --lines N` (default: 40) -- number of trailing lines to show (default 40)
+
+## elate stderr
+
+Show the tail of the Emacs process log -- module panics, GC/native-comp warnings, and the fatal-signal line on a crash. TTY sessions capture stderr to a file (off the pane, so screenshots stay clean); GUI sessions log stdout+stderr. Works on dead/stopped sessions too.
+
+- `[name]` -- session name (or use -s NAME)
+- `-n, --lines N` (default: 40) -- number of trailing lines to show (default 40)
+
 ## elate wait
 
 wait for a condition (exit 3 on timeout)
 
-- `{idle,text,prompt,stable}`
-- `[args]` (repeatable) -- idle: [MIN_IDLE_SECS]; text: REGEXP (Python regex syntax, not elisp); prompt/stable: none
+- `{idle,text,prompt,stable,dead}`
+- `[args]` (repeatable) -- idle: [MIN_IDLE_SECS]; text: REGEXP (Python regex syntax, not elisp); prompt/stable/dead: none
 - `--buffer BUFFER` -- buffer to search (wait text) or watch (wait stable); may not exist yet
 - `--quiet-ms MS` (default: 300) -- wait stable: settle threshold -- the buffer must be unchanged for this many ms (default 300)
 - `--timeout SECS` (default: 10)

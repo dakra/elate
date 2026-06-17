@@ -30,9 +30,11 @@ from pydantic import Field
 from . import session as S
 from .errors import (
     ElateError,
+    EvalTimeout,
     RpcError,
     ScreenshotError,
     SessionNotFound,
+    TransportError,
     WaitTimeout,
 )
 
@@ -121,6 +123,8 @@ def _fail(exc: Exception, sess: S.Session | None = None) -> str:
     payload: dict[str, Any] = {"ok": False, "error": message}
     if isinstance(exc, RpcError) and exc.backtrace:
         payload["backtrace"] = exc.backtrace
+    if isinstance(exc, EvalTimeout) and getattr(exc, "sample", None):
+        payload["sample"] = exc.sample
     if isinstance(exc, ScreenshotError):
         payload["reason"] = exc.reason
     # State dumps are {"state": ..., "screen_tail": ...}; spread them so
@@ -215,6 +219,10 @@ def elate_start(
         = None,
     size: Annotated[str, Field(description=(
         "Terminal size as COLSxROWS, e.g. '120x36'."))] = "120x36",
+    replace: Annotated[bool, Field(description=(
+        "If a session of this name is already running, stop and recreate it "
+        "(dead/stopped sessions of that name are always replaced). Without "
+        "this, starting over a live session is an error."))] = False,
 ) -> str:
     """Start a new sandboxed Emacs session (TTY or GUI).
 
@@ -248,9 +256,15 @@ def elate_start(
             rows=int(m.group(2)),
             ui=ui,
             headless=headless,
+            replace=replace,
         )
         sess.log("mcp-start", name=name, via="mcp")
-        return _ok(S.session_info(sess.name))
+        info = S.session_info(sess.name)
+        if sess.ui == "gui":
+            wm_warning = S.gui_wm_warning(sess)
+            if wm_warning:
+                info["wm_warning"] = wm_warning
+        return _ok(info)
     except Exception as exc:
         return _fail(exc)
 
@@ -696,6 +710,11 @@ def elate_eval(
         "On error, also return structured 'frames' (each: function name + "
         "printed args) alongside the rendered 'backtrace' string. Off by "
         "default to keep replies small."))] = False,
+    on_timeout: Annotated[Literal["none", "sample"], Field(description=(
+        "On timeout with Emacs still busy: 'sample' captures a thread "
+        "backtrace of the wedged Emacs (macOS `sample`; Linux eu-stack/gdb) "
+        "and attaches it to the error as 'sample'; 'none' (default) does "
+        "not."))] = "none",
 ) -> str:
     """Evaluate elisp in the session; the precision instrument.
 
@@ -704,7 +723,9 @@ def elate_eval(
     backtrace=true, also structured "frames"). Values longer than 64 KiB
     come back with truncated=true and the full value-length -- narrow your
     form instead of re-fetching. The form runs in the live interactive
-    Emacs (not batch), so UI side effects are real.
+    Emacs (not batch), so UI side effects are real. If a form crashes the
+    session, the response carries session_died=true plus the signal and
+    crash_report path instead of an opaque transport error.
     """
     sess = None
     try:
@@ -721,6 +742,20 @@ def elate_eval(
                 pass
             return _json(payload)
         return _ok(data)
+    except EvalTimeout as exc:
+        if on_timeout == "sample" and sess is not None and sess.is_busy():
+            from . import diagnostics
+            exc.sample = diagnostics.sample_process(sess.emacs_pid)
+        return _fail(exc, sess)
+    except TransportError as exc:
+        # Socket gone mid-eval: usually the form crashed Emacs. Report the
+        # death (signal + crash report) instead of the raw transport error.
+        if sess is not None and S.died_during(sess):
+            enrich = S.crash_enrichment(sess)
+            sess.log("eval-died", **enrich, via="mcp")
+            return _json({"ok": False, "session_died": True,
+                          "error": S.death_message(enrich), **enrich})
+        return _fail(exc, sess)
     except Exception as exc:
         return _fail(exc, sess)
 
@@ -1405,8 +1440,8 @@ def elate_echo(
 @_threaded
 def elate_wait(
     session: Annotated[str, Field(description="Session name.")],
-    condition: Annotated[Literal["idle", "text", "prompt", "stable"], Field(
-        description=(
+    condition: Annotated[Literal["idle", "text", "prompt", "stable", "dead"],
+                         Field(description=(
         "'stable': BUFFER's text stopped changing for quiet_ms ms -- the "
         "right wait for subprocess/REPL output (comint, compilation, "
         "terminal, async LSP); this is usually what you want, not 'idle'. "
@@ -1415,7 +1450,9 @@ def elate_wait(
         "says nothing about whether buffer OUTPUT finished). 'text': a "
         "pattern appeared in a buffer -- use to await known output. "
         "'prompt': a minibuffer prompt became active -- use after keys "
-        "that should ask a question."))],
+        "that should ask a question. 'dead': the session's Emacs exited -- "
+        "returns died=true with the signal and crash_report; use to confirm "
+        "an expected crash."))],
     pattern: Annotated[str | None, Field(description=(
         "For condition='text': a PYTHON regular expression (not elisp "
         "syntax) matched against the buffer text."))] = None,
@@ -1441,13 +1478,17 @@ def elate_wait(
     """
     sess = None
     try:
-        sess = _load(session)
+        # 'dead' waits for the opposite of liveness, so it must not require
+        # a live session up front.
+        sess = _load(session, require_alive=(condition != "dead"))
         # min_idle/quiet_ms must be logged or the transcript->script
         # exporter would silently lose them from replayed waits.
         sess.log("wait", condition=condition, pattern=pattern, buffer=buffer,
                  min_idle=min_idle, quiet_ms=quiet_ms, timeout=timeout,
                  via="mcp")
-        if condition == "idle":
+        if condition == "dead":
+            data = S.wait_dead(sess, timeout=timeout)
+        elif condition == "idle":
             data = S.wait_idle(sess, min_idle=min_idle, timeout=timeout)
         elif condition == "text":
             if not pattern:
@@ -1498,6 +1539,36 @@ def elate_describe(
         data = sess.semantic().rpc("describe", kind, name)
         sess.log("describe", kind=kind, name=name, via="mcp")
         return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_READONLY)
+@_threaded
+def elate_logs(
+    session: Annotated[str, Field(description="Session name.")],
+    lines: Annotated[int, Field(ge=1, le=1000, description=(
+        "Number of trailing lines to show (default 40)."))] = 40,
+) -> str:
+    """Tail the driven Emacs's stderr/stdout log.
+
+    Surfaces what does not reach the screen: native-module panics, GC and
+    native-comp warnings, and the fatal-signal line a crash prints. TTY
+    sessions capture Emacs's stderr to a file (kept off the pane, so
+    screenshots stay clean); GUI sessions log stdout+stderr together.
+    Works on dead and stopped sessions too -- the log outlives the Emacs,
+    so this is the right tool to read why a session crashed (pair it with
+    elate_info's signal/crash_report).
+    """
+    sess = None
+    try:
+        from . import gui
+
+        sess = _load(session, require_alive=False)
+        text = gui.log_tail(sess.emacs_log_path, lines=lines)
+        sess.log("logs", lines=lines, ui=sess.ui, via="mcp")
+        return _ok({"path": str(sess.emacs_log_path), "ui": sess.ui,
+                    "lines": lines, "log": text})
     except Exception as exc:
         return _fail(exc, sess)
 

@@ -41,7 +41,11 @@ uvx elate stop s                              # ALWAYS stop your sessions when d
 
 Rules that prevent the most common mistakes:
 - **Always name sessions** (`--name`), always `elate stop NAME` when done.
-  `elate list` shows leftovers; stop them.
+  `elate list` shows leftovers; stop them. `start` without `--name`
+  auto-generates an `elate-<hex>` name (returned in the result); `start
+  --name X --replace` stops and recreates a live `X`. `stop` is idempotent
+  (stopping a missing session is a no-op success), and `stop --all` stops
+  every running session at once.
 - Most commands need `-s NAME` **before** the subcommand: `elate -s s eval …`.
 - The sandbox `$HOME` is fake: create fixture files via `eval`
   (`(with-temp-file "~/f" …)`) so nothing touches the real home. There is
@@ -88,7 +92,9 @@ Never sleep-and-poll. Never assume an effect happened — observe it.
    window layout, minibuffer prompt + completions, echo area, active popup
    kinds, *Messages* tail). When confused, run `state` first — it almost
    always explains what happened. Targeted reads: `buffer`, `messages`
-   (delta since last call), `echo`, `popups`, `screenshot`.
+   (delta since last call), `echo`, `popups`, `screenshot`, and `logs`
+   (the Emacs stderr tail — module panics, GC/native-comp warnings, the
+   fatal-signal line on a crash; works on dead/stopped sessions too).
 
 ## Key delivery: which mode when
 
@@ -161,6 +167,14 @@ uvx elate -s s eval '(my-fn 42)' --timeout 5
 - Predicates often return a truthy *value*, not `t`: `(process-live-p p)`
   yields the status tail `(run open listen connect stop)`, not `t`. Wrap
   with `(and … t)` (or `(if … t nil)`) when you want a clean boolean back.
+- If a still-busy timeout needs *where* it is stuck, add `--on-timeout
+  sample`: it attaches a thread backtrace of the wedged Emacs (macOS
+  `sample`; Linux eu-stack/gdb) to the timeout error as `sample`.
+- If a form **crashes** Emacs, `eval` returns `session_died: true` with the
+  fatal `signal` and the OS `crash_report` path (instead of an opaque
+  transport error). `wait dead` blocks until the session exits and returns
+  the same; `info`/`list` show a dead session's signal (e.g. `dead
+  (SIGABRT)`). Read the stderr with `logs`.
 
 ## Verify rendering structurally, not by eyeballing
 
@@ -276,8 +290,9 @@ images** instead of PNG files to read. If `elate_*` MCP tools are already
 available in your session (someone registered the server — the plugin is
 CLI-first and does not register it for you), use them directly — do **not**
 register a duplicate; otherwise register it with
-`claude mcp add elate -- uvx elate mcp`. The 29 `elate_*` tools cover the core surface (`attach`, `resize`,
-`export-script`, `snap`, `matrix`, and `install` stay CLI-only); sessions are shared
+`claude mcp add elate -- uvx elate mcp`. The 30 `elate_*` tools cover the core surface (`attach`, `resize`,
+`prune`, `stderr`, `export-script`, `snap`, `matrix`, and `install` stay CLI-only); `prune`
+aliases `purge` and `stderr` aliases `logs`. Sessions are shared
 between both (same names, same sandboxes), so you can mix.
 
 ## Cleanup checklist (always)
@@ -291,7 +306,9 @@ dead pane for post-mortem `screenshot` until stopped. A stopped session's
 sandbox dir — and its `stopped` entry in `elate list` (which shows each
 one's idle age) — stays behind on purpose (transcripts outlive the Emacs).
 Stopped sandboxes are inert; when the transcripts are no longer needed,
-`elate purge NAME…` (or `elate purge --all`) deletes them — purge never
-touches a running session. During a long parallel run, GC only the stale
-ones with `elate purge --all --stopped-older-than 1h`. Sandboxes live
-under `~/.cache/elate/sessions/<name>` (`$ELATE_HOME` overrides the base).
+`elate purge NAME…` (or `elate purge --all`; `prune` is the same command)
+deletes them — purge never touches a running session. During a long
+parallel run, GC only the stale ones with `elate purge --all
+--stopped-older-than 1h`, and preview which they are with `elate list
+--older-than 1h`. Sandboxes live under `~/.cache/elate/sessions/<name>`
+(`$ELATE_HOME` overrides the base).

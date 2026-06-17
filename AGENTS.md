@@ -15,8 +15,11 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   subcommand. Stopped sessions keep an inert sandbox (and a `stopped`
   list entry) at `~/.cache/elate/sessions/<name>` for their transcripts —
   `elate purge NAME…`/`elate purge --all` deletes them (never running
-  sessions); `elate purge --all --stopped-older-than 1h` GCs only stale
-  ones (`elate list` shows each stopped session's idle age).
+  sessions; `prune` is an alias); `elate purge --all --stopped-older-than
+  1h` GCs only stale ones (`elate list --older-than 1h` previews them).
+  `start` auto-names when `--name` is omitted; `start --name X --replace`
+  recreates a live `X`; `stop` is idempotent (missing session = no-op) and
+  `stop --all` stops every running session.
 - The loop is **act → wait → observe**: `keys`/`type`/`mouse`/`eval`/
   `send-process` (and `focus`/`send-events` for window-system focus events,
   ordered against clicks/keys), then `wait stable --buffer B --quiet-ms N`
@@ -40,6 +43,11 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
 - Eval forms don't run in the selected window's buffer — wrap
   buffer-mutating forms in `(with-current-buffer …)`. Output truncates at
   64 KiB. `wait text` patterns are **Python** regexps, not elisp.
+- Crashes/hangs: a form that crashes Emacs comes back as `session_died`
+  with the fatal `signal` + OS `crash_report` path (also via `wait dead` /
+  `info` / `list`, which renders `dead (SIGABRT)`); `eval --on-timeout
+  sample` attaches a thread backtrace of a still-wedged Emacs; `logs`
+  (alias `stderr`) tails the Emacs stderr, including the fatal-signal line.
 - Sandbox `$HOME` is fake. For files a **subprocess** needs at spawn (shell
   rc files), `start --home-seed DIR` copies a fixture tree in before launch.
   Startup forms run before `emacs-startup-hook`: inline `--eval`, or reuse

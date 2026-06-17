@@ -59,13 +59,22 @@ _MINIMAL_DEFAULTS = """\
 """
 
 
-def _frame_geometry_forms(cols: int, rows: int) -> list[str]:
-    """Elisp pinning the initial GUI frame to COLS x ROWS characters."""
+def _frame_geometry_forms(cols: int, rows: int,
+                          title: str | None = None) -> list[str]:
+    """Elisp pinning the initial GUI frame to COLS x ROWS characters.
+
+    With TITLE, also set frame-title-format so a tiling window manager can
+    recognize elate's frame (and be told to float it) -- see the README
+    section on tiling window managers.
+    """
     geometry = f"'((width . {cols}) (height . {rows}))"
-    return [
+    forms = [
         f"(setq initial-frame-alist (append {geometry} initial-frame-alist))",
         f"(setq default-frame-alist (append {geometry} default-frame-alist))",
     ]
+    if title:
+        forms.append(f"(setq frame-title-format {elisp_string(title)})")
+    return forms
 
 
 def create_dirs(session_dir: Path) -> dict[str, Path]:
@@ -239,6 +248,9 @@ def build_sandbox(
     set_session_dir = f"(setq elate-session-dir {elisp_string(str(session_dir))})"
 
     ui_args = ["-nw"] if ui == "tty" else []
+    # GUI frames are titled "elate:<session>" so a tiling window manager
+    # can be configured to float just elate's windows (see the README).
+    frame_title = f"elate:{session_dir.name}"
 
     if config == "bare":
         # User forms run inside elate-guard so a failing form is recorded
@@ -250,7 +262,7 @@ def build_sandbox(
             # Command-line --eval runs before frame-notice-user-settings
             # applies the user frame settings, so the alists set here
             # shape the initial frame exactly like an init file would.
-            for form in _frame_geometry_forms(cols, rows):
+            for form in _frame_geometry_forms(cols, rows, frame_title):
                 args += ["--eval", form]
         for form in _load_forms(loads):
             args += ["--eval", f"(elate-guard {form})"]
@@ -266,7 +278,7 @@ def build_sandbox(
         set_session_dir,
     ]
     if ui == "gui":
-        lines += _frame_geometry_forms(cols, rows)
+        lines += _frame_geometry_forms(cols, rows, frame_title)
     if config in ("minimal", "clean-install"):
         lines.append(_MINIMAL_DEFAULTS)
     # Agent first, so the semantic channel is up even if user code errors.

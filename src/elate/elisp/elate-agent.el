@@ -816,9 +816,19 @@ as RET (?\\r), matching what a keyboard sends."
   (unless (display-graphic-p)
     (error "elate: agent-side resize is GUI-only; TTY sessions resize through tmux"))
   (set-frame-size (selected-frame) cols rows)
-  ;; The window system applies the resize asynchronously; give redisplay
-  ;; a chance so the reported size is usually the settled one.
-  (redisplay t)
+  ;; The window system applies the resize asynchronously, and a tiling WM
+  ;; may re-assert its own size right after; wait briefly so the reported
+  ;; size is the settled one (and an override is visible to the caller).
+  (sit-for 0.6)
+  (list :width (frame-width) :height (frame-height)))
+
+(defun elate--rpc-frame-size ()
+  "Settled character size of the selected frame.
+Read-only; lets elate notice a window manager that resized a GUI
+frame out from under the size it asked for.  A managing WM resizes
+the window asynchronously, so wait briefly for it to land before
+reporting."
+  (sit-for 0.6)
   (list :width (frame-width) :height (frame-height)))
 
 (defun elate--rpc-frame-parameter (name)

@@ -407,9 +407,37 @@ macOS notes:
   that runs elate (your terminal): System Settings → Privacy & Security →
   Screen Recording, then restart the terminal. elate probes the permission
   first and returns an actionable error instead of triggering prompts.
-- A tiling window manager (AeroSpace, yabai, Amethyst) will re-tile new
-  Emacs windows, overriding `--size`/`resize` — the requested geometry
-  still lands in `initial-frame-alist`/`default-frame-alist`.
+### GUI sessions under a tiling window manager
+
+A tiling window manager (AeroSpace, yabai, Amethyst, …) manages every new
+window, so it will move an agent's GUI Emacs onto a visible workspace and
+resize it — overriding `--size`/`resize` and interrupting your own layout.
+elate does **not** touch your WM config; instead it makes the frame easy to
+exempt:
+
+- Every GUI frame is titled **`elate:<session>`**, so you can match just
+  elate's windows (not your normal Emacs).
+- When elate detects the frame ended up a different size than requested, it
+  adds a `wm_warning` to the `start`/`resize` result (and prints it on a
+  terminal) so the cause is obvious.
+
+Add a float rule for elate's windows to your WM config. AeroSpace
+(`~/.config/aerospace/aerospace.toml`):
+
+```toml
+[[on-window-detected]]
+if.app-id = 'org.gnu.Emacs'
+if.window-title-regex-substring = 'elate:'
+run = ['layout floating']
+```
+
+yabai (`~/.yabairc`):
+
+```sh
+yabai -m rule --add app='^Emacs$' title='^elate:' manage=off
+```
+
+A floating/unmanaged frame keeps the size and position elate sets it to.
 
 Linux/CI notes (written for CI, not exercised on macOS dev machines):
 

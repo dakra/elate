@@ -182,6 +182,103 @@ def signal_pid(pid: int | None, sig: int, identity: str | None = None,
     return True
 
 
+# Month abbreviations as `ps` emits them under LC_ALL=C (forced below).
+_PS_MONTHS = {m: i for i, m in enumerate(
+    ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), start=1)}
+
+
+def _parse_lstart(text: str) -> float | None:
+    """Parse a `ps -o lstart` string ("Wed Jun 4 21:00:00 2026") to epoch.
+
+    Locale-independent on purpose: `time.strptime`'s %a/%b are
+    locale-sensitive in CPython, so a non-C process locale could make every
+    parse fail and silently turn reaping into a no-op (orphans survive, the
+    orphan count always reads 0). We force LC_ALL=C on the `ps` call and
+    split the fixed "DOW MON DD HH:MM:SS YYYY" layout ourselves (ps
+    space-pads the day-of-month, so plain split() collapses it). None on
+    any parse failure.
+    """
+    parts = text.split()
+    if len(parts) != 5:
+        return None
+    try:
+        month = _PS_MONTHS[parts[1]]
+        day = int(parts[2])
+        hour, minute, second = (int(x) for x in parts[3].split(":"))
+        year = int(parts[4])
+        # tm_isdst=-1: let mktime resolve DST for the local zone.
+        return time.mktime((year, month, day, hour, minute, second, 0, 0, -1))
+    except (KeyError, ValueError, OverflowError):
+        return None
+
+
+def _group_members(pgid: int | None, since: float) -> list[tuple[int, float]]:
+    """(pid, start-epoch) of processes in group PGID started at/after SINCE.
+
+    The start-time filter is what makes group reaping safe against pgid
+    reuse: a recycled group's members predate our session, so they fall
+    below SINCE and are never touched. `ps` start times have ~1s
+    granularity, so SINCE is floored to the whole second (a member spawned
+    in the same second the session started must still count). Never raises.
+    """
+    if not pgid or pgid <= 0:
+        return []
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", "pid=", "-o", "lstart=", "-g", str(pgid)],
+            capture_output=True, text=True, timeout=5.0,
+            # Force C locale so lstart's month/day names are English, which
+            # _parse_lstart expects -- independent of the user's locale.
+            env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    threshold = int(since)
+    members: list[tuple[int, float]] = []
+    for line in proc.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        started = _parse_lstart(parts[1])
+        if started is None or started < threshold:
+            continue
+        members.append((pid, started))
+    return members
+
+
+def reap_group(pgid: int | None, since: float) -> list[int]:
+    """SIGKILL processes in group PGID started at/after SINCE; return pids.
+
+    For GUI sessions, whose Emacs leads its own process group: a single
+    os.kill takes only Emacs, leaving any backgrounded grandchildren
+    behind. This kills the whole (start-time-filtered) group. Never raises.
+    """
+    killed: list[int] = []
+    for pid, _ in _group_members(pgid, since):
+        try:
+            os.kill(pid, 9)
+            killed.append(pid)
+        except OSError:
+            pass
+    return killed
+
+
+def count_group(pgid: int | None, since: float,
+                exclude: set[int] | None = None) -> int:
+    """Count members of group PGID started at/after SINCE, minus EXCLUDE.
+
+    Used to surface leaked descendants (orphans) of a live GUI session:
+    pass the Emacs pid/pgid as EXCLUDE so the count is grandchildren only.
+    """
+    exclude = exclude or set()
+    return sum(1 for pid, _ in _group_members(pgid, since)
+               if pid not in exclude)
+
+
 def spawn_emacs(
     emacs_path: str,
     emacs_args: Sequence[str],
@@ -219,13 +316,13 @@ def spawn_emacs(
 
 
 def log_tail(log_path: Path, lines: int = 12) -> str:
-    """Last LINES of the GUI process log, for crash reports."""
+    """Last LINES of a process log (GUI log / TTY stderr), for crash reports."""
     try:
         text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return "(no GUI process log available)"
+        return "(no process log available)"
     tail = text.rstrip("\n").splitlines()[-lines:]
-    return "\n".join(tail) if tail else "(GUI process log is empty)"
+    return "\n".join(tail) if tail else "(process log is empty)"
 
 
 def start_xvfb(session_dir: Path, screen: str = "1280x800x24") -> tuple[int, str]:

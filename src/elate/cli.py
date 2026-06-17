@@ -18,6 +18,7 @@ from .errors import (
     EvalTimeout,
     RpcError,
     ScreenshotError,
+    TransportError,
     UsageError,
     WaitTimeout,
 )
@@ -96,7 +97,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     sp = sub.add_parser("start", help="start a new sandboxed session")
-    sp.add_argument("--name", required=True)
+    sp.add_argument("--name",
+                    help="session name (default: an auto-generated "
+                         "elate-<hex>; the chosen name is in the result, so "
+                         "later commands can reference it)")
+    sp.add_argument("--replace", action="store_true",
+                    help="if a session of this name is already running, stop "
+                         "and recreate it (dead/stopped sessions of that name "
+                         "are always replaced)")
     sp.add_argument("--ui", choices=["tty", "gui"], default="tty",
                     help="session UI: tty (tmux-hosted terminal Emacs, "
                          "default) or gui (windowed Emacs; PNG screenshots)")
@@ -131,8 +139,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "subprocess spawns; keeps sandbox isolation)")
     sp.add_argument("--size", type=_parse_size, default=(120, 36), metavar="COLSxROWS")
 
-    sp = sub.add_parser("stop", help="stop a session")
+    sp = sub.add_parser("stop", help="stop a session (or --all)")
     sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
+    sp.add_argument("--all", action="store_true", dest="all_sessions",
+                    help="stop every running session (instead of a name)")
 
     sp = sub.add_parser(
         "interrupt",
@@ -156,6 +166,11 @@ def build_parser() -> argparse.ArgumentParser:
                     default="all",
                     help="filter by liveness: running, stopped (stopped/dead/"
                          "corrupt), or all (default)")
+    sp.add_argument("--older-than", metavar="DUR", type=_parse_duration,
+                    help="only show sessions inert at least this long "
+                         "(e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- "
+                         "running sessions are excluded; pairs with `purge "
+                         "--stopped-older-than`")
 
     sp = sub.add_parser(
         "purge",
@@ -175,6 +190,20 @@ def build_parser() -> argparse.ArgumentParser:
                     help="only purge sessions inert at least this long "
                          "(e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- "
                          "keeps just-stopped sandboxes during heavy runs")
+
+    sp = sub.add_parser(
+        "prune",
+        help="alias for `purge` (delete stopped/dead sandboxes)",
+        description="Alias for `purge`: delete the sandbox directories of "
+                    "sessions that are no longer running. `purge` is the "
+                    "canonical spelling; `prune` exists for discoverability.")
+    sp.add_argument("names", nargs="*", metavar="NAME",
+                    help="session to prune (repeatable)")
+    sp.add_argument("--all", action="store_true", dest="all_sessions",
+                    help="prune every session that is not running")
+    sp.add_argument("--stopped-older-than", metavar="DUR", type=_parse_duration,
+                    help="only prune sessions inert at least this long "
+                         "(e.g. 30s, 15m, 2h, 1d; bare number = seconds)")
 
     sp = sub.add_parser("info", help="show session details")
     sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
@@ -324,6 +353,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="on error, also return structured backtrace frames "
                          "(each frame's function + printed args), not just "
                          "the rendered backtrace string")
+    sp.add_argument("--on-timeout", choices=["none", "sample"], default="none",
+                    help="on timeout with Emacs still busy: 'sample' captures "
+                         "a thread backtrace of the wedged Emacs (macOS "
+                         "`sample`; Linux eu-stack/gdb) and attaches it to "
+                         "the error; 'none' (default) does not")
 
     sp = sub.add_parser(
         "trace",
@@ -505,11 +539,24 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--ansi", action="store_true",
                     help="tty only: include ANSI color escapes")
 
+    sp = sub.add_parser(
+        "logs", aliases=["stderr"],
+        help="tail the driven Emacs's stderr/stdout log",
+        description="Show the tail of the Emacs process log -- module "
+                    "panics, GC/native-comp warnings, and the fatal-signal "
+                    "line on a crash. TTY sessions capture stderr to a file "
+                    "(off the pane, so screenshots stay clean); GUI sessions "
+                    "log stdout+stderr. Works on dead/stopped sessions too.")
+    sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
+    sp.add_argument("-n", "--lines", type=int, default=40, metavar="N",
+                    help="number of trailing lines to show (default 40)")
+
     sp = sub.add_parser("wait", help="wait for a condition (exit 3 on timeout)")
-    sp.add_argument("condition", choices=["idle", "text", "prompt", "stable"])
+    sp.add_argument("condition",
+                    choices=["idle", "text", "prompt", "stable", "dead"])
     sp.add_argument("args", nargs="*",
                     help="idle: [MIN_IDLE_SECS]; text: REGEXP (Python regex "
-                         "syntax, not elisp); prompt/stable: none")
+                         "syntax, not elisp); prompt/stable/dead: none")
     sp.add_argument("--buffer", help="buffer to search (wait text) or watch "
                                      "(wait stable); may not exist yet")
     sp.add_argument("--quiet-ms", type=int, default=300, metavar="MS",
@@ -716,6 +763,7 @@ def cmd_start(args: argparse.Namespace) -> Result:
         rows=rows,
         ui=args.ui,
         headless=args.headless,
+        replace=args.replace,
     )
     info = S.session_info(sess.name)
     human = (
@@ -731,13 +779,33 @@ def cmd_start(args: argparse.Namespace) -> Result:
         )
         print(f"elate: {warning}", file=sys.stderr)
         human += f"\n{warning}"
+    if sess.ui == "gui":
+        wm_warning = S.gui_wm_warning(sess)
+        if wm_warning:
+            info["wm_warning"] = wm_warning
+            print(f"elate: WARNING: {wm_warning}", file=sys.stderr)
+            human += f"\nWARNING: {wm_warning}"
     return info, human, 0
 
 
 def cmd_stop(args: argparse.Namespace) -> Result:
+    if args.all_sessions:
+        if args.name or args.session:
+            raise ElateError("give a session name or --all, not both")
+        running = [s["name"] for s in S.list_sessions()
+                   if s["status"] == "running"]
+        for n in running:
+            S.stop_session(n)
+        human = (f"stopped {len(running)} session(s): {', '.join(running)}"
+                 if running else "no running sessions to stop")
+        return {"stopped": running}, human, 0
     name = _name_arg(args)
     result = S.stop_session(name)
-    return result, f"stopped session {name!r}", 0
+    if result.get("stopped"):
+        human = f"stopped session {name!r}"
+    else:
+        human = f"no such session {name!r} (nothing to stop)"
+    return result, human, 0
 
 
 def cmd_interrupt(args: argparse.Namespace) -> Result:
@@ -778,12 +846,21 @@ def cmd_list(args: argparse.Namespace) -> Result:
         sessions = [s for s in sessions if s["status"] == "running"]
     elif args.status == "stopped":  # everything inert: stopped/dead/corrupt
         sessions = [s for s in sessions if s["status"] != "running"]
+    older_than = getattr(args, "older_than", None)
+    if older_than is not None:
+        # Running sessions have idle_for=None -> excluded, so this lists
+        # only inert sandboxes at least this old (the `purge` companion).
+        sessions = [s for s in sessions
+                    if s.get("idle_for") is not None
+                    and s["idle_for"] >= older_than]
     if not sessions:
         what = (f"no session named {name!r}" if name else
+                f"no sessions inert for {_fmt_duration(older_than)}"
+                if older_than is not None else
                 "no sessions" if args.status == "all" else
                 f"no {args.status} sessions")
         return {"sessions": sessions}, what, 0
-    lines = [f"{'NAME':<20} {'UI':<4} {'STATUS':<9} {'EMACS':<10} AGE"]
+    lines = [f"{'NAME':<20} {'UI':<4} {'STATUS':<11} {'EMACS':<10} AGE"]
     for s in sessions:
         if s.get("uptime") is not None:
             age = f"up {_fmt_duration(s['uptime'])}"
@@ -791,8 +868,15 @@ def cmd_list(args: argparse.Namespace) -> Result:
             age = f"idle {_fmt_duration(s['idle_for'])}"
         else:
             age = "-"
+        # A dead session renders its fatal signal inline ("dead (SIGABRT)");
+        # the JSON keeps the stable status + a separate signal field.
+        status = s["status"]
+        if s.get("signal"):
+            status = f"{status} ({s['signal']})"
+        elif s.get("orphans"):
+            status = f"{status} +{s['orphans']} orphan(s)"
         lines.append(
-            f"{s['name']:<20} {s.get('ui') or '-':<4} {s['status']:<9} "
+            f"{s['name']:<20} {s.get('ui') or '-':<4} {status:<11} "
             f"{s.get('emacs_version') or '-':<10} {age}"
         )
     inert = sum(1 for s in sessions if s["status"] != "running")
@@ -914,7 +998,10 @@ def cmd_resize(args: argparse.Namespace) -> Result:
     sess = _get_session(args)
     cols, rows = args.size
     data = S.resize_session(sess, cols, rows)
-    return data, f"resized to {cols}x{rows}", 0
+    human = f"resized to {cols}x{rows}"
+    if data.get("wm_warning"):
+        human += f"\nWARNING: {data['wm_warning']}"
+    return data, human, 0
 
 
 def cmd_eval(args: argparse.Namespace) -> Result:
@@ -926,6 +1013,11 @@ def cmd_eval(args: argparse.Namespace) -> Result:
     except EvalTimeout as exc:
         busy = sess.is_busy()
         sess.log("eval-timeout", form=args.form)
+        sample = None
+        if busy and args.on_timeout == "sample":
+            from . import diagnostics
+            sample = diagnostics.sample_process(sess.emacs_pid)
+            sess.log("eval-timeout-sample", available=sample.get("available"))
         if busy and sess.ui == "tty":
             hint = (" -- Emacs is still busy; unwedge it with "
                     f"`elate -s {sess.name} interrupt` (raw C-g), or pass a "
@@ -938,7 +1030,20 @@ def cmd_eval(args: argparse.Namespace) -> Result:
                     "the session if it stays wedged")
         else:
             hint = ""
-        raise EvalTimeout(f"{exc}{hint}") from exc
+        raise EvalTimeout(f"{exc}{hint}", sample=sample) from exc
+    except TransportError as exc:
+        # The semantic socket vanished mid-eval -- usually Emacs just died
+        # (e.g. a crash the form triggered). Turn the opaque "connection
+        # refused" into a death verdict with the signal + crash report.
+        if S.died_during(sess):
+            enrich = S.crash_enrichment(sess)
+            msg = S.death_message(enrich)
+            sess.log("eval-died", **enrich)
+            # ok:False here wins over main()'s {"ok": True, **result} spread
+            # (later keys win), so the JSON correctly reads ok:false at exit 1.
+            data = {"ok": False, "session_died": True, "error": msg, **enrich}
+            return data, msg, 1
+        raise
     sess.log("eval-result", **data)
     parts = []
     if data.get("error"):
@@ -1512,12 +1617,31 @@ def cmd_screenshot(args: argparse.Namespace) -> Result:
     return {"screen": screen, "ansi": args.ansi}, screen.rstrip("\n"), 0
 
 
+def cmd_logs(args: argparse.Namespace) -> Result:
+    from . import gui
+
+    # No require_alive: the log outlives the Emacs, so a crashed/stopped
+    # session's stderr is exactly what you want to read here.
+    sess = S.load_session(_name_arg(args))
+    log = sess.emacs_log_path
+    text = gui.log_tail(log, lines=args.lines)
+    sess.log("logs", lines=args.lines, ui=sess.ui)
+    return ({"path": str(log), "ui": sess.ui, "lines": args.lines, "log": text},
+            text, 0)
+
+
 def cmd_wait(args: argparse.Namespace) -> Result:
-    sess = _require_session(args)
+    # `wait dead` must not require a live session -- it is waiting for the
+    # opposite (and the session may already be gone).
+    sess = (_get_session(args) if args.condition == "dead"
+            else _require_session(args))
     # buffer must be logged or the transcript->script exporter would
     # silently retarget replayed waits at the then-current buffer.
     sess.log("wait", condition=args.condition, args=args.args,
              buffer=args.buffer, quiet_ms=args.quiet_ms, timeout=args.timeout)
+    if args.condition == "dead":
+        data = S.wait_dead(sess, timeout=args.timeout)
+        return data, S.death_message(data), 0
     if args.condition == "idle":
         if args.args:
             try:
@@ -1799,7 +1923,10 @@ _COMMANDS = {
     "interrupt": cmd_interrupt,
     "list": cmd_list,
     "purge": cmd_purge,
+    "prune": cmd_purge,  # alias
     "info": cmd_info,
+    "logs": cmd_logs,
+    "stderr": cmd_logs,  # alias
     "keys": cmd_keys,
     "type": cmd_type,
     "mouse": cmd_mouse,
@@ -1873,6 +2000,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"elate: {exc}", file=sys.stderr)
             print(json.dumps(exc.state, ensure_ascii=False, indent=2), file=sys.stderr)
         return 3
+    except EvalTimeout as exc:
+        # A subclass of ElateError; handled first so an attached --on-timeout
+        # `sample` backtrace is spread into the JSON (and printed for humans).
+        payload: dict[str, Any] = {"ok": False, "error": str(exc)}
+        if getattr(exc, "sample", None):
+            payload["sample"] = exc.sample
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print(f"elate: {exc}", file=sys.stderr)
+            sample = getattr(exc, "sample", None)
+            if sample and sample.get("backtrace"):
+                print(f"--- sample ({sample.get('tool')}) ---", file=sys.stderr)
+                print(sample["backtrace"], file=sys.stderr)
+        return 1
     except RpcError as exc:
         payload: dict[str, Any] = {"ok": False, "error": str(exc)}
         if exc.backtrace:

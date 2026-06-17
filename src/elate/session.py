@@ -6,6 +6,7 @@ import base64
 import dataclasses
 import json
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -50,6 +51,7 @@ class Session:
     status: str = "running"
     stopped_at: float | None = None  # unix time stop_session ran (for purge GC)
     emacs_pid: int | None = None
+    emacs_pgid: int | None = None  # gui: process group led by the spawned Emacs
     emacs_identity: str | None = None  # gui: ps start-time+comm at spawn
     emacs_version: str | None = None
     init_file: str | None = None
@@ -92,6 +94,16 @@ class Session:
     @property
     def gui_log_path(self) -> Path:
         return self.dir / "log" / "emacs-gui.log"
+
+    @property
+    def stderr_log_path(self) -> Path:
+        """TTY sessions' captured Emacs stderr (GUI uses gui_log_path)."""
+        return self.dir / "log" / "emacs-stderr.log"
+
+    @property
+    def emacs_log_path(self) -> Path:
+        """The log carrying this session's Emacs stderr, by ui."""
+        return self.gui_log_path if self.ui == "gui" else self.stderr_log_path
 
     @property
     def clean_install_path(self) -> Path:
@@ -213,6 +225,21 @@ def load_session(name: str) -> Session:
         raise ElateError(f"corrupt session registry: {path}: {exc}") from exc
 
 
+def _free_name() -> str:
+    """A session name not currently taken under the sessions root.
+
+    Used when `start` is invoked without an explicit name. Short and
+    collision-checked so an agent juggling many parallel sessions need
+    not invent unique names itself.
+    """
+    root = sessions_root()
+    for _ in range(100):
+        candidate = f"elate-{secrets.token_hex(3)}"
+        if not (root / candidate).exists():
+            return candidate
+    raise ElateError("could not allocate a free session name")
+
+
 def _stopped_since(sess: Session) -> float:
     """Best-effort unix time a non-running session became inert.
 
@@ -226,6 +253,92 @@ def _stopped_since(sess: Session) -> float:
         return sess.registry_path.stat().st_mtime
     except OSError:
         return sess.created_at
+
+
+def _comm_hint(sess: Session) -> str | None:
+    """Process-name hint for crash-report globbing (advisory)."""
+    if sess.emacs_identity and "|" in sess.emacs_identity:
+        return Path(sess.emacs_identity.split("|", 1)[1]).name
+    if sess.emacs:
+        return Path(sess.emacs).name
+    return None
+
+
+def crash_signal(sess: Session) -> str | None:
+    """Fatal signal grepped from the session's own Emacs log (cheap)."""
+    from . import crash
+    return crash.signal_from_log(sess.emacs_log_path)
+
+
+def died_during(sess: Session, grace: float = 0.5) -> bool:
+    """True if the session is (or becomes within GRACE) not alive.
+
+    A semantic-channel transport error means the emacsclient socket is
+    gone; the Emacs is usually already dead, but liveness can lag a hair
+    behind (a TTY's tmux pane is marked dead only once tmux reaps its
+    child). Poll briefly so a crash mid-eval is reported as a death rather
+    than an opaque transport error.
+
+    An already-dead session returns immediately; only the brief tmux-lag
+    window costs anything, so GRACE is small -- a transport error that is
+    NOT a death (an over-the-argv-limit payload, a missing emacsclient, an
+    unparseable reply) waits at most GRACE before the real error surfaces.
+    """
+    deadline = time.monotonic() + grace
+    while True:
+        if not sess.is_alive():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def crash_enrichment(sess: Session) -> dict[str, Any]:
+    """Best-effort {signal?, crash_report?} for a dead session.
+
+    Combines the signal from the session's own stderr/GUI log with the OS
+    crash-report path (macOS .ips / Linux coredumpctl) attributed to its
+    pid. Never raises -- diagnostics must not mask the death itself.
+    """
+    from . import crash
+    out: dict[str, Any] = {}
+    signal_name = crash_signal(sess)
+    try:
+        report = crash.find_crash_report(sess.emacs_pid, _comm_hint(sess),
+                                         sess.created_at)
+    except Exception:
+        report = None
+    if report:
+        out["crash_report"] = report["path"]
+        signal_name = signal_name or report.get("signal")
+    if signal_name:
+        out["signal"] = signal_name
+    return out
+
+
+def death_message(enrich: dict[str, Any]) -> str:
+    """Human one-liner for a dead session from a crash_enrichment dict."""
+    msg = "session died"
+    if enrich.get("signal"):
+        msg += f" ({enrich['signal']})"
+    if enrich.get("crash_report"):
+        msg += f"; crash report: {enrich['crash_report']}"
+    return msg
+
+
+def _orphan_count(sess: Session) -> int:
+    """Leaked descendants in a live GUI session's process group (0 for TTY).
+
+    Excludes Emacs itself (the group leader); a non-zero count flags
+    subprocesses Emacs spawned and left running.
+    """
+    if sess.ui != "gui" or not sess.emacs_pgid:
+        return 0
+    try:
+        return gui.count_group(sess.emacs_pgid, sess.created_at,
+                               exclude={sess.emacs_pid, sess.emacs_pgid})
+    except Exception:
+        return 0
 
 
 def list_sessions() -> list[dict[str, Any]]:
@@ -245,19 +358,27 @@ def list_sessions() -> list[dict[str, Any]]:
             continue
         alive = sess.is_alive()
         status = "running" if alive else ("dead" if sess.status == "running" else sess.status)
-        out.append(
-            {
-                "name": sess.name,
-                "ui": sess.ui,
-                "status": status,
-                "emacs_version": sess.emacs_version,
-                "uptime": round(now - sess.created_at, 1) if alive else None,
-                # Seconds since the session went inert, so heavy parallel
-                # runs can tell stale stopped sessions from fresh ones.
-                "idle_for": None if alive else round(now - _stopped_since(sess), 1),
-                "session_dir": sess.session_dir,
-            }
-        )
+        record = {
+            "name": sess.name,
+            "ui": sess.ui,
+            "status": status,
+            "emacs_version": sess.emacs_version,
+            "uptime": round(now - sess.created_at, 1) if alive else None,
+            # Seconds since the session went inert, so heavy parallel
+            # runs can tell stale stopped sessions from fresh ones.
+            "idle_for": None if alive else round(now - _stopped_since(sess), 1),
+            "session_dir": sess.session_dir,
+        }
+        if status == "dead":
+            # Cheap signal only (the session's own log); the full crash-report
+            # lookup stays in session_info to keep `list` light.
+            signal_name = crash_signal(sess)
+            if signal_name:
+                record["signal"] = signal_name
+        orphans = _orphan_count(sess) if alive else 0
+        if orphans:
+            record["orphans"] = orphans
+        out.append(record)
     return out
 
 
@@ -291,6 +412,11 @@ def _force_cleanup(sess: Session) -> None:
                           comm_hint="emacs")
         gui.terminate_pid(sess.xvfb_pid, identity=sess.xvfb_identity,
                           comm_hint="xvfb")
+        # SIGKILL any grandchildren still in Emacs's process group: GUI
+        # Emacs leads its own group but os.kill above signals only the one
+        # pid, so a backgrounded subprocess would otherwise survive (TTY
+        # avoids this -- tmux kill-server reaps the whole pane group).
+        gui.reap_group(sess.emacs_pgid, sess.created_at)
     else:
         sess.raw().kill_server()
         from . import record as _record  # local: keep module load light
@@ -299,7 +425,7 @@ def _force_cleanup(sess: Session) -> None:
 
 
 def start_session(
-    name: str,
+    name: str | None = None,
     *,
     emacs: str | None = None,
     config: str = "minimal",
@@ -313,7 +439,10 @@ def start_session(
     rows: int = 36,
     ui: str = "tty",
     headless: bool = False,
+    replace: bool = False,
 ) -> Session:
+    if name is None:
+        name = _free_name()
     if not _NAME_RE.match(name):
         raise ElateError(f"invalid session name: {name!r}")
     if cols < 10 or rows < 4:
@@ -329,9 +458,15 @@ def start_session(
     if (session_dir / "session.json").is_file():
         old = load_session(name)
         if old.is_alive():
-            raise SessionExists(f"session {name!r} is already running")
-        # Stale/dead session: clean up and rebuild.
-        _force_cleanup(old)
+            if not replace:
+                raise SessionExists(f"session {name!r} is already running")
+            # --replace over a LIVE session: stop_session already does the
+            # full terminate + reap (kill-emacs / signal escalation /
+            # reaping), so it also covers what _force_cleanup would.
+            stop_session(name)
+        else:
+            # Stale/dead/stopped leftover: force-clean surviving processes.
+            _force_cleanup(old)
         shutil.rmtree(session_dir)
     elif session_dir.exists():
         shutil.rmtree(session_dir)
@@ -417,9 +552,14 @@ def start_session(
 def _boot_tty(sess: Session, emacs_args: list[str], tmux_conf: Path) -> None:
     env = sandbox.environment(sess.dir)
     env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-    command = "exec env {} {} {}".format(
+    # Redirect Emacs's stderr to a file (absolute path -- tmux's cwd is the
+    # controller's, not the sandbox): module panics / GC warnings / the
+    # fatal-signal line move off the pane into a tailable log (`elate logs`,
+    # and crash.signal_from_log reads it), and the TUI screenshot stays clean.
+    command = "exec env {} {} {} 2> {}".format(
         env_prefix, shlex.quote(sess.emacs),
-        " ".join(shlex.quote(a) for a in emacs_args)
+        " ".join(shlex.quote(a) for a in emacs_args),
+        shlex.quote(str(sess.stderr_log_path)),
     )
 
     raw = sess.raw()
@@ -431,12 +571,16 @@ def _boot_tty(sess: Session, emacs_args: list[str], tmux_conf: Path) -> None:
         sess.status = "failed"
         sess.save()
         crash = _crash_report(raw)
-        sess.log("start-failed", error=str(exc), crash=crash)
+        stderr_tail = gui.log_tail(sess.stderr_log_path, lines=20)
+        sess.log("start-failed", error=str(exc), crash=crash, stderr=stderr_tail)
         raw.kill_server()
         # Keep the underlying cause: e.g. tmux refusing a unix-socket path
-        # longer than ~104 bytes is invisible in the (empty) screen capture.
+        # longer than ~104 bytes is invisible in the (empty) screen capture;
+        # a module panic / fatal signal now lands in the stderr log, not the
+        # pane, so surface its tail too.
         raise ElateError(
-            f"session {sess.name!r} failed to start: {exc}\nLast screen:\n{crash}"
+            f"session {sess.name!r} failed to start: {exc}\n"
+            f"Last screen:\n{crash}\nstderr tail:\n{stderr_tail}"
         ) from None
 
     sess.emacs_pid = int(info.get("pid") or 0) or None
@@ -458,6 +602,11 @@ def _boot_gui(sess: Session, emacs_args: list[str]) -> None:
             sess.gui_log_path, display=sess.display,
         )
         sess.emacs_pid = proc.pid
+        # start_new_session=True makes the spawned Emacs its own group
+        # leader, so its pgid == pid. Descendants inherit the pgid even if
+        # a wrapper forks and the agent's reported pid (below) differs, so
+        # this is the handle for reaping orphaned grandchildren at teardown.
+        sess.emacs_pgid = proc.pid
         sess.emacs_identity = gui.proc_identity(proc.pid)
         sess.save()
 
@@ -523,7 +672,13 @@ def _crash_report(raw: RawChannel) -> str:
 
 
 def stop_session(name: str, via: str | None = None) -> dict[str, Any]:
-    sess = load_session(name)
+    try:
+        sess = load_session(name)
+    except SessionNotFound:
+        # Stopping a session that does not exist is a no-op success, so
+        # `stop` (and `stop --all`, replace, cleanup loops) is idempotent.
+        return {"name": name, "stopped": False, "was_alive": False,
+                "reason": "no such session"}
     was_alive = sess.is_alive()
     if was_alive:
         try:
@@ -543,7 +698,11 @@ def stop_session(name: str, via: str | None = None) -> dict[str, Any]:
                           identity=sess.emacs_identity, comm_hint="emacs")
         gui.terminate_pid(sess.xvfb_pid, identity=sess.xvfb_identity,
                           comm_hint="xvfb")
+        # Reap orphaned grandchildren left in Emacs's process group (see
+        # _force_cleanup): killing the one Emacs pid does not take them.
+        reaped = gui.reap_group(sess.emacs_pgid, sess.created_at)
     else:
+        reaped = []
         sess.raw().kill_server()
         # Killing the tmux server EOFs a healthily attached recorder
         # helper; one attached to a crashed (remain-on-exit) pane is
@@ -554,8 +713,13 @@ def stop_session(name: str, via: str | None = None) -> dict[str, Any]:
     sess.status = "stopped"
     sess.stopped_at = time.time()
     sess.save()
-    sess.log("stop", was_alive=was_alive, **({"via": via} if via else {}))
-    return {"name": name, "stopped": True, "was_alive": was_alive}
+    sess.log("stop", was_alive=was_alive,
+             **({"reaped": reaped} if reaped else {}),
+             **({"via": via} if via else {}))
+    result = {"name": name, "stopped": True, "was_alive": was_alive}
+    if reaped:
+        result["reaped"] = reaped
+    return result
 
 
 # signal name -> signal, for the GUI interrupt path (TTY uses raw C-g).
@@ -727,12 +891,13 @@ def session_info(name: str) -> dict[str, Any]:
     sess = load_session(name)
     alive = sess.is_alive()
     busy = sess.is_busy() if alive else False
-    return {
+    status = "running" if alive else ("dead" if sess.status == "running" else sess.status)
+    info = {
         "name": sess.name,
         "ui": sess.ui,
         "alive": alive,
         "busy": busy,
-        "status": "running" if alive else ("dead" if sess.status == "running" else sess.status),
+        "status": status,
         "pid": sess.emacs_pid,
         "emacs": sess.emacs,
         "emacs_version": sess.emacs_version,
@@ -749,6 +914,13 @@ def session_info(name: str) -> dict[str, Any]:
             "installed": sess.clean_install_info()}
            if sess.config == "clean-install" else {}),
     }
+    if status == "dead":
+        # Keep the stable status:"dead"; add signal/crash_report alongside.
+        info.update(crash_enrichment(sess))
+    orphans = _orphan_count(sess) if alive else 0
+    if orphans:
+        info["orphans"] = orphans
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -1240,6 +1412,25 @@ def wait_prompt(sess: Session, timeout: float = 10.0) -> dict[str, Any]:
     return _wait_loop(sess, timeout, "an active minibuffer prompt", probe)
 
 
+def wait_dead(sess: Session, timeout: float = 10.0) -> dict[str, Any]:
+    """Wait until the session's Emacs is no longer alive.
+
+    Polls liveness directly (no RPC, unlike the other waiters -- a dying
+    Emacs cannot answer the semantic channel), and on death returns
+    {died, signal?, crash_report?}. Times out (exit 3) if the session is
+    still alive at the deadline, like the other waiters.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not sess.is_alive():
+            return {"died": True, **crash_enrichment(sess)}
+        time.sleep(0.1)
+    dump = state_dump(sess)
+    raise WaitTimeout(
+        f"timed out after {timeout:g}s waiting for the session to die",
+        state=dump)
+
+
 # ---------------------------------------------------------------------------
 # Input helpers
 
@@ -1514,6 +1705,42 @@ def focus_event(
     return {**data, "focus": direction}
 
 
+def _wm_resize_warning(want_cols: int, want_rows: int,
+                       got_cols: int, got_rows: int, tol: int = 2) -> str | None:
+    """A warning when a window manager overrode a requested GUI frame size.
+
+    A tiling/managing window manager (AeroSpace, yabai, Amethyst, ...)
+    resizes the frame out from under us; the gap between the size elate
+    asked for and the settled size is the tell. Small deltas (cell
+    rounding, minimum frame sizes) are ignored.
+    """
+    if abs(got_cols - want_cols) <= tol and abs(got_rows - want_rows) <= tol:
+        return None
+    return (f"window manager resized the GUI frame: requested "
+            f"{want_cols}x{want_rows}, got {got_cols}x{got_rows} characters. "
+            "A tiling window manager is likely managing elate's frame -- "
+            "float the \"elate:<session>\" window in your WM config (see "
+            "\"GUI sessions under tiling window managers\" in the README) to "
+            "keep the size you set.")
+
+
+def gui_wm_warning(sess: Session) -> str | None:
+    """Best-effort warning if the WM resized this live GUI frame.
+
+    Returns None for TTY sessions, dead sessions, or any probe failure --
+    purely advisory, never raises.
+    """
+    if sess.ui != "gui" or not sess.is_alive():
+        return None
+    try:
+        data = sess.semantic().rpc("frame-size")
+    except (EvalTimeout, TransportError, RpcError):
+        return None
+    return _wm_resize_warning(sess.cols, sess.rows,
+                              data.get("width", sess.cols),
+                              data.get("height", sess.rows))
+
+
 def resize_session(sess: Session, cols: int, rows: int) -> dict[str, Any]:
     """Resize the live session to COLS x ROWS characters."""
     if cols < 10 or rows < 4:
@@ -1521,6 +1748,12 @@ def resize_session(sess: Session, cols: int, rows: int) -> dict[str, Any]:
     sess.require_alive()
     if sess.ui == "gui":
         data = sess.semantic().rpc("resize", cols, rows)
+        # The resize RPC reports the settled size, so a WM that fought the
+        # resize is visible right here.
+        warning = _wm_resize_warning(cols, rows, data.get("width", cols),
+                                     data.get("height", rows))
+        if warning:
+            data["wm_warning"] = warning
     else:
         sess.raw().resize(cols, rows)
         data = {}

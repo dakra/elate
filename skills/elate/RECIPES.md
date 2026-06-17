@@ -227,3 +227,43 @@ Reuse the same startup setup across many sessions with `--eval-file
 setup.el` (a forms file, no `load-path` side effects) or `--profile NAME`
 (`$XDG_CONFIG_HOME/elate/profiles/NAME.el`); both run before
 `emacs-startup-hook`, so they set vars an auto-launch hook will read.
+
+## Diagnose a crash or a hang
+
+When stress-testing native code or risky elisp, a session can crash or
+wedge. elate turns both into actionable data instead of an opaque
+"connection refused".
+
+```sh
+uvx elate start --name fuzz --load ./my-module.el
+
+# A form that crashes Emacs: eval reports the death, not a transport error.
+uvx elate -s fuzz eval '(my-module-trigger-the-bug)'
+#   {"ok": false, "session_died": true, "signal": "SIGSEGV",
+#    "crash_report": "/Users/me/Library/Logs/DiagnosticReports/Emacs-….ips", …}
+uvx elate -s fuzz logs              # the Emacs stderr tail (Fatal error 11: …)
+
+# Expecting a crash? Block on it and read the verdict:
+uvx elate -s fuzz wait dead --timeout 10   # {"died": true, "signal": "SIGSEGV", …}
+uvx elate -s fuzz info                      # status: dead (SIGSEGV) + crash_report
+
+# A hang (not a crash): see WHERE it is stuck with a sampled backtrace.
+uvx elate -s fuzz eval '(my-module-maybe-loops)' --timeout 5 --on-timeout sample
+#   timeout error with "sample": {tool, backtrace} — the wedged threads
+# then unblock without losing the session:
+uvx elate -s fuzz interrupt        # raw C-g (TTY) / SIGINT (GUI)
+
+uvx elate stop fuzz
+```
+
+`signal`/`crash_report` are best-effort: the signal is grepped from the
+Emacs stderr log (so it appears even before the OS writes a `.ips`), and
+the report is attributed by matching the recorded pid — correct even when
+several sandboxed Emacsen crash in parallel. GUI sessions also reap any
+subprocess Emacs left behind on `stop` (`list` flags a live session's
+leaked descendants as `orphans`).
+
+Heavy parallel runs: `start --replace` recreates a name in place, `start`
+without `--name` auto-generates one, `stop --all` clears everything
+running, and `elate list --older-than 1h` / `elate purge --all
+--stopped-older-than 1h` find and GC stale sandboxes.

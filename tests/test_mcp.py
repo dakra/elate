@@ -46,6 +46,7 @@ EXPECTED_TOOLS = {
     "elate_test", "elate_lint", "elate_popups", "elate_faces_at",
     "elate_run_script", "elate_record",
     "elate_profile", "elate_bench", "elate_trace", "elate_purge",
+    "elate_logs",
 }
 
 

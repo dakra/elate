@@ -26,7 +26,17 @@ class TransportError(ElateError):
 
 
 class EvalTimeout(ElateError):
-    """The emacsclient subprocess hit its hard timeout (Emacs busy/blocked)."""
+    """The emacsclient subprocess hit its hard timeout (Emacs busy/blocked).
+
+    Carries an optional ``sample`` -- a best-effort thread backtrace of the
+    wedged Emacs captured by ``eval --on-timeout sample`` (see
+    :mod:`elate.diagnostics`); ``None`` unless that was requested.
+    """
+
+    def __init__(self, message: str,
+                 sample: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.sample = sample
 
 
 class RpcError(ElateError):
