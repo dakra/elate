@@ -30,7 +30,8 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   rings the bell aborts the whole macro — use `keys … --no-abort-on-bell`
   (or `--events`) to deliver past a bell. A sequence that opens a minibuffer
   prompt and leaves it open needs `keys … --events` (queued); unwedging a
-  stuck Emacs needs `keys C-g --raw` (TTY only).
+  stuck Emacs (`info` shows `busy: true`) needs `interrupt` (raw C-g on TTY,
+  a C-g-like SIGINT on GUI; `--signal usr2` for a debugger backtrace).
 - Drive a **subprocess** (shell/REPL/terminal) with `send-process`: it writes
   straight to the buffer's process (`send-process --char C-c` interrupts,
   `send-process 'cmd\n'` feeds input) — `keys`/`type` drive Emacs, this drives

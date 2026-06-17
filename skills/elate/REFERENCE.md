@@ -20,6 +20,7 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 
 - [`elate start`](#elate-start)
 - [`elate stop`](#elate-stop)
+- [`elate interrupt`](#elate-interrupt)
 - [`elate list`](#elate-list)
 - [`elate purge`](#elate-purge)
 - [`elate info`](#elate-info)
@@ -77,11 +78,21 @@ stop a session
 
 - `[name]` -- session name (or use -s NAME)
 
+## elate interrupt
+
+unblock a wedged session (raw C-g / signal) without stopping it
+
+Poke a busy-but-alive session without killing it. TTY: send raw C-g over tmux (works even when the semantic channel is blocked). GUI (no raw channel): signal Emacs -- --signal int (default) is a C-g-like quit that unwinds a stuck synchronous call; --signal usr2 drops into the Lisp debugger so a follow-up observation shows where it was stuck.
+
+- `[name]` -- session name (or use -s NAME)
+- `--signal {int,usr2}` (default: int) -- GUI only: int (C-g-like quit, default) or usr2 (enter the Lisp debugger); ignored for TTY
+
 ## elate list
 
 list known sessions
 
-(no arguments)
+- `[name]` -- only this session (or use -s NAME)
+- `--status {running,stopped,all}` (default: all) -- filter by liveness: running, stopped (stopped/dead/corrupt), or all (default)
 
 ## elate purge
 

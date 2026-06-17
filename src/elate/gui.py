@@ -162,6 +162,26 @@ def terminate_pid(pid: int | None, grace: float = 3.0,
     _reap_spawned(pid)
 
 
+def signal_pid(pid: int | None, sig: int, identity: str | None = None,
+               comm_hint: str | None = None) -> bool:
+    """Send SIG to PID once. Returns True if delivered, False if skipped.
+
+    Like `terminate_pid`, an IDENTITY/COMM_HINT mismatch (a recycled pid
+    after a controller restart) is treated as already dead and never
+    signalled. Unlike it, this neither waits nor escalates: it is the GUI
+    analogue of poking C-g at a busy Emacs, not killing it.
+    """
+    if not pid or pid <= 0:
+        return False
+    if (identity or comm_hint) and not pid_alive(pid, identity, comm_hint):
+        return False
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        return False
+    return True
+
+
 def spawn_emacs(
     emacs_path: str,
     emacs_args: Sequence[str],

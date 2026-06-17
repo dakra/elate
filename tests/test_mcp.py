@@ -37,7 +37,7 @@ pytestmark = pytest.mark.skipif(
 NAME = f"m{os.getpid()}"
 
 EXPECTED_TOOLS = {
-    "elate_start", "elate_stop", "elate_list", "elate_info",
+    "elate_start", "elate_stop", "elate_interrupt", "elate_list", "elate_info",
     "elate_keys", "elate_type", "elate_send_process", "elate_mouse",
     "elate_focus", "elate_send_events",
     "elate_eval", "elate_state", "elate_screenshot",

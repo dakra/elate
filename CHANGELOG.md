@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.8.0
+
+- **`elate interrupt`** (CLI + `elate_interrupt`): unblock a wedged-but-alive
+  session without killing it — the recovery for a session whose `info` reports
+  `busy` (e.g. Emacs blocked on a slow synchronous `call-process`), short of
+  stopping and restarting it. A TTY session gets a raw `C-g` over tmux, which
+  works even when the semantic channel is blocked. A GUI session — which has
+  no raw channel — is signalled instead: `--signal int` (default) sends a
+  `C-g`-like SIGINT that unwinds a stuck call back to top level, and
+  `--signal usr2` drops Emacs into the Lisp debugger so a follow-up
+  observation shows where it was stuck.
+
+- **Screenshot failure reasons**: a failed GUI capture carries a
+  machine-readable `reason` in the error JSON — `locked`, `display_asleep`,
+  `window_gone`, or `permission`. On macOS a locked screen or asleep display
+  is diagnosed by probing the window-server session, so it is reported
+  distinctly from a missing Screen Recording grant.
+
+- **`elate list` filtering**: `list [NAME]` shows a single session and
+  `--status {running,stopped,all}` filters by liveness, so a busy parallel run
+  can query just what it needs rather than every session at once. The table
+  footer points at `purge` once inert sessions accumulate.
+
+- **Ergonomics**: a global flag placed after the subcommand (`elate stop -s
+  NAME`) suggests the correct order (`elate -s NAME stop`) rather than a bare
+  argparse error. The eval-timeout hints point at `interrupt` and `--timeout`,
+  and the skill documents driving a program inside a terminal buffer with
+  `send-process`.
+
 ## 0.7.0
 
 - **`elate install`**: wire elate into AI coding harnesses with one command.

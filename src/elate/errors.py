@@ -45,5 +45,19 @@ class WaitTimeout(ElateError):
         self.state = state or {}
 
 
+class ScreenshotError(ElateError):
+    """A GUI capture failed. Carries a machine-readable reason code.
+
+    `reason` is one of "permission", "locked", "display_asleep", or
+    "window_gone", so a caller can tell a missing Screen Recording grant
+    apart from a locked/asleep Mac (which look identical to screencapture)
+    without parsing the message.
+    """
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 class UsageError(ElateError):
     """A usage mistake (wrong context or arguments). Maps to CLI exit 2."""

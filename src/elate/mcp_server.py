@@ -28,7 +28,13 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from . import session as S
-from .errors import ElateError, RpcError, SessionNotFound, WaitTimeout
+from .errors import (
+    ElateError,
+    RpcError,
+    ScreenshotError,
+    SessionNotFound,
+    WaitTimeout,
+)
 
 INSTRUCTIONS = """\
 elate spawns disposable, sandboxed Emacs sessions (fresh fake $HOME,
@@ -115,6 +121,8 @@ def _fail(exc: Exception, sess: S.Session | None = None) -> str:
     payload: dict[str, Any] = {"ok": False, "error": message}
     if isinstance(exc, RpcError) and exc.backtrace:
         payload["backtrace"] = exc.backtrace
+    if isinstance(exc, ScreenshotError):
+        payload["reason"] = exc.reason
     # State dumps are {"state": ..., "screen_tail": ...}; spread them so
     # "state" in the error payload is the actual snapshot (not state.state).
     if isinstance(exc, WaitTimeout):
@@ -264,6 +272,34 @@ def elate_stop(
     """
     try:
         return _ok(S.stop_session(session, via="mcp"))
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool(annotations=ToolAnnotations(readOnlyHint=False,
+                                         destructiveHint=False,
+                                         openWorldHint=False))
+@_threaded
+def elate_interrupt(
+    session: Annotated[str, Field(description="Session name to interrupt.")],
+    signal: Annotated[Literal["int", "usr2"], Field(description=(
+        "GUI only: 'int' (default) sends a C-g-like quit that unwinds a "
+        "stuck synchronous call back to top level; 'usr2' drops Emacs into "
+        "the Lisp debugger so a follow-up elate_state shows where it was "
+        "stuck. Ignored for TTY sessions, which always get raw C-g."))]
+        = "int",
+) -> str:
+    """Unblock a wedged-but-alive session without killing it.
+
+    The recovery for a session that stopped answering the semantic channel
+    (elate_info reports busy) -- e.g. Emacs stuck on a slow synchronous
+    call. TTY: raw C-g over tmux (works even when the semantic channel is
+    blocked). GUI (no raw channel): signal Emacs. Prefer this over
+    elate_stop when you want to keep the session's accumulated state; for a
+    form you already know is slow, raise elate_eval's timeout instead.
+    """
+    try:
+        return _ok(S.interrupt_session(session, sig=signal, via="mcp"))
     except Exception as exc:
         return _fail(exc)
 

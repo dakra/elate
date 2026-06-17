@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .errors import ElateError, RpcError
+from .errors import ElateError, RpcError, ScreenshotError
 
 if TYPE_CHECKING:  # pragma: no cover
     from .session import Session
@@ -94,6 +94,54 @@ def screen_recording_allowed() -> bool | None:
     return bool(preflight())
 
 
+def _macos_capture_blocker() -> str | None:
+    """Why a capture would come back black, when it is not a permission gap.
+
+    Returns "display_asleep" or "locked" when the Mac is in a state that
+    makes window capture impossible no matter what permission is granted,
+    else None. Best-effort: any probe gap or error returns None and the
+    caller falls back to the permission explanation.
+    """
+    try:
+        import Quartz
+    except ImportError:
+        return None
+    # Order matters: a locked screen and an asleep display can both be true
+    # at once, and "unlock the Mac" is the more actionable remedy, so the
+    # session dictionary is consulted before the sleep probe.
+    session = getattr(Quartz, "CGSessionCopyCurrentDictionary", None)
+    if session is not None:
+        try:
+            info = session()
+            if info is not None:  # None == no GUI session (daemon/SSH); unknown
+                info = dict(info)
+                if info.get("CGSSessionScreenIsLocked"):
+                    return "locked"
+                on_console_key = getattr(Quartz, "kCGSessionOnConsoleKey",
+                                         "kCGSSessionOnConsoleKey")
+                if info.get(on_console_key) is False:
+                    return "locked"  # on, but fast-user-switched away
+        except Exception:  # noqa: BLE001 - probe is advisory only
+            pass
+    asleep = getattr(Quartz, "CGDisplayIsAsleep", None)
+    main_display = getattr(Quartz, "CGMainDisplayID", None)
+    if asleep is not None and main_display is not None:
+        try:
+            if asleep(main_display()):
+                return "display_asleep"
+        except Exception:  # noqa: BLE001 - probe is advisory only
+            pass
+    return None
+
+
+def _blocker_message(reason: str) -> str:
+    if reason == "display_asleep":
+        return ("the display is asleep -- wake the Mac to capture "
+                "(this is not a permission problem)")
+    return ("the screen is locked -- unlock the Mac to capture "
+            "(this is not a permission problem)")
+
+
 def macos_window_id(pid: int) -> int | None:
     """CGWindowID of the largest on-screen window owned by PID, or None."""
     try:
@@ -124,31 +172,47 @@ def macos_window_id(pid: int) -> int | None:
 
 def _capture_macos(sess: "Session", out_path: Path) -> None:
     if screen_recording_allowed() is False:
-        raise ElateError(f"cannot capture the screen: {PERMISSION_HINT}")
+        raise ScreenshotError(f"cannot capture the screen: {PERMISSION_HINT}",
+                              reason="permission")
     if not sess.emacs_pid:
         raise ElateError(f"session {sess.name!r} has no recorded Emacs pid")
     window_id = macos_window_id(sess.emacs_pid)
     if window_id is None:
-        raise ElateError(
+        # A locked screen / asleep display also hides every on-screen
+        # window, so check that before blaming the frame.
+        blocker = _macos_capture_blocker()
+        if blocker is not None:
+            raise ScreenshotError(f"cannot capture: {_blocker_message(blocker)}",
+                                  reason=blocker)
+        raise ScreenshotError(
             f"no on-screen window found for Emacs pid {sess.emacs_pid} "
             f"(session {sess.name!r}); the frame may be minimized, on "
-            "another Space, or the process dead"
+            "another Space, or the process dead",
+            reason="window_gone",
         )
     # -x: no sound, -o: no window shadow, -l: capture window by CGWindowID.
     proc = subprocess.run(
         ["screencapture", "-x", "-o", "-l", str(window_id), str(out_path)],
         capture_output=True, text=True, timeout=15.0,
     )
-    if proc.returncode != 0:
-        raise ElateError(
-            f"screencapture failed ({proc.returncode}): "
-            f"{proc.stderr.strip() or 'no output'} -- if this is a "
-            f"permission problem, {PERMISSION_HINT}"
-        )
-    if not out_path.is_file() or out_path.stat().st_size == 0:
-        raise ElateError(
-            f"screencapture produced no image at {out_path} -- "
-            f"{PERMISSION_HINT}"
+    failed = proc.returncode != 0
+    empty = not out_path.is_file() or out_path.stat().st_size == 0
+    if failed or empty:
+        # screencapture reports a generic failure (or silently writes
+        # nothing) when the screen is locked or the display is asleep --
+        # exactly the case the old "grant permission" hint mis-diagnosed.
+        blocker = _macos_capture_blocker()
+        if blocker is not None:
+            raise ScreenshotError(
+                f"screencapture failed: {_blocker_message(blocker)}",
+                reason=blocker,
+            )
+        detail = (f"screencapture failed ({proc.returncode}): "
+                  f"{proc.stderr.strip() or 'no output'}") if failed else (
+            f"screencapture produced no image at {out_path}")
+        raise ScreenshotError(
+            f"{detail} -- if this is a permission problem, {PERMISSION_HINT}",
+            reason="permission",
         )
 
 

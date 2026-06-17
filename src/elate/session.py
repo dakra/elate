@@ -8,6 +8,7 @@ import json
 import re
 import shlex
 import shutil
+import signal
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,7 @@ from .errors import (
     SessionExists,
     SessionNotFound,
     TransportError,
+    UsageError,
     WaitTimeout,
 )
 from .paths import sessions_root
@@ -554,6 +556,46 @@ def stop_session(name: str, via: str | None = None) -> dict[str, Any]:
     sess.save()
     sess.log("stop", was_alive=was_alive, **({"via": via} if via else {}))
     return {"name": name, "stopped": True, "was_alive": was_alive}
+
+
+# signal name -> signal, for the GUI interrupt path (TTY uses raw C-g).
+_INTERRUPT_SIGNALS = {"int": signal.SIGINT, "usr2": signal.SIGUSR2}
+
+
+def interrupt_session(name: str, sig: str = "int",
+                      via: str | None = None) -> dict[str, Any]:
+    """Poke a wedged-but-alive session without killing it.
+
+    TTY: send raw C-g over tmux -- works even when the semantic channel
+    is blocked, exactly as `keys C-g --raw` does. GUI: there is no raw
+    channel, so signal the Emacs process instead. SIGINT (`sig="int"`)
+    behaves like C-g -- a quit that unwinds a stuck synchronous call back
+    to top level; SIGUSR2 (`sig="usr2"`) trips Emacs's `debug-on-event`
+    default and drops into the Lisp debugger so a follow-up observation
+    shows *where* it was stuck. `sig` is ignored for TTY sessions.
+    """
+    sess = load_session(name)
+    sess.require_alive()
+    if sess.ui == "gui":
+        signum = _INTERRUPT_SIGNALS.get(sig)
+        if signum is None:
+            raise UsageError(
+                f"unknown interrupt signal {sig!r}; use one of: "
+                f"{', '.join(_INTERRUPT_SIGNALS)}")
+        delivered = gui.signal_pid(sess.emacs_pid, signum,
+                                   identity=sess.emacs_identity,
+                                   comm_hint="emacs")
+        if not delivered:
+            raise ElateError(
+                f"could not signal Emacs pid {sess.emacs_pid} for session "
+                f"{name!r}; it may have just exited")
+        how = signum.name  # "SIGINT" / "SIGUSR2"
+    else:
+        sess.raw().send_kbd("C-g")
+        how = "raw-C-g"
+    sess.log("interrupt", ui=sess.ui, signal=how,
+             **({"via": via} if via else {}))
+    return {"name": name, "ui": sess.ui, "delivered": how}
 
 
 def _dir_size(path: Path) -> int:

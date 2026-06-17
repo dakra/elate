@@ -10,10 +10,17 @@ import re
 import shlex
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from . import __version__, install, session as S
-from .errors import ElateError, EvalTimeout, RpcError, UsageError, WaitTimeout
+from .errors import (
+    ElateError,
+    EvalTimeout,
+    RpcError,
+    ScreenshotError,
+    UsageError,
+    WaitTimeout,
+)
 
 
 def _parse_size(value: str) -> tuple[int, int]:
@@ -44,8 +51,27 @@ def _fmt_duration(seconds: float) -> str:
     return f"{seconds:.0f}s"
 
 
+class _ElateParser(argparse.ArgumentParser):
+    """Argparse parser that hints at the global-flag ordering footgun.
+
+    The global flags (`-s/--session`, `--json`, `--human`) live on the
+    top-level parser, so they must precede the subcommand: `elate -s NAME
+    stop`, not `elate stop -s NAME`. The latter trips argparse's
+    "unrecognized arguments" path with a bare error; we append a pointer
+    to the right ordering when a session flag is what got stranded.
+    """
+
+    def error(self, message: str) -> NoReturn:
+        if message.startswith("unrecognized arguments") and (
+            "-s" in message.split() or "--session" in message
+        ):
+            message += ("\n(global flags go before the subcommand: "
+                        "`elate -s NAME <command>`)")
+        super().error(message)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = _ElateParser(
         prog="elate",
         description="Drive sandboxed, observable Emacs sessions.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -108,7 +134,28 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("stop", help="stop a session")
     sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
 
-    sub.add_parser("list", help="list known sessions")
+    sp = sub.add_parser(
+        "interrupt",
+        help="unblock a wedged session (raw C-g / signal) without stopping it",
+        description="Poke a busy-but-alive session without killing it. TTY: "
+                    "send raw C-g over tmux (works even when the semantic "
+                    "channel is blocked). GUI (no raw channel): signal Emacs "
+                    "-- --signal int (default) is a C-g-like quit that unwinds "
+                    "a stuck synchronous call; --signal usr2 drops into the "
+                    "Lisp debugger so a follow-up observation shows where it "
+                    "was stuck.")
+    sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
+    sp.add_argument("--signal", choices=["int", "usr2"], default="int",
+                    help="GUI only: int (C-g-like quit, default) or usr2 "
+                         "(enter the Lisp debugger); ignored for TTY")
+
+    sp = sub.add_parser("list", help="list known sessions")
+    sp.add_argument("name", nargs="?",
+                    help="only this session (or use -s NAME)")
+    sp.add_argument("--status", choices=["running", "stopped", "all"],
+                    default="all",
+                    help="filter by liveness: running, stopped (stopped/dead/"
+                         "corrupt), or all (default)")
 
     sp = sub.add_parser(
         "purge",
@@ -693,6 +740,12 @@ def cmd_stop(args: argparse.Namespace) -> Result:
     return result, f"stopped session {name!r}", 0
 
 
+def cmd_interrupt(args: argparse.Namespace) -> Result:
+    name = _name_arg(args)
+    result = S.interrupt_session(name, sig=args.signal)
+    return result, f"interrupted {name!r} via {result['delivered']}", 0
+
+
 def cmd_purge(args: argparse.Namespace) -> Result:
     result = S.purge_sessions(args.names, all_sessions=args.all_sessions,
                               stopped_older_than=args.stopped_older_than)
@@ -718,8 +771,18 @@ def cmd_purge(args: argparse.Namespace) -> Result:
 
 def cmd_list(args: argparse.Namespace) -> Result:
     sessions = S.list_sessions()
+    name = getattr(args, "name", None) or args.session
+    if name:
+        sessions = [s for s in sessions if s["name"] == name]
+    if args.status == "running":
+        sessions = [s for s in sessions if s["status"] == "running"]
+    elif args.status == "stopped":  # everything inert: stopped/dead/corrupt
+        sessions = [s for s in sessions if s["status"] != "running"]
     if not sessions:
-        return {"sessions": []}, "no sessions", 0
+        what = (f"no session named {name!r}" if name else
+                "no sessions" if args.status == "all" else
+                f"no {args.status} sessions")
+        return {"sessions": sessions}, what, 0
     lines = [f"{'NAME':<20} {'UI':<4} {'STATUS':<9} {'EMACS':<10} AGE"]
     for s in sessions:
         if s.get("uptime") is not None:
@@ -732,6 +795,10 @@ def cmd_list(args: argparse.Namespace) -> Result:
             f"{s['name']:<20} {s.get('ui') or '-':<4} {s['status']:<9} "
             f"{s.get('emacs_version') or '-':<10} {age}"
         )
+    inert = sum(1 for s in sessions if s["status"] != "running")
+    if inert >= 5:
+        lines.append(f"\n{inert} inert session(s) -- reclaim their sandboxes "
+                     "with `elate purge --stopped-older-than 1h`")
     return {"sessions": sessions}, "\n".join(lines), 0
 
 
@@ -860,12 +927,15 @@ def cmd_eval(args: argparse.Namespace) -> Result:
         busy = sess.is_busy()
         sess.log("eval-timeout", form=args.form)
         if busy and sess.ui == "tty":
-            hint = (" -- Emacs is still busy; raw C-g may unblock it:"
-                    f" elate -s {sess.name} keys C-g --raw")
+            hint = (" -- Emacs is still busy; unwedge it with "
+                    f"`elate -s {sess.name} interrupt` (raw C-g), or pass a "
+                    "bigger --timeout for a legitimately slow form")
         elif busy:
-            hint = (" -- Emacs is still busy; a GUI session has no raw "
-                    "channel to unblock it, stop the session if it stays "
-                    "wedged")
+            hint = (" -- Emacs is still busy; unwedge it with "
+                    f"`elate -s {sess.name} interrupt` (signals the GUI "
+                    "Emacs; --signal usr2 for a debugger backtrace), or pass "
+                    "a bigger --timeout for a legitimately slow form; stop "
+                    "the session if it stays wedged")
         else:
             hint = ""
         raise EvalTimeout(f"{exc}{hint}") from exc
@@ -1726,6 +1796,7 @@ def cmd_install(args: argparse.Namespace) -> Result:
 _COMMANDS = {
     "start": cmd_start,
     "stop": cmd_stop,
+    "interrupt": cmd_interrupt,
     "list": cmd_list,
     "purge": cmd_purge,
     "info": cmd_info,
@@ -1810,6 +1881,16 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload, ensure_ascii=False))
         else:
             print(f"elate: elisp error: {exc}", file=sys.stderr)
+        return 1
+    except ScreenshotError as exc:
+        # Spread the machine-readable reason ("locked" / "display_asleep" /
+        # "permission" / "window_gone") so a caller can branch without
+        # parsing the message.
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc),
+                              "reason": exc.reason}, ensure_ascii=False))
+        else:
+            print(f"elate: {exc}", file=sys.stderr)
         return 1
     except ElateError as exc:
         if args.json:

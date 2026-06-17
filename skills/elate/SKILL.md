@@ -99,7 +99,7 @@ Never sleep-and-poll. Never assume an effect happened — observe it.
 | normal key sequence that completes | `keys 'M-x foo RET'` (semantic, default) |
 | sequence that **opens a prompt and leaves it open** | `keys 'C-x C-f' --events` |
 | answering an already-open prompt | `type 'filename'` then `keys RET --events` |
-| Emacs is wedged/busy, nothing responds | `keys C-g --raw` (TTY only) |
+| Emacs is wedged/busy, nothing responds | `interrupt` (raw C-g on TTY; signals a GUI Emacs) |
 | literal text into a buffer | `type 'hello'` (or `eval '(insert …)'` for bulk) |
 | drive a **subprocess** (shell/REPL): ^C, feed input | `send-process --char C-c` / `send-process 'cmd\n'` |
 
@@ -113,8 +113,9 @@ empty input (bare `M-x` errors with "'' is not a valid command name").
 open for you to inspect (`state` shows prompt + candidates) and answer.
 
 - `--raw` sends real terminal bytes via tmux: works even when Emacs is
-  stuck (the unwedging tool), but rejects chords a terminal cannot encode
-  (e.g. `C-%`) and does not exist for GUI sessions.
+  stuck, but rejects chords a terminal cannot encode (e.g. `C-%`) and does
+  not exist for GUI sessions. To simply unwedge a busy Emacs, prefer
+  `interrupt` (below) over raw key plumbing.
 - A command that **rings the bell** aborts the whole semantic macro. elate
   reports the culprit — `key delivery aborted -- COMMAND rang the bell in
   BUFFER at point N` — so diagnose with `describe key …` / `messages`. To
@@ -125,10 +126,18 @@ open for you to inspect (`state` shows prompt + candidates) and answer.
   (`process-send-string`), bypassing the command loop: `--char C-c`
   interrupts a job, `send-process 'cmd\n'` feeds a shell/REPL, `--file`
   seeds a large payload. `keys`/`type` drive Emacs; this drives the process.
+  `--buffer NAME` targets *any* buffer with a live subprocess — a `shell`,
+  `comint` REPL, or a terminal buffer (`term`/`vterm`/`eat`). To drive a
+  program running inside a terminal buffer, send its bytes there directly,
+  e.g. `send-process --buffer '*ghostel*' --char 'C-c'` then
+  `send-process --buffer '*ghostel*' 'git status\n'`.
 - If a semantic `keys` call times out, the sequence probably left Emacs
-  reading input: retry with `--events`, or recover with `C-g --raw`.
-- After an eval/keys timeout where Emacs stays busy: `keys C-g --raw`
-  usually unblocks it. A GUI session has no raw channel — stop it instead.
+  reading input: retry with `--events`, or recover with `interrupt`.
+- After an eval/keys timeout where Emacs stays busy (`info` shows
+  `busy: true`): `interrupt` unblocks it — raw C-g on TTY, a C-g-like
+  SIGINT on GUI (`--signal usr2` instead drops Emacs into the Lisp debugger
+  so a follow-up `state`/`messages` shows where it was stuck). Stop the
+  session only if it stays wedged after an interrupt.
 
 ## Eval gotchas
 
@@ -143,8 +152,15 @@ uvx elate -s s eval '(my-fn 42)' --timeout 5
 - Printed values are truncated at 64 KiB (`truncated: true` +
   `value-length` in `--json`). Don't pass huge strings as arguments
   either (~1 MiB argv limit) — write a temp file and `load` it.
-- A form stuck in `sleep-for`/`sit-for`/process waits is interrupted by
-  `--timeout`; a hard elisp loop only ends via `C-g --raw`.
+- `--timeout` (default 15s) bounds the eval both in-Emacs and at the
+  client; **raise it** for a legitimately slow form (spawn, compile,
+  package install) rather than letting it abort. A form stuck in
+  `sleep-for`/`sit-for`/process waits is interrupted by `--timeout`; a
+  synchronous `call-process` or a hard elisp loop ignores it — recover with
+  `interrupt`.
+- Predicates often return a truthy *value*, not `t`: `(process-live-p p)`
+  yields the status tail `(run open listen connect stop)`, not `t`. Wrap
+  with `(and … t)` (or `(if … t nil)`) when you want a clean boolean back.
 
 ## Verify rendering structurally, not by eyeballing
 
@@ -168,6 +184,13 @@ uvx elate -s s popups                        # transient/which-key/corfu/childfr
 - `state`'s `popups` field tells you when a `popups` capture is worthwhile.
 - TTY `screenshot` prints the rendered screen as text (works post-mortem on
   a crashed Emacs); GUI `screenshot -o x.png` writes a PNG you can Read.
+- GUI capture on **macOS needs an awake, unlocked display** (`--headless`/Xvfb
+  is Linux-only). A failed capture reports a `reason` in the error JSON —
+  `locked` / `display_asleep` / `window_gone` / `permission` — so a locked or
+  asleep Mac is distinguishable from a missing Screen Recording grant. For an
+  unattended/CI Mac, keep a real GUI login awake and unlocked (auto-login +
+  disable screen-lock + `caffeinate -dimsu`); a backgrounded `launchd` runner
+  has no GUI session and always captures black.
 
 ## Tests, lint, profile, bench — fresh sessions only
 
@@ -253,7 +276,7 @@ images** instead of PNG files to read. If `elate_*` MCP tools are already
 available in your session (someone registered the server — the plugin is
 CLI-first and does not register it for you), use them directly — do **not**
 register a duplicate; otherwise register it with
-`claude mcp add elate -- uvx elate mcp`. The 28 `elate_*` tools cover the core surface (`attach`, `resize`,
+`claude mcp add elate -- uvx elate mcp`. The 29 `elate_*` tools cover the core surface (`attach`, `resize`,
 `export-script`, `snap`, `matrix`, and `install` stay CLI-only); sessions are shared
 between both (same names, same sandboxes), so you can mix.
 

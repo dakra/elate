@@ -1,8 +1,8 @@
 # elate - Emacs Lisp Automation Tool
 
 > **elate** /ɪˈleɪt/ *v.* - to fill (an AI) with joy by giving
-> it eyes and hands inside a live Emacs.
-> *"The agent was elated to find its keybinding actually fired."*
+> it eyes and hands inside a live Emacs.\
+> *"The agent was elated to find its keybinding actually fired."*\
 > From Latin *ēlātus*, "lifted up."
 
 [![CI](https://github.com/dakra/elate/actions/workflows/ci.yml/badge.svg)](https://github.com/dakra/elate/actions/workflows/ci.yml)
@@ -32,6 +32,12 @@ elate is on PyPI as [`elate`](https://pypi.org/project/elate/):
 uvx elate --help          # no install — uvx runs it straight from PyPI
 pipx run elate --help     # same, via pipx
 pip install elate         # or install it like any Python package
+```
+
+Or via [Homebrew](https://brew.sh) (also pulls in `tmux`):
+
+```sh
+brew install dakra/tap/elate
 ```
 
 For development, from a checkout:
