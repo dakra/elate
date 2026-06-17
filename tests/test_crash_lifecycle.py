@@ -20,6 +20,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -189,8 +190,18 @@ def test_eval_on_timeout_sample_captures_a_backtrace(
         assert rc == 1
         assert out["ok"] is False
         assert "sample" in out
-        assert out["sample"]["available"] is True
-        assert out["sample"]["backtrace"]
+        # A sampler must exist to actually capture; macOS always has `sample`,
+        # Linux needs eu-stack/gdb (absent on the CI runners). Either way the
+        # field is well-formed -- a backtrace when one ran, else a graceful
+        # available:False + reason rather than a crashed eval path.
+        sampler = (shutil.which("sample") if sys.platform == "darwin"
+                   else (shutil.which("eu-stack") or shutil.which("gdb")))
+        if sampler:
+            assert out["sample"]["available"] is True
+            assert out["sample"]["backtrace"]
+        else:
+            assert out["sample"]["available"] is False
+            assert out["sample"].get("reason")
     finally:
         # The session is wedged on sleep; stop falls through to a hard kill.
         _stop_quietly(name)
