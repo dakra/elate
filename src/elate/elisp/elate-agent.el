@@ -783,18 +783,27 @@ METHOD is \"macro\" (default; `execute-kbd-macro', synchronous) or
 \"events\" (append to `unread-command-events'; asynchronous, processed
 when control returns to the command loop -- use this for sequences that
 leave a prompt open, or that may ring the bell: events delivery is not a
-macro, so a bell merely beeps instead of aborting the sequence)."
-  (let ((vec (kbd keys)))
+macro, so a bell merely beeps instead of aborting the sequence).
+The reply's :command is what KEYS resolves to (via `key-binding') in the
+selected window's buffer, so a caller can tell a key that ran from one a
+buffer keymap swallowed.  :null for an unbound key or a multi-command
+sequence (no single binding)."
+  (let* ((vec (kbd keys))
+         ;; Resolve before delivery (a macro may change the selection), in
+         ;; the buffer the keys act in -- not this server buffer.
+         (command (elate--binding-name
+                   (with-current-buffer (window-buffer (selected-window))
+                     (ignore-errors (key-binding vec t))))))
     (pcase (or method "macro")
       ("events"
        (setq unread-command-events
              (nconc unread-command-events
                     (listify-key-sequence vec)))
-       (list :delivered "events" :keys keys))
+       (list :delivered "events" :keys keys :command command))
       ("macro"
        (condition-case err
            (progn (execute-kbd-macro vec)
-                  (list :delivered "macro" :keys keys))
+                  (list :delivered "macro" :keys keys :command command))
          (error (elate--macro-abort-report err keys))))
       (other (error "elate: unknown key delivery method %S" other)))))
 
@@ -1210,14 +1219,12 @@ PROP is `byte-obsolete-info' (functions) or `byte-obsolete-variable'."
       (append
        (list :key keys
              :bound (elate--jbool binding)
-             :prefix (elate--jbool (keymapp binding)))
-       (cond
-        ((null binding) (list :binding :null))
-        ((keymapp binding) (list :binding "prefix keymap"))
-        ((symbolp binding)
-         (list :binding (symbol-name binding)
-               :function (elate--function-info binding)))
-        (t (list :binding (elate--clip-print binding))))))))
+             :prefix (elate--jbool (keymapp binding))
+             :binding (elate--binding-name binding))
+       ;; Attach the full function description only for a command symbol
+       ;; (not a prefix keymap or an anonymous function).
+       (and binding (symbolp binding) (not (keymapp binding))
+            (list :function (elate--function-info binding)))))))
 
 (defun elate--clip-print (obj)
   "OBJ printed, clipped to a sane length."
@@ -1225,6 +1232,16 @@ PROP is `byte-obsolete-info' (functions) or `byte-obsolete-variable'."
         (print-level 6))
     (let ((s (prin1-to-string obj)))
       (if (> (length s) 2000) (concat (substring s 0 2000) "...") s))))
+
+(defun elate--binding-name (binding)
+  "Name of resolved key BINDING, for a JSON reply.
+:null when nil (unbound or multi-command), \"prefix keymap\" for a
+prefix, the symbol name for a command, else a clipped print form."
+  (cond
+   ((null binding) :null)
+   ((keymapp binding) "prefix keymap")
+   ((symbolp binding) (symbol-name binding))
+   (t (elate--clip-print binding))))
 
 (defun elate--describe-variable (sym)
   "Structured description of variable SYM in the current buffer's context."

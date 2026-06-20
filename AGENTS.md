@@ -31,7 +31,13 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   **through the command loop**, so they obey the active keymaps (e.g. in evil
   *normal* state `type "abc"` sends commands, not text), and a command that
   rings the bell aborts the whole macro — use `keys … --no-abort-on-bell`
-  (or `--events`) to deliver past a bell. A sequence that opens a minibuffer
+  (or `--events`) to deliver past a bell. Because they obey the buffer's
+  keymaps, a buffer that intercepts keys (a terminal emulator in char mode,
+  many special-mode buffers) can **swallow** one and your global command
+  never runs; the result's `command` field is what the keys resolved to in
+  the focused buffer (`null` for an unbound key or a multi-command sequence)
+  — check it, and `eval` a command directly when it must run regardless of
+  bindings. A sequence that opens a minibuffer
   prompt and leaves it open needs `keys … --events` (queued); unwedging a
   stuck Emacs (`info` shows `busy: true`) needs `interrupt` (raw C-g on TTY,
   a C-g-like SIGINT on GUI; `--signal usr2` for a debugger backtrace).

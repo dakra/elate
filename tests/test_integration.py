@@ -232,6 +232,18 @@ def test_semantic_keys_events_open_prompt(sess: S.Session) -> None:
     sess.raw().send_kbd("C-g")  # cancel
     S.wait_idle(sess, timeout=5.0)
 
+def test_semantic_keys_report_resolved_command(sess: S.Session) -> None:
+    reset_scratch(sess)
+    # A single chord reports the command it resolves to in the focused buffer.
+    data = sess.semantic().rpc("keys", "C-x h", "macro")  # mark-whole-buffer
+    assert data["command"] == "mark-whole-buffer"
+    # Events delivery carries it too (resolved before the keys are queued).
+    data = sess.semantic().rpc("keys", "C-x h", "events")
+    assert data["command"] == "mark-whole-buffer"
+    # A sequence that runs more than one command has no single binding.
+    data = sess.semantic().rpc("keys", "ab", "macro")
+    assert data["command"] is None
+
 def test_raw_type_and_wait_text(sess: S.Session) -> None:
     reset_scratch(sess)
     sess.raw().type_text("rawtyped42")

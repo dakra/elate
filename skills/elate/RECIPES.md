@@ -222,6 +222,13 @@ derives the state from `last-focus-update`). Works in TTY and GUI sessions;
 `type` and `keys` run through Emacs's command loop (so they obey the
 buffer's keymaps); `send-process` bypasses it and writes raw bytes to the
 buffer's process — the right tool for shells/REPLs that read from a PTY.
+Because they obey the buffer's keymaps, a buffer that intercepts keys can
+**swallow** one — a terminal emulator in char mode (vterm/eat/term)
+forwards most keystrokes to its PTY, so a globally-bound key never runs the
+command you meant. `keys` reports what the sequence resolved to in the
+focused buffer as its `command` field (`null` for an unbound key or a
+multi-command sequence), so you can tell a real invocation from a swallowed
+key; to run a command regardless of buffer bindings, `eval` it directly.
 
 Reuse the same startup setup across many sessions with `--eval-file
 setup.el` (a forms file, no `load-path` side effects) or `--profile NAME`

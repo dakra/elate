@@ -208,7 +208,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("info", help="show session details")
     sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
 
-    sp = sub.add_parser("keys", help="send keys (Emacs kbd notation)")
+    sp = sub.add_parser(
+        "keys", help="send keys (Emacs kbd notation)",
+        description="Send a key sequence. Semantic keys run through the "
+                    "command loop and obey the focused buffer's keymaps, so "
+                    "a buffer that intercepts keys (a terminal emulator in "
+                    "char mode, special-mode buffers) can swallow one and "
+                    "your intended command never runs. The result's "
+                    "`command` field is what the sequence resolves to in the "
+                    "focused buffer (null for an unbound key or a "
+                    "multi-command sequence); `eval` a command directly to "
+                    "run it regardless of bindings.")
     sp.add_argument("keys", help="key sequence in Emacs kbd notation, "
                                  "e.g. 'C-x C-f' or 'M-x foo RET'")
     grp = sp.add_mutually_exclusive_group()
@@ -913,7 +923,10 @@ def cmd_keys(args: argparse.Namespace) -> Result:
                 "Retry with --events (queued delivery) or --raw."
             ) from exc
         result = {"keys": args.keys, "channel": "semantic", **data}
-    return result, f"sent {args.keys!r} ({result['channel']})", 0
+    msg = f"sent {args.keys!r} ({result['channel']})"
+    if result.get("command"):
+        msg += f" -> {result['command']}"
+    return result, msg, 0
 
 
 def cmd_type(args: argparse.Namespace) -> Result:

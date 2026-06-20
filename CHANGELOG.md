@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.10.0
+
+`keys` now tells you whether a keystroke actually reached the command you meant.
+
+- **`command` field on `keys` results** (CLI, `elate_keys`, scenario scripts):
+  every semantic `keys` reply now reports what the sequence resolves to in the
+  focused buffer (`key-binding`), so you can tell an intended command from one a
+  buffer keymap swallowed. Keys run through the command loop and obey the focused
+  buffer's keymaps, so a buffer that intercepts keys — a terminal emulator in
+  char mode (vterm/eat/term), many special-mode buffers — can forward a
+  globally-bound key and the command you meant never runs; `command` makes that
+  visible instead of leaving you to infer it from `delivered`. It is `null` for
+  an unbound key or a multi-command sequence (no single binding). The CLI's
+  human one-liner shows it too (`sent '<f8>' (semantic) -> term-send-raw`). When
+  a command must run regardless of buffer bindings, call it directly with
+  `eval`. Docs (SKILL/RECIPES/AGENTS) note the swallow case.
+
 ## 0.9.0
 
 Crash, hang, and lifecycle handling for heavy parallel / fuzz-testing runs,

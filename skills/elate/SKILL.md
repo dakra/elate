@@ -118,6 +118,16 @@ empty input (bare `M-x` errors with "'' is not a valid command name").
 `--events` queues on `unread-command-events` instead, so the prompt stays
 open for you to inspect (`state` shows prompt + candidates) and answer.
 
+- Because keys obey the focused buffer's keymaps, a buffer that intercepts
+  keys can **swallow** one: a terminal emulator in char mode (vterm/eat,
+  and the like) forwards most keystrokes to its PTY, and many special-mode
+  buffers rebind keys, so a globally-bound key never runs as the command
+  you meant. The result's `command` field is what the sequence resolves to
+  in the focused buffer (`null` for an unbound key or a multi-command
+  sequence) — assert on it instead of inferring from `delivered`:
+  `keys '<f8>'` returning `"command": "term-send-raw"` tells you the
+  terminal ate the key. When a command **must** run regardless of buffer
+  bindings, call it directly with `eval`.
 - `--raw` sends real terminal bytes via tmux: works even when Emacs is
   stuck, but rejects chords a terminal cannot encode (e.g. `C-%`) and does
   not exist for GUI sessions. To simply unwedge a busy Emacs, prefer

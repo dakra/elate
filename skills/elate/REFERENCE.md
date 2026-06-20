@@ -130,6 +130,8 @@ show session details
 
 send keys (Emacs kbd notation)
 
+Send a key sequence. Semantic keys run through the command loop and obey the focused buffer's keymaps, so a buffer that intercepts keys (a terminal emulator in char mode, special-mode buffers) can swallow one and your intended command never runs. The result's `command` field is what the sequence resolves to in the focused buffer (null for an unbound key or a multi-command sequence); `eval` a command directly to run it regardless of bindings.
+
 - `keys` -- key sequence in Emacs kbd notation, e.g. 'C-x C-f' or 'M-x foo RET'
 - `--semantic` -- deliver via execute-kbd-macro (default)
 - `--raw` -- deliver as raw terminal bytes via tmux

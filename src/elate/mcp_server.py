@@ -426,6 +426,14 @@ def elate_keys(
     'idle') and then elate_state to observe the effect. If a semantic
     delivery times out, the keys probably left Emacs reading input --
     retry with delivery='events' or 'raw'.
+
+    Keys run through the command loop and obey the focused buffer's
+    keymaps, so a buffer that intercepts keys (a terminal emulator in char
+    mode, special-mode buffers) can swallow one and your intended command
+    never runs. The result's `command` field is what the sequence resolves
+    to in the focused buffer (null for an unbound key or a multi-command
+    sequence) -- check it to catch a swallowed key. Use elate_eval to run a
+    command regardless of bindings.
     """
     sess = None
     try:

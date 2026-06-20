@@ -1032,6 +1032,38 @@ def test_keys_bell_abort_reports_culprit(sess: S.Session,
         sess.semantic().eval_form('(global-unset-key (kbd "<f8>"))')
 
 
+def test_keys_command_reveals_swallowed_key(
+        sess: S.Session, capsys: pytest.CaptureFixture[str]) -> None:
+    # A buffer whose major mode forwards every key (a terminal emulator in
+    # char mode, say) swallows a globally-bound key: the global command
+    # never runs, and the result's `command` names the catch-all that ate it
+    # -- the signal a caller needs to tell a real invocation from a swallow.
+    sess.semantic().eval_form(
+        '(progn'
+        '  (setq elate-test-f8-ran nil)'
+        '  (global-set-key (kbd "<f8>")'
+        '    (lambda () (interactive) (setq elate-test-f8-ran t)))'
+        '  (defun elate-test-forward () (interactive))'
+        '  (define-derived-mode elate-test-term-mode fundamental-mode "ElTestTerm")'
+        '  (define-key elate-test-term-mode-map [t] (quote elate-test-forward))'
+        '  (with-current-buffer (get-buffer-create "*eltest-term*")'
+        '    (elate-test-term-mode))'
+        '  (switch-to-buffer "*eltest-term*"))')
+    try:
+        code = cli.main(["--json", "-s", NAME, "keys", "<f8>"])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 0 and out["ok"] is True
+        assert out["command"] == "elate-test-forward"   # the catch-all ate it
+        # The globally-bound command never ran.
+        assert sess.semantic().eval_form("elate-test-f8-ran")["value"] == "nil"
+    finally:
+        sess.semantic().eval_form(
+            '(progn (global-unset-key (kbd "<f8>"))'
+            '       (switch-to-buffer "*scratch*")'
+            '       (when (get-buffer "*eltest-term*")'
+            '         (kill-buffer "*eltest-term*")))')
+
+
 # -- send-process (drive a buffer's subprocess) ------------------------------
 
 def _b64(s: str) -> str:
