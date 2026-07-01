@@ -2121,3 +2121,98 @@ def test_run_script_xfail_map_classification(
     code, out = run()
     assert code == 1 and out["steps"][0]["status"] == "failed"
     assert running_run_sessions() == []
+
+
+SET_FILE_SCRIPT = {
+    "session": {"config": "bare", "size": "80x24"},
+    "steps": [
+        {"eval": '(progn (switch-to-buffer "*scratch*") (erase-buffer) '
+                 '(insert "{{v}}"))'},
+        {"assert": {"eval": '(string= (buffer-string) "{{want}}")',
+                    "buffer": "*scratch*"}},
+    ],
+}
+
+
+def test_run_set_file(elate_home: str, tmp_path: Path,
+                      capsys: pytest.CaptureFixture[str]) -> None:
+    # The file's contents bind verbatim minus exactly ONE trailing newline
+    # (editors append one; a second survives), alongside a plain --set.
+    path = write_script(tmp_path, SET_FILE_SCRIPT, "sf.json")
+    multi = tmp_path / "multi.txt"
+    multi.write_text("line1\nline2\n", encoding="utf-8")
+    code = cli.main(["--json", "run", "--set-file", f"v={multi}",
+                     "--set", "want=line1\\nline2", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    blank = tmp_path / "blank.txt"
+    blank.write_text("x\n\n", encoding="utf-8")
+    code = cli.main(["--json", "run", "--set-file", f"v={blank}",
+                     "--set", "want=x\\n", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    assert running_run_sessions() == []
+
+
+def test_run_set_file_guards(elate_home: str, tmp_path: Path,
+                             capsys: pytest.CaptureFixture[str]) -> None:
+    # All loud, all before anything boots.
+    path = write_script(tmp_path, SET_FILE_SCRIPT, "sfg.json")
+    val = tmp_path / "val.txt"
+    val.write_text("x", encoding="utf-8")
+    for argv, msg in [
+        (["--set-file", f"v={tmp_path}/nope.txt"], "cannot read --set-file"),
+        (["--set", "v=a", "--set-file", f"v={val}"], "both --set and"),
+        (["--set-file", f"v={val}", "--set-file", f"v={val}"],
+         "more than once"),
+        # The reserved name is rejected via render_script like any override.
+        (["--set-file", f"variant={val}"], "reserved"),
+    ]:
+        code = cli.main(["--json", "run", *argv, path])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 1 and msg in out["error"], (argv, out)
+    assert running_run_sessions() == []
+
+
+def test_matrix_set_file(elate_home: str, tmp_path: Path,
+                         capsys: pytest.CaptureFixture[str]) -> None:
+    emacs = shutil.which("emacs")
+    val = tmp_path / "val.txt"
+    val.write_text("constant\n", encoding="utf-8")
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"assert": {"eval": '(string= "{{v}}" "constant")'},
+                   "comment": "n={{n}}"}],
+    }, "msf.json")
+    # A constant binding crosses with a --param axis: both combos see it.
+    code = cli.main(["--json", "matrix", "--emacs", emacs,
+                     "--param", "n=1,2", "--set-file", f"v={val}",
+                     "--", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    assert len(out["results"]) == 2
+    assert all(r["success"] for r in out["results"])
+    # Guards: a constant cannot also be an axis, and a dead constant is loud.
+    code = cli.main(["--json", "matrix", "--emacs", emacs,
+                     "--param", "v=1,2", "--set-file", f"v={val}", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "cannot also be an axis" in out["error"]
+    code = cli.main(["--json", "matrix", "--emacs", emacs,
+                     "--param", "n=1", "--set-file", f"dead={val}", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "never referenced" in out["error"]
+    assert "dead" in out["error"]
+    # Documented precedence: a --set-file constant MAY override a
+    # variant-bound variable (params < variant < overrides), unlike a
+    # --param axis, which errors.
+    vpath = write_script(tmp_path, {
+        "variants": {"a": {"v": "from-variant"}},
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"assert": {"eval": '(string= "{{v}}" "constant")'}}],
+    }, "msfv.json")
+    code = cli.main(["--json", "matrix", "--emacs", emacs,
+                     "--set-file", f"v={val}", "--", vpath])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out                    # the file value won
+    assert out["results"][0]["axes"]["variant"] == "a"
+    assert running_run_sessions() == []

@@ -26,6 +26,15 @@
   undeclared variant is a loud error. New `examples/shell-variants.json`
   shows variants + conditional xfail end to end.
 
+- **`run`/`matrix --set-file NAME=PATH`**: bind a `{{NAME}}` template
+  variable to a file's contents verbatim (exactly one trailing newline
+  stripped) — multi-line, quote-heavy values like shell setup snippets
+  without fighting shell quoting. On `matrix` the binding is a constant
+  across every combo, not an axis. Binding a NAME with both `--set` and
+  `--set-file`, repeating a `--set-file` NAME, or colliding with a
+  `--param` axis are loud errors. (MCP `elate_run_script` needs no
+  equivalent: its `params` object carries multi-line values directly.)
+
 ## 0.11.0
 
 A scenario run can now report *what does not work* — every check, not just the

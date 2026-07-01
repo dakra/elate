@@ -90,7 +90,13 @@ A top-level `"params"` block declares template variables with defaults;
 every `{{var}}` in a string value (anywhere in the scenario) is substituted
 **before** validation. `elate run --set NAME=VALUE` (repeatable) overrides a
 default, and `matrix --param NAME=v1,v2` turns one into an axis — so a
-single scenario drives many shells/configs. An unknown `{{var}}` (no
+single scenario drives many shells/configs. For multi-line or quote-heavy
+values (a shell setup snippet full of `;`, `$`, and quotes), `--set-file
+NAME=PATH` (run and matrix) binds the file's contents verbatim, minus
+exactly one trailing newline — no shell quoting in the way; binding the
+same NAME with both `--set` and `--set-file` is an error. (The MCP
+`elate_run_script` tool needs no file indirection: its `params` object
+carries multi-line values directly.) An unknown `{{var}}` (no
 default, no `--set`) is a loud error before anything boots. The `params`
 block is consumed (it is not itself templated and never reaches the run).
 Only **string** values are templated, so numeric fields (`timeout`,

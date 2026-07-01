@@ -289,9 +289,9 @@ def render_script(raw: Any, overrides: dict[str, str],
         bindings["variant"] = variant or ""
     if "variant" in overrides:
         raise ElateError(
-            "'variant' cannot be bound directly (--set/--param/params): it "
-            "is reserved for the active variant name; select a variant "
-            "with --variant instead")
+            "'variant' cannot be bound directly (--set/--set-file/--param/"
+            "params): it is reserved for the active variant name; select a "
+            "variant with --variant instead")
     bindings.update(overrides)
     missing: set[str] = set()
     rendered = _substitute(raw, bindings, missing)

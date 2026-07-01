@@ -1122,7 +1122,9 @@ def elate_run_script(
     params: Annotated[dict[str, str] | None, Field(description=(
         "Bind {{var}} template variables in the scenario (overriding any "
         "scenario \"params\" defaults), e.g. {\"shell\": \"/bin/zsh\"} so one "
-        "scenario file drives many configs."))] = None,
+        "scenario file drives many configs. Multi-line values pass through "
+        "verbatim (no shell in between), so there is no separate file-"
+        "binding argument like the CLI's --set-file."))] = None,
     variant: Annotated[str | None, Field(description=(
         "Select one entry of the scenario's \"variants\" block (a NAMED set "
         "of co-varying {{var}} bindings): it overlays the \"params\" "

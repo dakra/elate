@@ -39,6 +39,35 @@ def _parse_kv_pair(value: str) -> tuple[str, str]:
     return key, val
 
 
+def _read_set_files(pairs: list[tuple[str, str]],
+                    set_vars: list[tuple[str, str]]) -> dict[str, str]:
+    """Resolve --set-file NAME=PATH pairs to {NAME: file contents}.
+
+    The value is the file read verbatim (UTF-8) minus exactly one trailing
+    newline -- editors append one, and a shell setup snippet must not grow
+    a blank line -- interior newlines and any second trailing newline
+    survive. Collisions are loud: the same NAME twice, or in both --set
+    and --set-file, has no visible ordering, and last-wins would silently
+    discard a deliberate file read.
+    """
+    out: dict[str, str] = {}
+    set_names = {k for k, _ in set_vars}
+    for name, path in pairs:
+        if name in out:
+            raise ElateError(f"--set-file {name!r} given more than once")
+        if name in set_names:
+            raise ElateError(
+                f"{name!r} is bound by both --set and --set-file -- drop one")
+        try:
+            text = Path(path).expanduser().read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ElateError(
+                f"cannot read --set-file {name!r} from {path!r}: "
+                f"{exc}") from exc
+        out[name] = re.sub(r"\r?\n\Z", "", text, count=1)
+    return out
+
+
 _DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
@@ -656,6 +685,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="bind a {{NAME}} template variable in the scenario "
                          "(repeatable); overrides a scenario \"params\" "
                          "default, so one scenario can drive many configs")
+    sp.add_argument("--set-file", action="append", default=[],
+                    metavar="NAME=PATH", type=_parse_kv_pair,
+                    dest="set_file_vars",
+                    help="bind a {{NAME}} template variable to PATH's "
+                         "contents verbatim (one trailing newline stripped) "
+                         "-- multi-line/quote-heavy values without shell "
+                         "quoting; binding a NAME in both --set and "
+                         "--set-file is an error")
     sp.add_argument("--variant", metavar="NAME",
                     help="select one entry of the scenario's \"variants\" "
                          "block: its bindings overlay the \"params\" defaults "
@@ -744,6 +781,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="filter the variant axis to these \"variants\" "
                          "entries (comma-separated, repeatable); default: "
                          "every declared variant")
+    sp.add_argument("--set-file", action="append", default=[],
+                    metavar="NAME=PATH", type=_parse_kv_pair,
+                    dest="set_file_vars",
+                    help="bind a {{NAME}} template variable to PATH's "
+                         "contents verbatim (one trailing newline stripped), "
+                         "constant across every combo -- not an axis")
     sp.add_argument("--format", choices=("json", "human"),
                     help="output format: 'human' (default) the grid, 'json' "
                          "the structured results. Overrides --json/--human.")
@@ -1969,7 +2012,9 @@ def cmd_run(args: argparse.Namespace) -> Result:
         # A name is only meaningful for a session that survives the run;
         # otherwise it just leaves a non-run-* leftover on failure.
         raise ElateError("--name requires --keep (it names the kept session)")
-    script, base = SC.load_script(args.script, dict(args.set_vars),
+    overrides = {**_read_set_files(args.set_file_vars, args.set_vars),
+                 **dict(args.set_vars)}
+    script, base = SC.load_script(args.script, overrides,
                                   variant=args.variant)
     target = None
     if args.session:
@@ -2165,6 +2210,16 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
             raise ElateError(f"--param {name!r} lists no values")
         axes[name] = values
 
+    # --set-file vars are constant bindings, identical in every combo (the
+    # counterpart of run's --set/--set-file; matrix's per-combo bindings are
+    # the axes). A name on both sides would make the axis silently dead.
+    file_vars = _read_set_files(args.set_file_vars, [])
+    fclash = sorted(n for n in file_vars if n in axes)
+    if fclash:
+        raise ElateError(
+            f"--set-file name(s) {fclash} collide with a --param axis of "
+            "the same name -- a constant binding cannot also be an axis")
+
     raw, base = SC.load_raw(args.script)
     if not isinstance(raw, dict):
         raise ElateError('a script must be a JSON object with a "steps" list')
@@ -2203,6 +2258,11 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
         raise ElateError(
             f"--param axis/axes {sorted(unused)} are never referenced by a "
             "{{name}} template in the scenario")
+    dead_files = sorted(n for n in file_vars if n not in referenced)
+    if dead_files:
+        raise ElateError(
+            f"--set-file name(s) {dead_files} are never referenced by a "
+            "{{name}} template in the scenario")
     for vname in variant_axis:
         if vname is None:
             continue
@@ -2233,7 +2293,8 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
     # NAMES plus the variant's binding keys, identical across that
     # variant's combos) instead of the same error N times.
     if combos:
-        first_params = {n: axes[n][0] for n in axis_names}
+        first_params = {**file_vars,
+                        **{n: axes[n][0] for n in axis_names}}
         for vname in variant_axis:
             SC.render_script(raw, first_params, variant=vname)
 
@@ -2292,7 +2353,8 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
         stem = base_stem + suffix[combo_key(vname, params)]
         axes_out = {"emacs": emacs_bin, **shown}
         try:
-            rendered = SC.render_script(raw, params, variant=vname)
+            rendered = SC.render_script(raw, {**file_vars, **params},
+                                        variant=vname)
             run = SC.run_script(
                 rendered, base_dir=base, emacs=emacs_bin, on_step=on_step,
                 purge=True,  # purge a passing combo; failed combos are kept
