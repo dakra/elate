@@ -379,6 +379,7 @@ Execute a JSON scenario script: create a fresh sandboxed session from the script
 - `--emacs PATH` -- override the script's emacs binary (CI matrix)
 - `--update-snapshots` -- write/overwrite golden artifacts for snapshot assertions instead of comparing them; the run still executes every step (review the diff before committing)
 - `--snapshot-dir DIR` -- base directory for golden snapshots (default: <scenario-dir>/__snapshots__)
+- `--format {json,human,junit,tap}` -- output format: 'human' (default when not piped) a summary + per-group verdicts, 'json' the full result, 'junit' a JUnit XML testsuite (one testcase per group / ungrouped step), 'tap' TAP version 13. Overrides the global --json/--human for this run.
 
 ## elate export-script
 

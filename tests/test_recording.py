@@ -199,6 +199,87 @@ def test_validate_script_errors() -> None:
             SC.validate_script(script)
 
 
+def test_format_junit_and_tap() -> None:
+    # Pure formatter test on a synthetic result (no Emacs): a group becomes
+    # one testcase (at its first step), ungrouped non-comment steps their own.
+    import xml.etree.ElementTree as ET
+    result = {
+        "name": "demo", "success": False, "duration": 1.25,
+        "groups": [
+            {"name": "dw", "status": "PASS", "steps": [1, 2]},
+            {"name": "u", "status": "XFAIL", "steps": [3]},
+            {"name": "cc", "status": "FAIL", "steps": [4]},
+        ],
+        "steps": [
+            {"index": 1, "status": "comment", "group": "dw",
+             "summary": "# group: dw"},
+            {"index": 2, "status": "ok", "group": "dw", "summary": "assert ok"},
+            {"index": 3, "status": "xfail", "group": "u",
+             "summary": "assert x", "reason": "known"},
+            {"index": 4, "status": "failed", "group": "cc",
+             "summary": "assert y", "error": "boom"},
+            {"index": 5, "status": "failed", "summary": "eval z",
+             "error": "ungrouped boom"},
+            {"index": 6, "status": "comment", "summary": "# note"},
+        ],
+    }
+    xml = cli._format_junit(result)
+    root = ET.fromstring(xml)                       # well-formed
+    assert root.tag == "testsuite"
+    assert root.attrib["tests"] == "4"              # dw, u, cc, step 5
+    assert root.attrib["failures"] == "2"           # cc + ungrouped step 5
+    assert root.attrib["skipped"] == "1"            # u (xfail)
+    names = [tc.attrib["name"] for tc in root.findall("testcase")]
+    assert names == ["group: dw", "group: u", "group: cc", "step 5: eval z"]
+    u_case = root.findall("testcase")[1]
+    assert u_case.find("skipped") is not None       # xfail -> skipped
+    cc_case = root.findall("testcase")[2]
+    assert cc_case.find("failure") is not None
+
+    tap = cli._format_tap(result)
+    lines = tap.splitlines()
+    assert lines[0] == "TAP version 13"
+    assert lines[1] == "1..4"
+    assert lines[2] == "ok 1 - group: dw"
+    assert lines[3] == "ok 2 - group: u # TODO xfail: known failure"
+    assert lines[4] == "not ok 3 - group: cc"
+    assert lines[5].startswith("not ok 4 - step 5: eval z")
+
+
+def test_format_junit_tap_edge_cases() -> None:
+    import xml.etree.ElementTree as ET
+    result = {
+        "name": "e\x1bdge", "success": False, "duration": 0.5, "groups": [],
+        "steps": [
+            {"index": 1, "status": "failed", "summary": "assert x",
+             "error": "boom \x1b[31m\x00 red"},         # raw control chars
+            {"index": 2, "status": "failed", "optional": True,
+             "summary": "opt", "error": "tolerated"},   # optional -> tolerated
+            {"index": 3, "status": "xfail", "summary": "kf",
+             "reason": "line1\nline2"},                 # newline in reason
+        ],
+    }
+    xml = cli._format_junit(result)
+    root = ET.fromstring(xml)                           # well-formed despite ctrl chars
+    assert "\x1b" not in xml and "\x00" not in xml
+    assert root.attrib["name"] == "edge"                # stripped from suite name
+    assert root.attrib["failures"] == "1"               # only the non-optional fail
+    assert root.attrib["skipped"] == "2"                # optfail + xfail
+
+    tap = cli._format_tap(result)
+    lines = tap.splitlines()
+    assert lines[1] == "1..3"
+    assert len(lines) == 2 + 3                           # no phantom line from the reason newline
+    assert lines[3] == "not ok 2 - step 2: opt # TODO optional failure"
+    assert lines[4] == "ok 3 - step 3: kf # TODO xfail: line1 line2"
+
+
+def test_outcome_unknown_status_surfaces_as_failure() -> None:
+    # A future/unknown status must never be silently rendered as a pass.
+    assert cli._step_outcome({"status": "weird"})[0] == "fail"
+    assert cli._group_outcome({"status": "WEIRD"})[0] == "fail"
+
+
 def test_run_script_bad_types_clean_cli_error(
         elate_home: str, tmp_path: Path,
         capsys: pytest.CaptureFixture[str]) -> None:
@@ -474,6 +555,32 @@ def test_run_script_group_merge_clear_and_empty(
     assert groups["dw"]["steps"] == [2, 3, 6, 7]
     # The trailing step after {"group": null} belongs to no group.
     assert not any(9 in g["steps"] for g in out["groups"])
+    assert running_run_sessions() == []
+
+
+def test_run_format_junit_plumbing(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # --format junit overrides the global output mode, emits a valid XML
+    # document, exits 1 on failure, and suppresses per-step streaming.
+    import xml.etree.ElementTree as ET
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"group": "ok"},
+            {"assert": {"eval": "(= 1 1)"}},
+            {"group": "bad"},
+            {"assert": {"eval": "(= 1 2)"}},
+        ],
+    })
+    code = cli.main(["run", path, "--format", "junit", "--keep-going"])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert out.startswith("<?xml")               # no streaming leaked ahead of it
+    root = ET.fromstring(out)                     # the CLI emitted valid XML
+    assert root.attrib["failures"] == "1"
+    names = {tc.attrib["name"] for tc in root.findall("testcase")}
+    assert names == {"group: ok", "group: bad"}
     assert running_run_sessions() == []
 
 

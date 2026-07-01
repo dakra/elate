@@ -612,6 +612,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--snapshot-dir", metavar="DIR",
                     help="base directory for golden snapshots "
                          "(default: <scenario-dir>/__snapshots__)")
+    sp.add_argument("--format", choices=("json", "human", "junit", "tap"),
+                    help="output format: 'human' (default when not piped) a "
+                         "summary + per-group verdicts, 'json' the full "
+                         "result, 'junit' a JUnit XML testsuite (one testcase "
+                         "per group / ungrouped step), 'tap' TAP version 13. "
+                         "Overrides the global --json/--human for this run.")
 
     sp = sub.add_parser(
         "export-script",
@@ -1748,6 +1754,128 @@ def _run_summary(result: dict[str, Any]) -> str:
     return line
 
 
+# XML 1.0 forbids the C0 control chars except tab/newline/CR. A failing
+# assert against a terminal buffer routinely puts a raw ESC/NUL/BEL into the
+# error message, so strip them or the "valid XML" promise breaks.
+_XML_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xml_safe(s: str) -> str:
+    return _XML_ILLEGAL.sub("", s)
+
+
+def _group_outcome(g: dict[str, Any]) -> tuple[str, str]:
+    """Normalize a group verdict to (outcome, message) for junit/tap."""
+    return {
+        "PASS": ("pass", ""),
+        "FAIL": ("fail", "group failed"),
+        "XPASS": ("xpass", "a known-failing step passed -- drop the xfail marker"),
+        "XFAIL": ("xfail", "known failure"),
+        "OPT-FAIL": ("optfail", "optional failure"),
+        "not-run": ("notrun", "not run"),
+        "SKIP": ("skip", ""),
+        # An unknown verdict surfaces as a failure rather than a silent pass.
+    }.get(g["status"], ("fail", f"unknown group verdict {g['status']!r}"))
+
+
+def _step_outcome(rec: dict[str, Any]) -> tuple[str, str]:
+    """Normalize a step status to (outcome, message) for junit/tap."""
+    s = rec["status"]
+    if s == "ok":
+        return "pass", ""
+    if s == "failed":
+        if rec.get("optional"):
+            return "optfail", rec.get("error", "optional failure")
+        return "fail", rec.get("error", "failed")
+    if s == "xpass":
+        return "xpass", "unexpected pass -- drop the xfail marker"
+    if s == "xfail":
+        return "xfail", rec.get("reason", "known failure")
+    if s == "not-run":
+        return "notrun", "not run"
+    if s == "skipped":
+        return "skip", ""
+    # Unknown/future status: surface it, never silently green.
+    return "fail", f"unknown status {s!r}"
+
+
+def _testcases(result: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """One (name, outcome, message) per test case, in step order.
+
+    A group becomes a single case (emitted at its first step); every
+    ungrouped, non-comment step becomes its own case. Comment/marker steps
+    are annotations, not tests.
+    """
+    groups = result.get("groups") or []
+    first = {g["steps"][0]: g for g in groups if g.get("steps")}
+    grouped = {i for g in groups for i in g.get("steps", [])}
+    cases: list[tuple[str, str, str]] = []
+    for rec in result.get("steps") or []:
+        idx = rec["index"]
+        if idx in first:
+            g = first[idx]
+            cases.append((f"group: {g['name']}", *_group_outcome(g)))
+        elif idx in grouped or rec["status"] == "comment":
+            continue
+        else:
+            cases.append((f"step {idx}: {rec['summary']}", *_step_outcome(rec)))
+    return cases
+
+
+def _format_junit(result: dict[str, Any]) -> str:
+    from xml.sax.saxutils import quoteattr
+    cases = _testcases(result)
+    fail_kinds = {"fail", "xpass"}
+    n_fail = sum(1 for _, o, _ in cases if o in fail_kinds)
+    n_skip = sum(1 for _, o, _ in cases if o not in fail_kinds and o != "pass")
+    body: list[str] = []
+    for name, outcome, msg in cases:
+        attr = f"name={quoteattr(_xml_safe(name))}"
+        if outcome == "pass":
+            body.append(f"  <testcase {attr}/>")
+        elif outcome in fail_kinds:
+            body.append(f"  <testcase {attr}>")
+            body.append(
+                f"    <failure message={quoteattr(_xml_safe(msg or outcome))}/>")
+            body.append("  </testcase>")
+        else:
+            body.append(f"  <testcase {attr}>")
+            body.append(f"    <skipped message={quoteattr(_xml_safe(msg))}/>"
+                        if msg else "    <skipped/>")
+            body.append("  </testcase>")
+    head = (f"<testsuite name={quoteattr(_xml_safe(result.get('name') or 'elate'))} "
+            f'tests="{len(cases)}" failures="{n_fail}" skipped="{n_skip}" '
+            f'time="{result.get("duration", 0):.3f}">')
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n' + head
+            + ("\n" + "\n".join(body) if body else "") + "\n</testsuite>")
+
+
+def _format_tap(result: dict[str, Any]) -> str:
+    cases = _testcases(result)
+    lines = ["TAP version 13", f"1..{len(cases)}"]
+    for i, (name, outcome, msg) in enumerate(cases, 1):
+        ok, directive = {
+            "fail": ("not ok", ""),
+            "xpass": ("not ok", f"xpass: {msg}" if msg else "xpass"),
+            "xfail": ("ok", f"TODO xfail: {msg}" if msg else "TODO xfail"),
+            # A tolerated failure: "not ok" (it failed) but TODO (non-gating),
+            # mirroring JUnit's <skipped> -- a plain "ok" would read as a pass.
+            "optfail": ("not ok", "TODO optional failure"),
+            "skip": ("ok", "SKIP"),
+            "notrun": ("ok", "SKIP not run"),
+        }.get(outcome, ("ok", ""))
+        # '#' would start a spurious directive; a newline would split the line
+        # into a phantom extra test -- keep both out of the description AND the
+        # directive (msg may be a multi-line, script-authored reason).
+        desc = name.replace("#", "").replace("\n", " ").replace("\r", " ")
+        directive = directive.replace("\n", " ").replace("\r", " ")
+        line = f"{ok} {i} - {desc}"
+        if directive:
+            line += f" # {directive}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def cmd_run(args: argparse.Namespace) -> Result:
     from . import script as SC
 
@@ -1762,8 +1890,12 @@ def cmd_run(args: argparse.Namespace) -> Result:
     if args.session:
         target = S.load_session(args.session)
     total = len(script.get("steps") or [])
+    fmt = args.format
+    # Per-step streaming lines only make sense for the human summary; JSON
+    # and the junit/tap documents are printed whole at the end.
+    stream = fmt == "human" or (fmt is None and not args.json)
     on_step = None
-    if not args.json:
+    if stream:
         def on_step(rec: dict[str, Any]) -> None:
             print(_step_line(rec, total), flush=True)
     result = SC.run_script(
@@ -1776,7 +1908,13 @@ def cmd_run(args: argparse.Namespace) -> Result:
                       if args.snapshot_dir else None),
         snapshot_stem=Path(args.script).stem,
     )
-    return result, _run_summary(result), 0 if result["success"] else 1
+    if fmt == "junit":
+        text = _format_junit(result)
+    elif fmt == "tap":
+        text = _format_tap(result)
+    else:  # human / json / None -- the dispatcher picks json vs the summary
+        text = _run_summary(result)
+    return result, text, 0 if result["success"] else 1
 
 
 def cmd_export_script(args: argparse.Namespace) -> Result:
@@ -2081,11 +2219,13 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"elate: {exc}", file=sys.stderr)
         return 1
-    if args.json:
+    # A command-local --format (run) overrides the global --json/--human:
+    # 'json' forces JSON, 'human'/'junit'/'tap' force the text in `human`.
+    fmt = getattr(args, "format", None)
+    if fmt == "json" or (fmt is None and args.json):
         print(json.dumps({"ok": True, **result}, ensure_ascii=False))
-    else:
-        if human:
-            print(human)
+    elif human:
+        print(human)
     return code
 
 
