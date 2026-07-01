@@ -76,7 +76,13 @@ VERBS = ("keys", "type", "eval", "wait", "mouse", "focus", "send_events",
 #   step fails it is reported as xfail (non-gating, run continues); if it
 #   unexpectedly passes it is an xpass (fails the run -- drop the marker).
 #   "reason" annotates why a step is optional/xfail.
-_COMMON_KEYS = {"comment", "skip", "optional", "expect", "xfail", "reason"}
+#   "group" (sticky) names a test group: the step and every following step
+#   belong to it until another "group" appears, so a run reports named
+#   verdicts ("dw: PASS, u: XFAIL, cc: FAIL") instead of bare indices. A
+#   verb-less {"group": "dw"} step is a pure boundary marker;
+#   {"group": null} ends the current group (following steps are ungrouped).
+_COMMON_KEYS = {"comment", "skip", "optional", "expect", "xfail", "reason",
+                "group"}
 
 # Option keys allowed per verb (mirroring the CLI flags).
 _STEP_OPTIONS: dict[str, set[str]] = {
@@ -182,6 +188,16 @@ def _check_str(obj: dict[str, Any], key: str, where: str) -> None:
         raise ElateError(f'{where}: "{key}" must be a string, got {val!r}')
 
 
+def _check_group(step: dict[str, Any], where: str) -> None:
+    # null is allowed and means "leave the current group"; a present name
+    # must be a non-empty string (it labels a test group).
+    g = step.get("group")
+    if g is not None and not (isinstance(g, str) and g):
+        raise ElateError(
+            f'{where}: "group" must be a non-empty string, or null to clear '
+            f"the current group, got {g!r}")
+
+
 def _check_int(obj: dict[str, Any], key: str, where: str,
                minimum: int | None = None, maximum: int | None = None) -> None:
     val = obj.get(key)
@@ -273,11 +289,25 @@ def _validate_step(step: Any, index: int) -> None:
     if len(verbs) > 1:
         raise ElateError(f"{where}: a step takes exactly one action, got {verbs}")
     if not verbs:
-        if "comment" in step:
-            return  # a pure comment; recorded as a "comment" annotation
+        if "comment" in step or "group" in step:
+            # A pure comment and/or group-boundary marker: an annotation,
+            # recorded with status "comment" (it never runs). It runs
+            # nothing, so it takes only "comment"/"group" -- any other key
+            # is almost certainly a mistyped action verb (e.g. "evl" for
+            # "eval") that would silently degrade a real step into a no-op
+            # marker, so reject it like every other typo.
+            unknown = set(step) - {"comment", "group"}
+            if unknown:
+                raise ElateError(
+                    f'{where}: a comment/group marker runs nothing and takes '
+                    f'only "comment"/"group"; unknown key(s) {sorted(unknown)} '
+                    "-- did you mistype an action verb?")
+            _check_str(step, "comment", where)
+            _check_group(step, where)
+            return
         raise ElateError(
             f"{where}: no action key (one of: {', '.join(VERBS)}) "
-            'and no "comment"')
+            'and no "comment"/"group"')
     verb = verbs[0]
     allowed = _STEP_OPTIONS[verb] | _COMMON_KEYS | {verb}
     unknown = set(step) - allowed
@@ -290,11 +320,21 @@ def _validate_step(step: Any, index: int) -> None:
     _check_bool(step, "optional", where)
     _check_bool(step, "xfail", where)
     _check_str(step, "reason", where)
+    _check_group(step, where)
     if step.get("expect") is not None and step.get("expect") not in (
             "pass", "fail"):
         raise ElateError(
             f'{where}: "expect" must be "pass" or "fail", '
             f'got {step.get("expect")!r}')
+    if step.get("optional") and (
+            step.get("xfail") or step.get("expect") == "fail"):
+        # Two different failure-handling modes: "allowed to fail" vs
+        # "expected to fail". Combining them is a contradiction (and would
+        # make an optional xpass -- a gating-looking label on a green run).
+        raise ElateError(
+            f'{where}: "optional" and "expect"/"xfail" are mutually exclusive '
+            "-- a step is either allowed to fail (optional) or expected to "
+            "fail (xfail), not both")
     val = step[verb]
     if verb in ("keys", "type", "eval") and not isinstance(val, str):
         raise ElateError(f'{where}: "{verb}" takes a string')
@@ -582,11 +622,16 @@ def run_script(
         "emacs_version": sess.emacs_version,
     }
     records: list[dict[str, Any]] = []
+    current_group: str | None = None  # sticky: set by any step's "group"
     try:
         for index, step in enumerate(steps, 1):
             verb = next((v for v in VERBS if v in step), None)
+            if "group" in step:
+                current_group = step["group"]
             rec: dict[str, Any] = {"index": index, "verb": verb,
                                    "summary": _summary(step, verb)}
+            if current_group is not None:
+                rec["group"] = current_group
             if stopped:
                 rec["status"] = "not-run"
             elif verb is None:
@@ -693,6 +738,7 @@ def run_script(
         "not_run": counts["not-run"],
         "comment": counts["comment"],
         "duration": round(time.monotonic() - t_start, 3),
+        "groups": _aggregate_groups(records),
         "steps": records,
     })
     sess.log("run-script-result", success=success, **counts)
@@ -726,6 +772,73 @@ def _resolve(path: str | None, base: Path) -> str | None:
     return str(p) if p.is_absolute() else str((base / p).resolve())
 
 
+def _group_verdict(members: list[dict[str, Any]]) -> str:
+    """One label for a group of step records (annotations excluded).
+
+    Precedence is severity-first so the label names the worst thing that
+    happened: a real failure, then an xpass (also gating), then a known
+    xfail, then an optional-only failure, then pass/skip.
+    """
+    statuses = [m["status"] for m in members]
+    if any(m["status"] == "failed" and not m.get("optional") for m in members):
+        return "FAIL"
+    if "xpass" in statuses:
+        return "XPASS"
+    if "xfail" in statuses:
+        return "XFAIL"
+    if "failed" in statuses:          # optional-only (non-optional caught above)
+        return "OPT-FAIL"
+    if "ok" in statuses:
+        return "PASS"
+    if "not-run" in statuses:
+        return "not-run"
+    return "SKIP"                     # only skipped/comment members
+
+
+def _aggregate_groups(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Roll step records into named group verdicts (one entry per name).
+
+    All records sharing a "group" name aggregate into a single entry, in
+    first-seen order -- so names are unique (a name that recurs after an
+    intervening group still yields one entry, which maps cleanly to a
+    single JUnit test-case). A group with only comment/marker members (no
+    real step) is dropped; comment records count toward membership but not
+    the verdict.
+    """
+    order: list[str] = []
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for rec in records:
+        name = rec.get("group")
+        if name is None:
+            continue
+        if name not in by_name:
+            by_name[name] = []
+            order.append(name)
+        by_name[name].append(rec)
+    groups: list[dict[str, Any]] = []
+    for name in order:
+        members = by_name[name]
+        real = [m for m in members if m["status"] != "comment"]
+        if not real:
+            continue  # a group that never held a runnable step is not reported
+        groups.append({
+            "name": name,
+            "status": _group_verdict(real),
+            "steps": [m["index"] for m in members],
+            "passed": sum(1 for m in real if m["status"] == "ok"),
+            "failed": sum(1 for m in real if m["status"] == "failed"),
+            # optional failures are counted but broken out (they do not gate),
+            # mirroring the top-level result so JUnit can tell them apart.
+            "optional_failed": sum(1 for m in real
+                                   if m["status"] == "failed" and m.get("optional")),
+            "xfail": sum(1 for m in real if m["status"] == "xfail"),
+            "xpass": sum(1 for m in real if m["status"] == "xpass"),
+            "skipped": sum(1 for m in real if m["status"] == "skipped"),
+            "not_run": sum(1 for m in real if m["status"] == "not-run"),
+        })
+    return groups
+
+
 def _embed_state(rec: dict[str, Any], sess: S.Session) -> None:
     try:
         rec.update(S.state_dump(sess))
@@ -739,7 +852,13 @@ def _clip(text: str, limit: int = 60) -> str:
 
 def _summary(step: dict[str, Any], verb: str | None) -> str:
     if verb is None:
-        return f"# {_clip(str(step.get('comment') or ''))}"
+        if step.get("comment"):
+            return f"# {_clip(str(step['comment']))}"
+        if step.get("group"):
+            return f"# group: {step['group']}"
+        if "group" in step:                 # {"group": null}: end the group
+            return "# end group"
+        return "#"
     val = step[verb]
     if verb == "assert" and isinstance(val, dict):
         kind = next((k for k in _ASSERT_KINDS if k in val), "?")

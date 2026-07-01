@@ -37,8 +37,14 @@ failing or stopping the run; `"expect": "fail"` (a.k.a. `"xfail": true`)
 marks a **known** failure — a failing xfail step is reported `xfail` and
 does not gate the run, while one that unexpectedly passes is an `xpass` and
 **does** fail the run (drop the stale marker); `"reason"` (string) annotates
-why. Pass `--keep-going` to `elate run` to execute every step even after a
-failure (a failed run still exits non-zero).
+why. (`optional` and `expect`/`xfail` are mutually exclusive.) Pass
+`--keep-going` to `elate run` to execute every step even after a failure (a
+failed run still exits non-zero). A `"group"` (string) names a test group:
+it and every following step belong to it (**sticky**) until another
+`"group"` — or `{"group": null}`, which ends the current group — so the run
+reports one verdict per group (`dw: PASS · u: XFAIL · cc: FAIL`). A
+verb-less `{"group": "dw"}` is a boundary marker; a comment/group marker
+runs nothing and takes no other keys.
 
 Relative paths (session `load`/`init_file`, test `load_files`, `lint`
 files, `screenshot` output) resolve against the **script file's

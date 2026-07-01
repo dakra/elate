@@ -1733,6 +1733,9 @@ def _run_summary(result: dict[str, Any]) -> str:
             bits.append(f"{val} {label}")
     line = (("PASS" if result["success"] else "FAIL")
             + f": {', '.join(bits)} in {result['duration']:.2f}s")
+    if result.get("groups"):
+        line += "\n" + " · ".join(
+            f"{g['name']}: {g['status']}" for g in result["groups"])
     if result.get("error"):
         line += f"\nerror: {result['error']}"
     elif result.get("init_error"):

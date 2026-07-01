@@ -162,6 +162,19 @@ def test_validate_script_errors() -> None:
         ({"steps": [{"eval": "1", "xfail": "yes"}]}, "xfail"),
         ({"steps": [{"eval": "1", "expect": "maybe"}]}, "expect"),
         ({"steps": [{"eval": "1", "reason": 7}]}, "reason"),
+        ({"steps": [{"eval": "1", "group": 7}]}, "group"),
+        ({"steps": [{"group": 7}]}, "group"),
+        ({"steps": [{"group": ""}]}, "group"),          # empty name
+        ({"steps": [{"eval": "1", "group": ""}]}, "group"),
+        # A typo'd action verb on a grouped step must not be swallowed as a
+        # no-op marker (it has extra keys beyond comment/group).
+        ({"steps": [{"evl": "(x)", "group": "cc"}]}, "marker"),
+        ({"steps": [{"group": "x", "skip": True}]}, "marker"),
+        # optional and xfail/expect are mutually exclusive.
+        ({"steps": [{"eval": "1", "optional": True, "xfail": True}]},
+         "mutually exclusive"),
+        ({"steps": [{"eval": "1", "optional": True, "expect": "fail"}]},
+         "mutually exclusive"),
         ({"steps": [{"test": "t", "allow_unexpected": 1}]}, "allow_unexpected"),
         ({"steps": [{"lint": ["f.el"], "allow_findings": "no"}]},
          "allow_findings"),
@@ -395,6 +408,72 @@ def test_run_script_xfail_does_not_mask_internal_error(
     assert out["steps"][0]["status"] == "failed"   # NOT reclassified to xfail
     assert "internal error" in out["steps"][0]["error"]
     assert out["xfail"] == 0
+    assert running_run_sessions() == []
+
+
+def test_run_script_named_groups(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # A "group" is sticky: a {"group": ...} boundary (or an inline "group"
+    # on a step) names the following steps, and the run reports one verdict
+    # per group.
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"group": "dw"},                      # boundary marker
+            {"assert": {"eval": "(= 1 1)"}},      # dw: ok
+            {"assert": {"eval": "(= 2 2)"}},      # dw: ok
+            {"group": "u", "assert": {"eval": "(= 1 2)"},
+             "expect": "fail"},                   # u: xfail (inline group)
+            {"group": "cc"},
+            {"assert": {"eval": "(= 3 4)"}},      # cc: fail
+        ],
+    })
+    code = cli.main(["--json", "run", path, "--keep-going"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["success"] is False
+    assert [g["name"] for g in out["groups"]] == ["dw", "u", "cc"]
+    groups = {g["name"]: g for g in out["groups"]}
+    assert groups["dw"]["status"] == "PASS" and groups["dw"]["passed"] == 2
+    assert groups["dw"]["steps"] == [1, 2, 3]   # boundary marker + 2 asserts
+    assert groups["u"]["status"] == "XFAIL" and groups["u"]["xfail"] == 1
+    assert groups["cc"]["status"] == "FAIL" and groups["cc"]["failed"] == 1
+    # The human summary renders the per-group verdict line.
+    summary = cli._run_summary(out)
+    assert "dw: PASS" in summary
+    assert "u: XFAIL" in summary
+    assert "cc: FAIL" in summary
+    assert running_run_sessions() == []
+
+
+def test_run_script_group_merge_clear_and_empty(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # A recurring group name merges into one entry; {"group": null} ends the
+    # current group; a group that never holds a runnable step is dropped.
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"group": "empty"},                # 1: no real step -> dropped
+            {"group": "dw"},                   # 2
+            {"assert": {"eval": "(= 1 1)"}},   # 3: dw ok
+            {"group": "cc"},                   # 4
+            {"assert": {"eval": "(= 2 2)"}},   # 5: cc ok
+            {"group": "dw"},                   # 6: dw recurs -> same entry
+            {"assert": {"eval": "(= 3 3)"}},   # 7: dw ok
+            {"group": None},                   # 8: end the group
+            {"eval": "(+ 1 1)"},               # 9: ungrouped
+        ],
+    })
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["success"] is True
+    assert [g["name"] for g in out["groups"]] == ["dw", "cc"]  # "empty" dropped
+    groups = {g["name"]: g for g in out["groups"]}
+    assert groups["dw"]["passed"] == 2                # both dw asserts merged
+    assert groups["dw"]["steps"] == [2, 3, 6, 7]
+    # The trailing step after {"group": null} belongs to no group.
+    assert not any(9 in g["steps"] for g in out["groups"])
     assert running_run_sessions() == []
 
 
