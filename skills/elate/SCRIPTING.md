@@ -112,7 +112,7 @@ Failure semantics:
 |---|---|---|
 | `buffer_contains` | substring | `buffer` (default: current) |
 | `buffer_matches` | Python regexp (multiline) | `buffer` |
-| `state` | non-empty object of state-field → expected value; dotted paths work (`"minibuffer.prompt"`) | — |
+| `state` | non-empty object of state-field → expected; dotted paths work (`"region.size"`). A value is a bare equality check, **or** an operator object — `{">": n}`/`{">=":}`/`{"<":}`/`{"<=":}` (numeric), `{"!=":}`/`{"equals":}`, `{"matches": "regexp"}` (Python regexp on the stringified value); all operators in the object must hold | — |
 | `messages_match` | Python regexp over `*Messages*` | — |
 | `popup` | popup kind string, or `true` for any | — |
 | `tests` | non-empty object of count-field → expected (`{"unexpected": 0, "timed-out": false}`), checked against the **last `test` step** | — |
@@ -121,6 +121,13 @@ Failure semantics:
 | `snapshot` | a name string, or `{"name", "of"}` — compare the current render against a committed golden (see below) | — |
 
 `tests`/`lint_clean` need a preceding `test`/`lint` step in the same run.
+
+To assert a **buffer-local or package variable** that is not in the state
+snapshot (e.g. `evil-state`), use the `eval` matcher — it runs in the
+selected window's buffer, so buffer-local values read correctly:
+`{"assert": {"eval": "(eq evil-state 'insert)"}}`. Note the regexp split:
+`eval` runs **elisp**, while `buffer_matches`/`messages_match` and the
+`state` `matches` operator take **Python** regexps (as does `wait text`).
 
 ## Golden snapshots
 

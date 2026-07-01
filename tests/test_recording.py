@@ -186,6 +186,11 @@ def test_validate_script_errors() -> None:
         ({"steps": [{"eval": "1"}], "session": {"home_seed": 5}}, "string path"),
         ({"steps": [{"eval": "1", "buffer": 5}]}, "buffer"),
         ({"steps": [{"assert": {"eval": "t", "buffer": 5}}]}, "buffer"),
+        ({"steps": [{"assert": {"state": {"point": {">": "x"}}}}]}, "number"),
+        ({"steps": [{"assert": {"state": {"m": {"matches": "("}}}}]},
+         "invalid regexp"),
+        ({"steps": [{"assert": {"state": {"point": {">": 5, "typo": 1}}}}]},
+         "must all be operators"),
         ({"steps": [{"test": "t", "allow_unexpected": 1}]}, "allow_unexpected"),
         ({"steps": [{"lint": ["f.el"], "allow_findings": "no"}]},
          "allow_findings"),
@@ -307,6 +312,27 @@ def test_sandbox_validate_env_rejects_unsafe_keys() -> None:
             sandbox.validate_env(bad)
     with pytest.raises(ElateError, match="isolation"):
         sandbox.validate_env({"HOME": "/evil"})                  # reserved
+
+
+def test_state_match_operators() -> None:
+    m = SC._state_match
+    assert m(100, {">": 50}) is True
+    assert m(100, {">": 500}) is False
+    assert m(5, {">=": 1, "<=": 5}) is True            # all operators must hold
+    assert m(6, {">=": 1, "<=": 5}) is False
+    assert m("fundamental-mode", {"matches": "mode$"}) is True
+    assert m("dired", {"matches": "^x"}) is False
+    assert m(3, {"!=": 4}) is True
+    assert m(3, {"equals": 3}) is True
+    assert m("dired-mode", "dired-mode") is True        # bare equality unchanged
+    assert m({"a": 1}, {"a": 1}) is True                # non-operator dict = equality
+    assert m("x", {">": 1}) is False                    # non-number vs numeric op
+    # A missing/null field (actual None) fails EVERY operator -- no silent
+    # pass on a typo'd path; assert null with a bare value instead.
+    assert m(None, {"matches": "y"}) is False
+    assert m(None, {"!=": 1}) is False
+    assert m(None, {"equals": None}) is False
+    assert m(None, None) is True                         # bare equality asserts null
 
 
 def test_step_timeout_resolution() -> None:
@@ -796,6 +822,30 @@ def test_run_script_eval_buffer_context(
     code = cli.main(["--json", "run", path])
     out = json.loads(capsys.readouterr().out)
     assert code == 0 and out["success"] is True, out
+    assert running_run_sessions() == []
+
+
+def test_run_script_assert_state_operators(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # assert state values may be comparison/regex operators, not just equality.
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"eval": '(progn (switch-to-buffer "*scratch*") (erase-buffer) '
+                     '(insert "abcdef") (goto-char 4))'},
+            {"assert": {"state": {"point": {">": 1, "<": 100},
+                                  "column": {">=": 0}}}},
+            {"assert": {"state": {"major-mode": {"matches": "mode"}}}},
+            # A failing operator (kept optional so the run stays green) proves
+            # a negative actually rejects.
+            {"assert": {"state": {"point": {">": 99999}}}, "optional": True},
+        ],
+    })
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["success"] is True, out
+    assert out["steps"][3]["status"] == "failed"   # the >99999 operator rejected
     assert running_run_sessions() == []
 
 

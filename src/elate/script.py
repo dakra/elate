@@ -488,10 +488,22 @@ def _validate_assert(spec: Any, where: str) -> None:
             re.compile(val)
         except re.error as exc:
             raise ElateError(f"{where}: invalid regexp {val!r}: {exc}") from exc
-    if kind == "state" and not (isinstance(val, dict) and val):
-        raise ElateError(
-            f'{where}: assert "state" takes a non-empty object of '
-            'state-field (dotted paths ok) -> expected value')
+    if kind == "state":
+        if not (isinstance(val, dict) and val):
+            raise ElateError(
+                f'{where}: assert "state" takes a non-empty object of '
+                'state-field (dotted paths ok) -> expected value')
+        for path, expected in val.items():
+            if _is_operator_spec(expected):
+                _validate_state_ops(expected, f"{where} (assert state {path})")
+            elif isinstance(expected, dict) and (set(expected) & _STATE_OPS):
+                # A dict mixing operators with other keys is almost certainly
+                # a typo (it would otherwise silently become an always-failing
+                # equality check against the dict).
+                raise ElateError(
+                    f"{where} (assert state {path}): an operator object's keys "
+                    "must all be operators; got non-operator key(s) "
+                    f"{sorted(set(expected) - _STATE_OPS)}")
     if kind == "popup" and not (val is True or isinstance(val, str)):
         raise ElateError(
             f'{where}: assert "popup" takes a popup kind string, '
@@ -1075,6 +1087,68 @@ def _screenshot_step(sess: S.Session, step: dict[str, Any],
     return {"screen": screen, "ansi": ansi}
 
 
+# Comparison/regex operators for `assert state` values. A value that is a
+# dict whose keys are ALL operators is an operator spec (all must hold);
+# any other value -- including a plain dict -- is a bare equality check, so
+# existing scenarios and dict-valued fields keep working.
+_STATE_OPS = {">", ">=", "<", "<=", "!=", "equals", "matches"}
+_STATE_NUM_OPS = {">", ">=", "<", "<="}
+
+
+def _is_operator_spec(expected: Any) -> bool:
+    return (isinstance(expected, dict) and bool(expected)
+            and all(k in _STATE_OPS for k in expected))
+
+
+def _validate_state_ops(spec: dict[str, Any], where: str) -> None:
+    for op, operand in spec.items():
+        if op == "matches":
+            if not isinstance(operand, str):
+                raise ElateError(f'{where}: "matches" takes a Python regexp string')
+            try:
+                re.compile(operand)
+            except re.error as exc:
+                raise ElateError(
+                    f"{where}: invalid regexp {operand!r}: {exc}") from exc
+        elif op in _STATE_NUM_OPS and (
+                isinstance(operand, bool) or not isinstance(operand, (int, float))):
+            raise ElateError(f'{where}: "{op}" takes a number, got {operand!r}')
+
+
+def _apply_state_op(actual: Any, op: str, operand: Any) -> bool:
+    # Operators require a present, non-null value: a missing/typo'd path
+    # (_dig -> None) or a genuinely null field fails EVERY operator (to
+    # assert null, use a bare value: {"mark": null}). Without this, a
+    # typo'd field would silently PASS `!=` (None != anything is true).
+    if actual is None:
+        return False
+    if op == "equals":
+        return actual == operand
+    if op == "!=":
+        return actual != operand
+    if op == "matches":
+        return re.search(str(operand), str(actual)) is not None
+    # Numeric comparisons: a non-number actual simply fails (never crashes).
+    if (isinstance(actual, bool) or isinstance(operand, bool)
+            or not isinstance(actual, (int, float))
+            or not isinstance(operand, (int, float))):
+        return False
+    if op == ">":
+        return actual > operand
+    if op == ">=":
+        return actual >= operand
+    if op == "<":
+        return actual < operand
+    return actual <= operand  # op == "<="
+
+
+def _state_match(actual: Any, expected: Any) -> bool:
+    """True if ACTUAL satisfies EXPECTED (a bare value, or an operator spec)."""
+    if _is_operator_spec(expected):
+        return all(_apply_state_op(actual, op, v) for op, v in expected.items())
+    return actual == expected
+
+
 def _dig(data: Any, path: str) -> Any:
     """Look up a dotted PATH ("minibuffer.prompt") in nested dicts."""
     cur = data
@@ -1110,7 +1184,7 @@ def _eval_assert(sess: S.Session, spec: dict[str, Any],
         mismatches = {}
         for path, expected in val.items():
             actual = _dig(state, path)
-            if actual != expected:
+            if not _state_match(actual, expected):
                 mismatches[path] = {"expected": expected, "actual": actual}
         if mismatches:
             raise _StepFailure(f"state mismatch on {sorted(mismatches)}",
