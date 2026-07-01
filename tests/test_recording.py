@@ -18,6 +18,7 @@ import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -157,6 +158,10 @@ def test_validate_script_errors() -> None:
         ({"steps": [{"assert": {"buffer_contains": "x", "buffer": 1}}]},
          "buffer"),
         ({"steps": [{"eval": "1", "skip": "yes"}]}, "skip"),
+        ({"steps": [{"eval": "1", "optional": "yes"}]}, "optional"),
+        ({"steps": [{"eval": "1", "xfail": "yes"}]}, "xfail"),
+        ({"steps": [{"eval": "1", "expect": "maybe"}]}, "expect"),
+        ({"steps": [{"eval": "1", "reason": 7}]}, "reason"),
         ({"steps": [{"test": "t", "allow_unexpected": 1}]}, "allow_unexpected"),
         ({"steps": [{"lint": ["f.el"], "allow_findings": "no"}]},
          "allow_findings"),
@@ -321,6 +326,75 @@ def test_run_script_optional_step_does_not_gate_or_stop(
     # Raw "failed" count includes the optional failure; it is broken out so
     # a passing run never reads as failed.
     assert out["failed"] == 1 and out["optional_failed"] == 1
+    assert running_run_sessions() == []
+
+
+def test_run_script_xfail_known_failure_does_not_gate(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # A step marked expect:"fail" that DOES fail is a known/expected
+    # failure: it is reported as xfail, does not fail the run, and does
+    # not stop it (later steps still run) -- even without --keep-going.
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"assert": {"eval": "(= 1 2)"}, "expect": "fail",
+             "reason": "known-broken"},
+            {"eval": "(+ 1 1)"},
+        ],
+    })
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["success"] is True
+    assert out["steps"][0]["status"] == "xfail"
+    assert out["steps"][0]["reason"] == "known-broken"
+    assert out["steps"][1]["status"] == "ok"
+    assert out["xfail"] == 1 and out["failed"] == 0
+    assert running_run_sessions() == []
+
+
+def test_run_script_xpass_fails_the_run(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # A step marked xfail that unexpectedly PASSES is an xpass: it fails
+    # the run (drop the stale marker) but does not stop it.
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"assert": {"eval": "(= 1 1)"}, "xfail": True,
+             "reason": "should still be broken"},
+            {"eval": "(+ 1 1)"},
+        ],
+    })
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["success"] is False
+    assert out["steps"][0]["status"] == "xpass"
+    assert out["steps"][1]["status"] == "ok"   # xpass does not stop the run
+    assert out["xpass"] == 1
+    assert running_run_sessions() == []
+
+
+def test_run_script_xfail_does_not_mask_internal_error(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # A controller-side bug (the except-Exception safety net) is an elate
+    # fault, not a test outcome: it must gate the run (exit 1) even on an
+    # xfail-marked step -- otherwise the "always surfaces" guarantee breaks.
+    def boom(*_a: Any, **_k: Any) -> dict[str, Any]:
+        raise RuntimeError("controller boom")
+    monkeypatch.setattr(SC, "_exec_step", boom)
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"eval": "(+ 1 1)", "xfail": True}],
+    })
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["success"] is False
+    assert out["steps"][0]["status"] == "failed"   # NOT reclassified to xfail
+    assert "internal error" in out["steps"][0]["error"]
+    assert out["xfail"] == 0
     assert running_run_sessions() == []
 
 

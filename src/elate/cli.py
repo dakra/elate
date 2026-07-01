@@ -1690,13 +1690,16 @@ def cmd_wait(args: argparse.Namespace) -> Result:
 # -- Phase 5: scripts, recording, snap series, matrix -------------------------
 
 _STEP_MARK = {"ok": "ok", "failed": "FAIL", "skipped": "skipped",
-              "not-run": "not run", "comment": "note"}
+              "not-run": "not run", "comment": "note",
+              "xfail": "xfail (known)", "xpass": "XPASS"}
 
 
 def _step_line(rec: dict[str, Any], total: int) -> str:
     mark = _STEP_MARK[rec["status"]]
     if rec["status"] == "failed" and rec.get("optional"):
         mark += " (optional)"
+    if rec["status"] in ("xfail", "xpass") and rec.get("reason"):
+        mark += f" [{rec['reason']}]"
     line = f"[{rec['index']}/{total}] {rec['summary']} ... {mark}"
     if rec.get("duration") is not None:
         line += f" ({rec['duration']:.2f}s)"
@@ -1721,7 +1724,9 @@ def _run_summary(result: dict[str, Any]) -> str:
     gating_failed = result.get("failed", 0) - optional_failed
     for key, label, val in (
             ("failed", "failed", gating_failed),
+            ("xpass", "XPASS", result.get("xpass", 0)),
             ("optional_failed", "optional-failed", optional_failed),
+            ("xfail", "xfail", result.get("xfail", 0)),
             ("skipped", "skipped", result.get("skipped", 0)),
             ("not_run", "not run", result.get("not_run", 0))):
         if val:
@@ -1911,9 +1916,13 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
                 "passed": run["passed"],
                 "failed": run["failed"],
                 "duration": run["duration"],
+                # The step that caused the FAIL: a real (non-optional)
+                # failure, or an xpass (a known-broken step that started
+                # passing) -- both gate the run, an optional failure does not.
                 "failed_step": next(
                     (r["summary"] for r in run["steps"]
-                     if r["status"] == "failed"), None),
+                     if (r["status"] == "failed" and not r.get("optional"))
+                     or r["status"] == "xpass"), None),
             }
         except ElateError as exc:
             # One broken binary must not abort the rest of the matrix.

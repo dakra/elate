@@ -72,7 +72,11 @@ VERBS = ("keys", "type", "eval", "wait", "mouse", "focus", "send_events",
 # Keys allowed on every step besides the verb itself.
 #   "optional": a failing step does not fail the run and does not stop it
 #   (later steps still run) -- for checks that are allowed to fail.
-_COMMON_KEYS = {"comment", "skip", "optional"}
+#   "expect": "fail" (a.k.a. "xfail": true) marks a KNOWN failure: if the
+#   step fails it is reported as xfail (non-gating, run continues); if it
+#   unexpectedly passes it is an xpass (fails the run -- drop the marker).
+#   "reason" annotates why a step is optional/xfail.
+_COMMON_KEYS = {"comment", "skip", "optional", "expect", "xfail", "reason"}
 
 # Option keys allowed per verb (mirroring the CLI flags).
 _STEP_OPTIONS: dict[str, set[str]] = {
@@ -270,7 +274,7 @@ def _validate_step(step: Any, index: int) -> None:
         raise ElateError(f"{where}: a step takes exactly one action, got {verbs}")
     if not verbs:
         if "comment" in step:
-            return  # a pure comment; recorded as skipped
+            return  # a pure comment; recorded as a "comment" annotation
         raise ElateError(
             f"{where}: no action key (one of: {', '.join(VERBS)}) "
             'and no "comment"')
@@ -284,6 +288,13 @@ def _validate_step(step: Any, index: int) -> None:
     _check_timeout(step, where)
     _check_bool(step, "skip", where)
     _check_bool(step, "optional", where)
+    _check_bool(step, "xfail", where)
+    _check_str(step, "reason", where)
+    if step.get("expect") is not None and step.get("expect") not in (
+            "pass", "fail"):
+        raise ElateError(
+            f'{where}: "expect" must be "pass" or "fail", '
+            f'got {step.get("expect")!r}')
     val = step[verb]
     if verb in ("keys", "type", "eval") and not isinstance(val, str):
         raise ElateError(f'{where}: "{verb}" takes a string')
@@ -507,10 +518,12 @@ def run_script(
     by default the first failure stops the run (later steps are recorded
     as not-run) and the failed step record embeds a state snapshot. With
     KEEP_GOING every step runs regardless of failures (a failed run still
-    exits non-zero); a step with "optional": true never gates or stops
-    the run whatever the mode.
-    DEADLINE is a time.monotonic() instant: steps not started by then
-    fail. ON_STEP is called with each step record as it completes (for
+    exits non-zero); a step whose own action fails under "optional": true
+    never gates or stops the run, in either mode.
+    DEADLINE is a time.monotonic() instant: it is a hard wall -- a step
+    not started by then fails, gates, and stops the run regardless of
+    KEEP_GOING or "optional" (a blown global budget is not a step
+    outcome). ON_STEP is called with each step record as it completes (for
     streaming output). ORIGIN tags the transcript's run-script events
     (e.g. "mcp") for forensics.
     """
@@ -592,6 +605,7 @@ def run_script(
                 stopped = True  # every later step would also be past the wall
             else:
                 t0 = time.monotonic()
+                internal = False  # controller bug: never waived (see below)
                 try:
                     rec["result"] = _exec_step(sess, step, verb, base, ctx)
                     rec["status"] = "ok"
@@ -612,12 +626,31 @@ def run_script(
                 except Exception as exc:
                     # Safety net: a controller-side bug must surface as a
                     # failed step (records kept, structured output, exit 1)
-                    # -- never as a raw traceback that discards the run.
+                    # -- never as a raw traceback that discards the run, and
+                    # never masked by "optional"/xfail (it is an elate bug,
+                    # not a test outcome).
                     traceback.print_exc(file=sys.stderr)
                     rec["status"] = "failed"
                     rec["error"] = f"internal error: {type(exc).__name__}: {exc}"
                     _embed_state(rec, sess)
-                if rec["status"] == "failed":
+                    internal = True
+                xfail = bool(step.get("xfail")) or step.get("expect") == "fail"
+                if internal:
+                    gate_failed = True
+                    if not keep_going:
+                        stopped = True
+                elif xfail and rec["status"] in ("ok", "failed"):
+                    # A known failure: a failed xfail step is expected
+                    # (non-gating, never stops the run -- that is the whole
+                    # point of marking it); a passing one is an xpass, which
+                    # fails the run so the stale marker gets noticed.
+                    rec["status"] = "xfail" if rec["status"] == "failed" \
+                        else "xpass"
+                    if step.get("reason"):
+                        rec["reason"] = step["reason"]
+                    if rec["status"] == "xpass" and not step.get("optional"):
+                        gate_failed = True
+                elif rec["status"] == "failed":
                     if step.get("optional"):
                         rec["optional"] = True  # reported, but never gates
                     else:
@@ -641,7 +674,8 @@ def run_script(
                 result["teardown_error"] = str(exc)
 
     counts = {status: sum(1 for r in records if r["status"] == status)
-              for status in ("ok", "failed", "skipped", "not-run", "comment")}
+              for status in ("ok", "failed", "xfail", "xpass", "skipped",
+                             "not-run", "comment")}
     # An optional step that fails is still "failed" status, but it did not
     # gate the run; break it out so the summary can read "PASS ... 1
     # optional-failed" without contradiction.
@@ -653,6 +687,8 @@ def run_script(
         "passed": counts["ok"],
         "failed": counts["failed"],
         "optional_failed": optional_failed,
+        "xfail": counts["xfail"],
+        "xpass": counts["xpass"],
         "skipped": counts["skipped"],
         "not_run": counts["not-run"],
         "comment": counts["comment"],

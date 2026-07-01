@@ -30,7 +30,15 @@ value types, bad enum values, out-of-bounds numbers, an option on the wrong
 step kind, or an empty `"steps"` list are loud errors **before anything
 boots**. Unknown *top-level* keys are ignored (metadata like `"name"`,
 `"exported_at"`). Every step additionally accepts `"comment"` (string) and
-`"skip": true`; a step with only a comment is recorded as skipped.
+`"skip": true` (record it but do not run it); a step with only a comment is
+recorded as a `comment` annotation (not a skipped or failed step). Three
+keys govern failure handling: `"optional": true` lets a step fail without
+failing or stopping the run; `"expect": "fail"` (a.k.a. `"xfail": true`)
+marks a **known** failure — a failing xfail step is reported `xfail` and
+does not gate the run, while one that unexpectedly passes is an `xpass` and
+**does** fail the run (drop the stale marker); `"reason"` (string) annotates
+why. Pass `--keep-going` to `elate run` to execute every step even after a
+failure (a failed run still exits non-zero).
 
 Relative paths (session `load`/`init_file`, test `load_files`, `lint`
 files, `screenshot` output) resolve against the **script file's
