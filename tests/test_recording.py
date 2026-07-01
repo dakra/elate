@@ -215,6 +215,19 @@ def test_validate_script_errors() -> None:
             SC.validate_script(script)
 
 
+def test_is_transient_path() -> None:
+    assert SC._is_transient('(setenv "HOME" "/tmp/eg-home")')
+    assert SC._is_transient('(load "/var/folders/ab/helper.el")')
+    assert SC._is_transient('(setenv "X" "$TMPDIR/y")')
+    assert not SC._is_transient("(setq x 1)")
+    assert not SC._is_transient('(load "/home/me/pkg.el")')
+    # Anchored: a durable path that merely contains a temp-looking
+    # component, or prose mentioning /tmp/, is NOT transient (no data loss).
+    assert not SC._is_transient('(load "~/proj/tmp/fixtures.el")')
+    assert not SC._is_transient('(message "scratch is in /tmp/ btw")')
+    assert not SC._is_transient('(getenv "$TMPDIRECTORY")')
+
+
 def test_format_junit_and_tap() -> None:
     # Pure formatter test on a synthetic result (no Emacs): a group becomes
     # one testcase (at its first step), ungrouped non-comment steps their own.
@@ -1248,6 +1261,39 @@ def test_export_script_roundtrip(elate_home: str, tmp_path: Path,
     assert out["success"] is True
     assert out["skipped"] == 2
     assert running_run_sessions() == []
+
+
+def test_export_script_clean_strips_transients(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    name = "cleanexp"
+    assert cli.main(["--json", "start", "--name", name, "--config", "bare",
+                     "--eval", '(setenv "EG_T" "/tmp/eg-thing")',
+                     "--eval", "(setq eg-durable t)"]) == 0
+    capsys.readouterr()
+    # A recorded eval step that references a transient temp path.
+    cli.main(["--json", "-s", name, "eval", '(message "/tmp/eg-marker")'])
+    capsys.readouterr()
+
+    plain_p = tmp_path / "plain.json"
+    assert cli.main(["-s", name, "export-script", "-o", str(plain_p)]) == 0
+    capsys.readouterr()
+    plain = json.loads(plain_p.read_text(encoding="utf-8"))
+    assert any("/tmp/eg-thing" in e for e in plain["session"]["eval"])  # kept
+    m = [s for s in plain["steps"] if "/tmp/eg-marker" in (s.get("eval") or "")]
+    assert m and not m[0].get("skip")                                   # not skipped
+
+    clean_p = tmp_path / "clean.json"
+    assert cli.main(["-s", name, "export-script", "--clean",
+                     "-o", str(clean_p)]) == 0
+    capsys.readouterr()
+    clean = json.loads(clean_p.read_text(encoding="utf-8"))
+    evals = clean["session"].get("eval", [])
+    assert all("/tmp/eg-thing" not in e for e in evals)                 # transient dropped
+    assert any("eg-durable" in e for e in evals)                        # durable kept
+    m = [s for s in clean["steps"] if "/tmp/eg-marker" in (s.get("eval") or "")]
+    assert m and m[0].get("skip") is True                              # now skipped
+    assert cli.main(["--json", "stop", name]) == 0
 
 
 def test_export_script_stdout_and_no_transcript(

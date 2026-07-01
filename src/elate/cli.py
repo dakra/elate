@@ -674,6 +674,11 @@ def build_parser() -> argparse.ArgumentParser:
                     "a faithful recording. Works on stopped sessions too.")
     sp.add_argument("-o", "--output", metavar="FILE",
                     help="write the script here (default: stdout)")
+    sp.add_argument("--clean", action="store_true",
+                    help="prune transient temp-path references so the export "
+                         "replays elsewhere: drop session load/eval entries "
+                         "under a temp root, and mark an eval step that "
+                         "references one \"skip\" with a comment")
 
     sp = sub.add_parser(
         "record",
@@ -1995,7 +2000,7 @@ def cmd_export_script(args: argparse.Namespace) -> Result:
     # No require_alive: the transcript outlives the Emacs (stopped and
     # crashed sessions export fine).
     sess = _get_session(args)
-    script = SC.export_script(sess)
+    script = SC.export_script(sess, clean=args.clean)
     text = json.dumps(script, indent=2, ensure_ascii=False) + "\n"
     steps = len(script["steps"])
     stubs = sum(1 for s in script["steps"] if s.get("skip"))

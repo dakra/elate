@@ -397,6 +397,7 @@ convert a session's transcript into a best-effort scenario script
 Turn the session's JSONL transcript into a scenario file for `elate run`: inputs become steps, observations become skipped assertion stubs ("skip": true). A starting point for editing, not a faithful recording. Works on stopped sessions too.
 
 - `-o, --output FILE` -- write the script here (default: stdout)
+- `--clean` -- prune transient temp-path references so the export replays elsewhere: drop session load/eval entries under a temp root, and mark an eval step that references one "skip" with a comment
 
 ## elate record
 

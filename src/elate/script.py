@@ -1514,7 +1514,20 @@ def _eval_snapshot(sess: S.Session, val: Any,
 # ---------------------------------------------------------------------------
 # Transcript -> script export
 
-def export_script(sess: S.Session) -> dict[str, Any]:
+# A transient temp-path reference: an absolute path LITERAL that starts at
+# a temp root (right after a quote or "(" -- so it is a path, not prose),
+# or a $TMPDIR var. Anchored on purpose: a DURABLE path that merely
+# contains a temp-looking component (~/proj/tmp/x) or a form that just
+# mentions "/tmp/" must NOT be mistaken for transient and dropped.
+_TRANSIENT_PATH_RE = re.compile(
+    r'''["'(](?:/private)?(?:/tmp|/var/folders|/dev/shm)/|\$\{?TMPDIR\b''')
+
+
+def _is_transient(text: str) -> bool:
+    return bool(_TRANSIENT_PATH_RE.search(text))
+
+
+def export_script(sess: S.Session, clean: bool = False) -> dict[str, Any]:
     """Convert the session's JSONL transcript into a scenario script.
 
     Best-effort, not a faithful recorder: inputs (keys/type/eval/mouse/
@@ -1524,6 +1537,11 @@ def export_script(sess: S.Session) -> dict[str, Any]:
     transcript clipped are exported skipped too, with a comment. The
     emacs binary is deliberately not pinned (use `elate run --emacs` or
     `elate matrix`).
+
+    With CLEAN, transient temp-path references are pruned: session
+    `load`/`eval` entries under a temp root are dropped, and an `eval`
+    step referencing one is marked "skip" with a comment (it would error
+    on a straight replay elsewhere).
     """
     transcript = sess.dir / "log" / "transcript.jsonl"
     if not transcript.is_file():
@@ -1545,28 +1563,44 @@ def export_script(sess: S.Session) -> dict[str, Any]:
             note = "value was clipped in the transcript -- restore it by hand"
             step["comment"] = (f"{step['comment']}; {note}"
                                if step.get("comment") else note)
+        if clean and isinstance(step.get("eval"), str) \
+                and _is_transient(step["eval"]):
+            step["skip"] = True
+            note = "references a transient temp path -- edit or drop before replay"
+            step["comment"] = (f"{step['comment']}; {note}"
+                               if step.get("comment") else note)
         steps.append(step)
+    comment = ("Best-effort export, not a faithful recording: inputs "
+               "became steps in transcript order; observations became "
+               "skipped assertion stubs. Edit the stubs into real "
+               'assertions and drop their "skip": true.')
+    if clean:
+        # Name the dropped session entries so the pruning is never silent.
+        pruned = [x for x in [*sess.loads, *sess.evals] if _is_transient(x)]
+        comment += " (--clean) transient temp-path eval steps were skipped."
+        if pruned:
+            comment += (" Pruned transient session load/eval: "
+                        + "; ".join(pruned) + ".")
     return {
         "name": f"exported from session {sess.name}",
         "exported_at": datetime.now(timezone.utc).isoformat(),
-        "comment": ("Best-effort export, not a faithful recording: inputs "
-                    "became steps in transcript order; observations became "
-                    "skipped assertion stubs. Edit the stubs into real "
-                    'assertions and drop their "skip": true.'),
-        "session": _session_config(sess),
+        "comment": comment,
+        "session": _session_config(sess, clean),
         "steps": steps,
     }
 
 
-def _session_config(sess: S.Session) -> dict[str, Any]:
+def _session_config(sess: S.Session, clean: bool = False) -> dict[str, Any]:
     cfg: dict[str, Any] = {"ui": sess.ui, "size": f"{sess.cols}x{sess.rows}",
                            "config": sess.config}
     if sess.init_file:
         cfg["init_file"] = sess.init_file
-    if sess.loads:
-        cfg["load"] = list(sess.loads)
-    if sess.evals:
-        cfg["eval"] = list(sess.evals)
+    loads = [x for x in sess.loads if not (clean and _is_transient(x))]
+    if loads:
+        cfg["load"] = loads
+    evals = [x for x in sess.evals if not (clean and _is_transient(x))]
+    if evals:
+        cfg["eval"] = evals
     if sess.headless:
         cfg["headless"] = True
     return cfg
