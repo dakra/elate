@@ -167,8 +167,12 @@ class RawChannel:
 
     # -- output -----------------------------------------------------------
 
-    def capture_pane(self, ansi: bool = False) -> str:
+    def capture_pane(self, ansi: bool = False, start: int | None = None) -> str:
         args = ["capture-pane", "-p", "-t", TARGET]
         if ansi:
             args.insert(1, "-e")
+        if start is not None:
+            # -S selects the first captured line; a negative value reaches
+            # into the scrollback history (e.g. -50 == 50 lines back).
+            args += ["-S", str(start)]
         return self._run(*args).stdout

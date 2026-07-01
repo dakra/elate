@@ -1244,11 +1244,29 @@ def state_dump(sess: Session, compact: bool = True) -> dict[str, Any]:
         dump["state_error"] = f"{exc} (Emacs busy?)"
     if sess.ui == "tty":
         try:
-            screen = sess.raw().capture_pane().rstrip("\n").splitlines()
-            dump["screen_tail"] = screen[-8:]
+            dump["screen_tail"] = _screen_tail(sess)
         except ElateError:
             pass
     return dump
+
+
+def _screen_tail(sess: Session, lines: int = 12) -> list[str]:
+    """Last non-blank lines of the tmux pane, robust to a redraw race.
+
+    A capture taken while Emacs is mid-repaint comes back all-blank, which
+    is exactly why a failed step used to embed an empty screen_tail. Retry
+    briefly to catch the repaint, then fall back to the scrollback history
+    so a frame that momentarily cleared still yields the recent content.
+    """
+    raw = sess.raw()
+    for attempt in range(3):
+        screen = raw.capture_pane().rstrip("\n").splitlines()
+        if any(ln.strip() for ln in screen):
+            return screen[-lines:]
+        if attempt < 2:
+            time.sleep(0.05)
+    hist = raw.capture_pane(start=-lines * 4).rstrip("\n").splitlines()
+    return [ln for ln in hist if ln.strip()][-lines:]
 
 
 def _compact_state(state: dict[str, Any]) -> dict[str, Any]:

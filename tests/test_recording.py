@@ -175,6 +175,10 @@ def test_validate_script_errors() -> None:
          "mutually exclusive"),
         ({"steps": [{"eval": "1", "optional": True, "expect": "fail"}]},
          "mutually exclusive"),
+        ({"steps": [{"eval": "1"}], "defaults": "x"}, "defaults"),
+        ({"steps": [{"eval": "1"}], "defaults": {"bogus": 1}}, "unknown"),
+        ({"steps": [{"eval": "1"}], "defaults": {"timeout": -3}}, "timeout"),
+        ({"steps": [{"eval": "1"}], "defaults": {"min_idle": 999}}, "min_idle"),
         ({"steps": [{"test": "t", "allow_unexpected": 1}]}, "allow_unexpected"),
         ({"steps": [{"lint": ["f.el"], "allow_findings": "no"}]},
          "allow_findings"),
@@ -278,6 +282,62 @@ def test_outcome_unknown_status_surfaces_as_failure() -> None:
     # A future/unknown status must never be silently rendered as a pass.
     assert cli._step_outcome({"status": "weird"})[0] == "fail"
     assert cli._group_outcome({"status": "WEIRD"})[0] == "fail"
+
+
+def test_step_timeout_resolution() -> None:
+    # step timeout > scenario default > per-verb builtin.
+    assert SC._step_timeout({}, "keys", {}) == SC._DEFAULT_TIMEOUTS["keys"]
+    assert SC._step_timeout({}, "eval", {"timeout": 8}) == 8.0
+    assert SC._step_timeout({"timeout": 3}, "eval", {"timeout": 8}) == 3.0
+
+
+def test_screen_tail_retries_past_a_blank_frame(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # A capture that lands mid-redraw is all-blank; _screen_tail retries and
+    # returns the repainted content rather than an empty list.
+    monkeypatch.setattr(S.time, "sleep", lambda *_a: None)
+
+    class FakeRaw:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def capture_pane(self, ansi: bool = False,
+                         start: int | None = None) -> str:
+            self.n += 1
+            return "\n\n\n" if self.n < 3 else "top line\nPROMPT>\n"
+
+    class FakeSess:
+        ui = "tty"
+
+        def __init__(self) -> None:
+            self._raw = FakeRaw()
+
+        def raw(self) -> Any:
+            return self._raw
+
+    assert S._screen_tail(FakeSess()) == ["top line", "PROMPT>"]
+
+
+def test_screen_tail_falls_back_to_scrollback(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # If the live frame stays blank, fall back to scrollback history.
+    monkeypatch.setattr(S.time, "sleep", lambda *_a: None)
+    starts: list[int | None] = []
+
+    class FakeRaw:
+        def capture_pane(self, ansi: bool = False,
+                         start: int | None = None) -> str:
+            starts.append(start)
+            return "hist one\nhist two\n" if start is not None else "\n\n"
+
+    class FakeSess:
+        ui = "tty"
+
+        def raw(self) -> Any:
+            return FakeRaw()
+
+    assert S._screen_tail(FakeSess()) == ["hist one", "hist two"]
+    assert any(s is not None and s < 0 for s in starts)   # reached into history
 
 
 def test_run_script_bad_types_clean_cli_error(
@@ -581,6 +641,45 @@ def test_run_format_junit_plumbing(
     assert root.attrib["failures"] == "1"
     names = {tc.attrib["name"] for tc in root.findall("testcase")}
     assert names == {"group: ok", "group: bad"}
+    assert running_run_sessions() == []
+
+
+def test_run_script_defaults_timeout_applies(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # A scenario "defaults.timeout" replaces the built-in per-verb timeout:
+    # an eval that would pass under the 15s eval default times out under 1s.
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "defaults": {"timeout": 1.0},
+        "steps": [{"eval": "(sleep-for 3)"}],
+    })
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["success"] is False
+    assert out["steps"][0]["status"] == "failed"
+    assert out["steps"][0]["duration"] < 2.5        # timed out ~1s, not ~3s
+    assert running_run_sessions() == []
+
+
+def test_run_script_tty_failure_embeds_screen_tail(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # A failed step in a tty session embeds a non-empty pane snapshot.
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"eval": '(progn (switch-to-buffer "*scratch*") (erase-buffer) '
+                     '(insert "eg-screen-marker"))'},
+            {"assert": {"buffer_contains": "absent-nope-qqq"}},
+        ],
+    })
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    failed = out["steps"][1]
+    assert failed["status"] == "failed"
+    tail = failed.get("screen_tail")
+    assert tail and any(ln.strip() for ln in tail)   # populated, non-blank
     assert running_run_sessions() == []
 
 

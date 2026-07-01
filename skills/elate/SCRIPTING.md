@@ -46,6 +46,12 @@ reports one verdict per group (`dw: PASS · u: XFAIL · cc: FAIL`). A
 verb-less `{"group": "dw"}` is a boundary marker; a comment/group marker
 runs nothing and takes no other keys.
 
+A top-level `"defaults"` block sets fallbacks for options every step would
+otherwise repeat: `"timeout"` (seconds, the fallback for any verb's step
+timeout) and `"min_idle"` (the fallback for `wait: "idle"`). A step's own
+`timeout`/`min_idle` still wins; the defaults just replace the built-in
+per-verb baseline.
+
 Relative paths (session `load`/`init_file`, test `load_files`, `lint`
 files, `screenshot` output) resolve against the **script file's
 directory**, so scripts can live next to the package they test and run

@@ -23,6 +23,7 @@ A script:
       "name": "demo",
       "session": {"ui": "tty", "size": "100x30", "config": "minimal",
                   "load": ["./my-pkg.el"], "eval": ["(my-setup)"]},
+      "defaults": {"timeout": 8, "min_idle": 0.3},
       "steps": [
         {"keys": "M-x my-mode RET"},
         {"wait": "text", "pattern": "ready", "buffer": "*scratch*"},
@@ -166,6 +167,9 @@ def validate_script(script: Any) -> None:
     cfg = script.get("session")
     if cfg is not None:
         _validate_session_config(cfg)
+    defaults = script.get("defaults")
+    if defaults is not None:
+        _validate_defaults(defaults)
     if not steps:
         # An empty CI script "passing" vacuously is far more likely a
         # typo (or a truncated export) than intent: be loud.
@@ -244,6 +248,22 @@ def _check_size(size: Any, what: str) -> None:
         # Same bounds resize_session enforces; without this, "0x0"
         # reaches tmux and dies with a cryptic boot error.
         raise ElateError(f"{what} {size} is implausible (minimum 10x4)")
+
+
+_DEFAULTS_KEYS = {"timeout", "min_idle"}
+
+
+def _validate_defaults(defaults: Any) -> None:
+    if not isinstance(defaults, dict):
+        raise ElateError('script "defaults" must be an object')
+    unknown = set(defaults) - _DEFAULTS_KEYS
+    if unknown:
+        raise ElateError(
+            f'unknown "defaults" key(s) {sorted(unknown)}; '
+            f"known: {sorted(_DEFAULTS_KEYS)}")
+    _check_timeout(defaults, 'script "defaults"')
+    _check_number(defaults, "min_idle", 'script "defaults"',
+                  minimum=0, maximum=60)
 
 
 def _validate_session_config(cfg: Any) -> None:
@@ -612,7 +632,7 @@ def run_script(
     sess.log("run-script", name=script.get("name"), steps=len(steps),
              **({"origin": origin} if origin else {}))
 
-    ctx: dict[str, Any] = {}
+    ctx: dict[str, Any] = {"_defaults": script.get("defaults") or {}}
     snap_root = (Path(snapshot_dir) if snapshot_dir is not None
                  else base / "__snapshots__")
     ctx["_snapshot"] = {
@@ -873,11 +893,19 @@ def _summary(step: dict[str, Any], verb: str | None) -> str:
     return f"{verb} {_clip(json.dumps(val, ensure_ascii=False))}"
 
 
+def _step_timeout(step: dict[str, Any], verb: str,
+                  defaults: dict[str, Any]) -> float:
+    """A step's timeout: its own, else the scenario default, else the builtin."""
+    return float(step.get("timeout",
+                          defaults.get("timeout", _DEFAULT_TIMEOUTS[verb])))
+
+
 def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
                base: Path, ctx: dict[str, Any]) -> dict[str, Any]:
+    defaults = ctx.get("_defaults") or {}
     if verb == "keys":
         delivery = step.get("delivery", "semantic")
-        timeout = float(step.get("timeout", _DEFAULT_TIMEOUTS["keys"]))
+        timeout = _step_timeout(step, verb, defaults)
         sess.log("keys", keys=step["keys"],
                  channel="raw" if delivery == "raw" else "semantic",
                  method="events" if delivery == "events" else "macro",
@@ -895,7 +923,7 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
         return S.deliver_type(sess, step["type"])
 
     if verb == "eval":
-        timeout = float(step.get("timeout", _DEFAULT_TIMEOUTS["eval"]))
+        timeout = _step_timeout(step, verb, defaults)
         sess.log("eval", form=step["eval"], timeout=timeout, via="script")
         data = sess.semantic().eval_form(step["eval"], timeout=timeout)
         sess.log("eval-result", **data)
@@ -907,13 +935,16 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
 
     if verb == "wait":
         cond = step["wait"]
-        timeout = float(step.get("timeout", _DEFAULT_TIMEOUTS["wait"]))
+        timeout = _step_timeout(step, verb, defaults)
         sess.log("wait", condition=cond, pattern=step.get("pattern"),
                  buffer=step.get("buffer"), min_idle=step.get("min_idle"),
                  timeout=timeout, via="script")
         if cond == "idle":
-            return S.wait_idle(sess, min_idle=float(step.get("min_idle", 0.2)),
-                               timeout=timeout)
+            return S.wait_idle(
+                sess,
+                min_idle=float(step.get("min_idle",
+                                        defaults.get("min_idle", 0.2))),
+                timeout=timeout)
         if cond == "text":
             return S.wait_text(sess, step["pattern"],
                                buffer=step.get("buffer"), timeout=timeout)
@@ -932,11 +963,10 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
         )
         sess.log("mouse", via="script", **kwargs)
         return S.mouse_event(
-            sess, timeout=float(step.get("timeout", _DEFAULT_TIMEOUTS["mouse"])),
-            **kwargs)
+            sess, timeout=_step_timeout(step, verb, defaults), **kwargs)
 
     if verb == "focus":
-        timeout = float(step.get("timeout", _DEFAULT_TIMEOUTS["focus"]))
+        timeout = _step_timeout(step, verb, defaults)
         set_state = bool(step.get("set_focus_state"))
         sess.log("focus", direction=step["focus"], frame=step.get("frame"),
                  set_focus_state=set_state, via="script")
@@ -944,7 +974,7 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
                              set_focus_state=set_state, timeout=timeout)
 
     if verb == "send_events":
-        timeout = float(step.get("timeout", _DEFAULT_TIMEOUTS["send_events"]))
+        timeout = _step_timeout(step, verb, defaults)
         set_state = bool(step.get("set_focus_state"))
         sess.log("send-events", events=step["send_events"],
                  buffer=step.get("buffer"), frame=step.get("frame"),
@@ -954,7 +984,7 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
                              timeout=timeout)
 
     if verb == "test":
-        timeout = float(step.get("timeout", _DEFAULT_TIMEOUTS["test"]))
+        timeout = _step_timeout(step, verb, defaults)
         load_files = [_resolve(p, base) for p in step.get("load_files") or []]
         sess.log("test", selector=step["test"], load_files=load_files,
                  timeout=timeout, via="script")
@@ -974,7 +1004,7 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
         return data
 
     if verb == "lint":
-        timeout = float(step.get("timeout", _DEFAULT_TIMEOUTS["lint"]))
+        timeout = _step_timeout(step, verb, defaults)
         files = [_resolve(p, base) for p in step["lint"]]
         sess.log("lint", files=files, timeout=timeout, via="script")
         data = S.lint_files(sess, files, timeout=timeout)
@@ -1117,7 +1147,8 @@ def _eval_assert(sess: S.Session, spec: dict[str, Any],
         return _eval_snapshot(sess, val, ctx)
 
     # kind == "eval": passes when the form evaluates without error to non-nil
-    timeout = float(spec.get("timeout", 10.0))
+    timeout = float(spec.get("timeout",
+                             (ctx.get("_defaults") or {}).get("timeout", 10.0)))
     data = sess.semantic().eval_form(val, timeout=timeout)
     if data.get("error"):
         raise _StepFailure(f"assertion form signalled: {data['error']}",
