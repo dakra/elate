@@ -67,6 +67,10 @@ from any cwd.
 | `init_file` | string path | — | only with config `minimal`/`init-file` (implies `init-file`); conflicts loudly with `bare`/`clean-install` |
 | `load` | list of strings | — | files/dirs for load-path; with `clean-install`: packages to install |
 | `eval` | list of strings | — | startup forms |
+| `eval_file` | list of strings | — | elisp files loaded at startup (like `eval`, no load-path effect) |
+| `profile` | list of strings | — | named snippets from `$XDG_CONFIG_HOME/elate/profiles/NAME.el` (or a `.el` path) |
+| `home_seed` | string path | — | fixture tree copied into the sandbox `$HOME` before launch (rc files for shell tests) |
+| `env` | object (string→string) | — | extra process env vars (e.g. `{"SHELL": "/bin/zsh"}`); cannot override `HOME`/`XDG_*` |
 | `emacs` | string path | — | binary override (also: `run --emacs`, `matrix`) |
 | `headless` | bool | false | GUI under a private Xvfb (Linux) |
 | `allow_init_error` | bool | false | see init_error contract below |

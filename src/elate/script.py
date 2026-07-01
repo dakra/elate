@@ -130,6 +130,7 @@ _SNAPSHOT_OF = ("screen", "faces", "state")
 _SNAPSHOT_KEYS = {"name", "of", "buffer", "from", "to", "ansi"}
 
 _SESSION_KEYS = {"ui", "size", "config", "init_file", "load", "eval",
+                 "eval_file", "profile", "home_seed", "env",
                  "emacs", "headless", "allow_init_error"}
 
 _DEFAULT_TIMEOUTS = {"keys": 15.0, "eval": 15.0, "wait": 10.0,
@@ -291,14 +292,20 @@ def _validate_session_config(cfg: Any) -> None:
         raise ElateError(
             f'session "init_file" conflicts with config '
             f"{cfg.get('config')!r}; drop one of the two")
-    for key in ("load", "eval"):
+    for key in ("load", "eval", "eval_file", "profile"):
         val = cfg.get(key)
         if val is not None and not (
                 isinstance(val, list) and all(isinstance(x, str) for x in val)):
             raise ElateError(f'session "{key}" must be a list of strings')
-    for key in ("init_file", "emacs"):
+    for key in ("init_file", "emacs", "home_seed"):
         if cfg.get(key) is not None and not isinstance(cfg[key], str):
             raise ElateError(f'session "{key}" must be a string path')
+    env = cfg.get("env")
+    if env is not None and not (
+            isinstance(env, dict)
+            and all(isinstance(k, str) and isinstance(v, str)
+                    for k, v in env.items())):
+        raise ElateError('session "env" must be an object of string -> string')
 
 
 def _validate_step(step: Any, index: int) -> None:
@@ -777,6 +784,10 @@ def _start_for(script: dict[str, Any], base: Path,
         init_file=_resolve(cfg.get("init_file"), base),
         loads=[_resolve(p, base) for p in cfg.get("load") or []],
         evals=list(cfg.get("eval") or []),
+        eval_files=[_resolve(p, base) for p in cfg.get("eval_file") or []],
+        profiles=list(cfg.get("profile") or []),
+        home_seed=_resolve(cfg.get("home_seed"), base),
+        env=cfg.get("env") or None,
         cols=int(m.group(1)),
         rows=int(m.group(2)),
         ui=cfg.get("ui", "tty"),

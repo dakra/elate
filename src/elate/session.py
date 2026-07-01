@@ -57,6 +57,7 @@ class Session:
     init_file: str | None = None
     loads: list[str] = field(default_factory=list)
     evals: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)  # extra process env vars
     headless: bool = False  # gui sessions: running under our own Xvfb
     display: str | None = None  # gui sessions: X11 DISPLAY (Linux)
     xvfb_pid: int | None = None  # gui sessions: Xvfb we own (Linux headless)
@@ -435,6 +436,7 @@ def start_session(
     eval_files: Sequence[str] = (),
     profiles: Sequence[str] = (),
     home_seed: str | None = None,
+    env: dict[str, str] | None = None,
     cols: int = 120,
     rows: int = 36,
     ui: str = "tty",
@@ -445,6 +447,8 @@ def start_session(
         name = _free_name()
     if not _NAME_RE.match(name):
         raise ElateError(f"invalid session name: {name!r}")
+    if env:
+        sandbox.validate_env(env)
     if cols < 10 or rows < 4:
         # Same bounds as resize_session; without this, sizes like 0x0
         # reach tmux/the frame code and die with a cryptic boot error.
@@ -530,6 +534,7 @@ def start_session(
         init_file=init_file,
         loads=list(loads),
         evals=list(evals),
+        env=dict(env or {}),
         headless=headless,
     )
     sess.save()
@@ -550,8 +555,12 @@ def start_session(
 
 
 def _boot_tty(sess: Session, emacs_args: list[str], tmux_conf: Path) -> None:
-    env = sandbox.environment(sess.dir)
-    env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+    env = sandbox.environment(sess.dir, sess.env)
+    # Quote BOTH sides: keys are validated to POSIX names upstream, but
+    # quoting here is defense-in-depth so nothing can inject into the shell
+    # command tmux runs even if a bad key ever slips past validation.
+    env_prefix = " ".join(
+        f"{shlex.quote(k)}={shlex.quote(v)}" for k, v in env.items())
     # Redirect Emacs's stderr to a file (absolute path -- tmux's cwd is the
     # controller's, not the sandbox): module panics / GC warnings / the
     # fatal-signal line move off the pane into a tailable log (`elate logs`,
@@ -598,7 +607,7 @@ def _boot_gui(sess: Session, emacs_args: list[str]) -> None:
             sess.xvfb_identity = gui.proc_identity(sess.xvfb_pid)
             sess.save()
         proc = gui.spawn_emacs(
-            sess.emacs, emacs_args, sandbox.environment(sess.dir),
+            sess.emacs, emacs_args, sandbox.environment(sess.dir, sess.env),
             sess.gui_log_path, display=sess.display,
         )
         sess.emacs_pid = proc.pid

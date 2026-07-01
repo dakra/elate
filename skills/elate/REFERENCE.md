@@ -74,6 +74,7 @@ start a new sandboxed session
 - `--eval-file PATH` (repeatable) -- elisp file to load at startup, before emacs-startup-hook (repeatable); like a reusable --eval, with no load-path side effects
 - `--profile NAME` (repeatable) -- named startup snippet from $XDG_CONFIG_HOME/elate/profiles/NAME.el (or a path to a .el file); loaded like --eval-file (repeatable)
 - `--home-seed DIR` -- copy this fixture tree into the sandbox's fake $HOME before launch (rc files in place before any subprocess spawns; keeps sandbox isolation)
+- `--env KEY=VALUE` (repeatable) -- set an environment variable for the Emacs process and the subprocesses it spawns (repeatable); cannot override the sandbox's HOME/XDG_* isolation vars
 - `--size COLSxROWS` (default: 120x36)
 
 ## elate stop

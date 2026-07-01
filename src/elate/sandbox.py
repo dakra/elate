@@ -20,6 +20,7 @@ Config modes:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Sequence
@@ -305,13 +306,54 @@ def build_sandbox(
     return [*ui_args, "--init-directory", str(dirs["init"])]
 
 
-def environment(session_dir: Path) -> dict[str, str]:
-    """Environment overrides isolating the session from the real $HOME."""
+# Env vars environment() sets to isolate the sandbox; user env must not
+# override them (that would break $HOME isolation / home_seed).
+RESERVED_ENV = frozenset(
+    {"HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+     "XDG_CACHE_HOME"})
+
+# A POSIX environment-variable name. Enforced because the tty boot builds a
+# shell `env NAME=value ...` prefix: an unconstrained NAME (e.g. containing
+# `$(...)`, `;`, spaces) would break the launch or -- worse -- inject a
+# command that runs on the HOST, outside the sandbox.
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def validate_env(env: dict[str, str]) -> None:
+    """Reject env that would break sandbox isolation or the shell launch.
+
+    The single choke point for user env (every entry point -- CLI
+    `--env`, a scenario `session.env`, MCP -- funnels through here via
+    `start_session`).
+    """
+    reserved = sorted(set(env) & RESERVED_ENV)
+    if reserved:
+        raise ElateError(
+            f"env cannot override the sandbox isolation vars {reserved}; "
+            "drop them (or use home_seed to seed $HOME)")
+    for key in env:
+        if not _ENV_NAME_RE.match(key):
+            raise ElateError(
+                f"invalid env var name {key!r}: must match "
+                "[A-Za-z_][A-Za-z0-9_]* (a POSIX shell variable name)")
+
+
+def environment(session_dir: Path,
+                extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment overrides isolating the session from the real $HOME.
+
+    EXTRA carries user-supplied vars (session "env"); they are added but
+    can never override the isolation vars above (validated loudly upstream,
+    and defended here).
+    """
     home = session_dir / "home"
-    return {
+    env = {
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
         "XDG_DATA_HOME": str(home / ".local/share"),
         "XDG_STATE_HOME": str(home / ".local/state"),
         "XDG_CACHE_HOME": str(home / ".cache"),
     }
+    for k, v in (extra or {}).items():
+        env.setdefault(k, v)  # isolation vars win
+    return env

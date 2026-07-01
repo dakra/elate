@@ -31,6 +31,14 @@ def _parse_size(value: str) -> tuple[int, int]:
     return int(m.group(1)), int(m.group(2))
 
 
+def _parse_env_pair(value: str) -> tuple[str, str]:
+    key, sep, val = value.partition("=")
+    if not sep or not key:
+        raise argparse.ArgumentTypeError(
+            f"--env expects KEY=VALUE with a non-empty KEY, got {value!r}")
+    return key, val
+
+
 _DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
@@ -137,6 +145,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="copy this fixture tree into the sandbox's fake "
                          "$HOME before launch (rc files in place before any "
                          "subprocess spawns; keeps sandbox isolation)")
+    sp.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                    type=_parse_env_pair,
+                    help="set an environment variable for the Emacs process "
+                         "and the subprocesses it spawns (repeatable); cannot "
+                         "override the sandbox's HOME/XDG_* isolation vars")
     sp.add_argument("--size", type=_parse_size, default=(120, 36), metavar="COLSxROWS")
 
     sp = sub.add_parser("stop", help="stop a session (or --all)")
@@ -780,6 +793,7 @@ def cmd_start(args: argparse.Namespace) -> Result:
         eval_files=args.eval_file,
         profiles=args.profile,
         home_seed=args.home_seed,
+        env=dict(args.env),
         cols=cols,
         rows=rows,
         ui=args.ui,

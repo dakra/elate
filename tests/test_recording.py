@@ -179,6 +179,11 @@ def test_validate_script_errors() -> None:
         ({"steps": [{"eval": "1"}], "defaults": {"bogus": 1}}, "unknown"),
         ({"steps": [{"eval": "1"}], "defaults": {"timeout": -3}}, "timeout"),
         ({"steps": [{"eval": "1"}], "defaults": {"min_idle": 999}}, "min_idle"),
+        ({"steps": [{"eval": "1"}], "session": {"env": "x"}}, "env"),
+        ({"steps": [{"eval": "1"}], "session": {"env": {"K": 1}}}, "env"),
+        ({"steps": [{"eval": "1"}], "session": {"eval_file": [1]}},
+         "list of strings"),
+        ({"steps": [{"eval": "1"}], "session": {"home_seed": 5}}, "string path"),
         ({"steps": [{"test": "t", "allow_unexpected": 1}]}, "allow_unexpected"),
         ({"steps": [{"lint": ["f.el"], "allow_findings": "no"}]},
          "allow_findings"),
@@ -282,6 +287,24 @@ def test_outcome_unknown_status_surfaces_as_failure() -> None:
     # A future/unknown status must never be silently rendered as a pass.
     assert cli._step_outcome({"status": "weird"})[0] == "fail"
     assert cli._group_outcome({"status": "WEIRD"})[0] == "fail"
+
+
+def test_sandbox_environment_merges_user_env(tmp_path: Path) -> None:
+    from elate import sandbox
+    env = sandbox.environment(tmp_path, {"FOO": "bar", "HOME": "/evil"})
+    assert env["FOO"] == "bar"                        # user var added
+    assert env["HOME"] == str(tmp_path / "home")      # isolation var still wins
+
+
+def test_sandbox_validate_env_rejects_unsafe_keys() -> None:
+    from elate import sandbox
+    sandbox.validate_env({"OK_NAME_1": "v", "_x": ""})           # valid POSIX names
+    for bad in ({"$(touch /tmp/x)": "v"}, {"FOO BAR": "v"}, {"": "v"},
+                {"A=B": "v"}, {"1FOO": "v"}, {"a;b": "v"}):
+        with pytest.raises(ElateError, match="env var name"):
+            sandbox.validate_env(bad)
+    with pytest.raises(ElateError, match="isolation"):
+        sandbox.validate_env({"HOME": "/evil"})                  # reserved
 
 
 def test_step_timeout_resolution() -> None:
@@ -681,6 +704,68 @@ def test_run_script_tty_failure_embeds_screen_tail(
     tail = failed.get("screen_tail")
     assert tail and any(ln.strip() for ln in tail)   # populated, non-blank
     assert running_run_sessions() == []
+
+
+def test_run_script_session_parity(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # eval_file, home_seed, and env all reach a run scenario's session (the
+    # parity `start` already had).
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    (seed / ".myrc").write_text("hello-rc", encoding="utf-8")
+    evalfile = tmp_path / "setup.el"
+    evalfile.write_text("(setq eg-parity-loaded t)", encoding="utf-8")
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24",
+                    "eval_file": [str(evalfile)],
+                    "home_seed": str(seed),
+                    "env": {"EG_PARITY": "yes-parity"}},
+        "steps": [
+            {"assert": {"eval": "(bound-and-true-p eg-parity-loaded)"}},
+            {"assert": {"eval": '(equal (getenv "EG_PARITY") "yes-parity")'}},
+            {"assert": {"eval": '(file-exists-p "~/.myrc")'}},
+        ],
+    })
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["success"] is True and out["passed"] == 3
+    assert running_run_sessions() == []
+
+
+def test_run_script_env_cannot_override_isolation(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # env must not clobber the sandbox $HOME isolation -- the run fails to
+    # start with a loud error rather than silently escaping the sandbox.
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24",
+                    "env": {"HOME": "/tmp/evil"}},
+        "steps": [{"eval": "1"}],
+    })
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["ok"] is False
+    assert "isolation" in out["error"] or "HOME" in out["error"]
+
+
+def test_run_script_env_key_injection_is_rejected(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # An env KEY containing a shell command-substitution must be rejected up
+    # front and must NEVER execute on the host (it used to inject via the
+    # tmux `sh -c` env prefix).
+    marker = tmp_path / "pwned"
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24",
+                    "env": {f"$(touch {marker})": "x"}},
+        "steps": [{"eval": "1"}],
+    })
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["ok"] is False
+    assert "env var name" in out["error"]
+    assert not marker.exists()          # the injected command never ran
 
 
 def test_run_script_failing_step_elisp_error(

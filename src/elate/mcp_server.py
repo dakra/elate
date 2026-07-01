@@ -217,6 +217,10 @@ def elate_start(
         "are in place before any subprocess the session spawns -- the way "
         "to test shell integration while keeping the sandbox isolated."))]
         = None,
+    env: Annotated[dict[str, str] | None, Field(description=(
+        "Extra environment variables for the Emacs process and the "
+        "subprocesses it spawns (e.g. {\"SHELL\": \"/bin/zsh\"}). Cannot "
+        "override the sandbox's HOME/XDG_* isolation vars."))] = None,
     size: Annotated[str, Field(description=(
         "Terminal size as COLSxROWS, e.g. '120x36'."))] = "120x36",
     replace: Annotated[bool, Field(description=(
@@ -252,6 +256,7 @@ def elate_start(
             eval_files=eval_files or [],
             profiles=profiles or [],
             home_seed=home_seed,
+            env=env or None,
             cols=int(m.group(1)),
             rows=int(m.group(2)),
             ui=ui,
