@@ -482,8 +482,107 @@ def test_run_script_passes_and_tears_down(
     assert all(s["status"] in ("ok", "skipped", "comment") for s in out["steps"])
     # Fresh session torn down: nothing left running.
     assert running_run_sessions() == []
-    # The sandbox (with its transcript) is kept on disk for forensics.
+    # A successful run purges its throwaway sandbox by default (no pile-up).
+    assert out["purged"] is True
+    assert not os.path.isdir(out["session_dir"])
+
+
+def test_run_keep_names_from_scenario(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # --keep names the kept session from the scenario "name" (sanitized), not
+    # an opaque run-<hex>.
+    path = write_script(tmp_path, {
+        "name": "My Kept Run!",
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"eval": "(+ 1 1)"}],
+    }, "named.json")
+    code = cli.main(["--json", "run", path, "--keep"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["kept"] is True
+    assert out["session"] == "My-Kept-Run"
+    assert S.load_session(out["session"]).is_alive()
+    assert cli.main(["--json", "stop", out["session"]]) == 0
+
+
+def test_run_keep_name_guards(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"eval": "(+ 1 1)"}],
+    }, "g.json")
+    # --name requires --keep.
+    code = cli.main(["--json", "run", path, "--name", "foo"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "requires --keep" in out["error"]
+    # A kept name cannot squat the throwaway run- namespace.
+    code = cli.main(["--json", "run", path, "--keep", "--name", "run-foo"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "run-" in out["error"]
+    # A very long name is capped, so it can't crash mkdir with a raw
+    # OSError -- the run completes cleanly (parseable JSON, an int code),
+    # whether or not the capped name then fits the socket path.
+    code = cli.main(["--json", "run", path, "--keep", "--name", "z" * 300])
+    out = json.loads(capsys.readouterr().out)   # clean JSON => no traceback
+    assert code in (0, 1)
+    if out.get("session"):
+        assert len(out["session"]) <= 64
+        cli.main(["--json", "stop", out["session"]])
+        capsys.readouterr()
+
+
+def test_run_no_purge_and_failure_keeps_sandbox(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # --no-purge keeps a successful run's sandbox on disk...
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"eval": "(+ 1 1)"}],
+    }, "np.json")
+    code = cli.main(["--json", "run", path, "--no-purge"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and not out.get("purged")
     assert os.path.isdir(out["session_dir"])
+    # ...and a FAILED run is always kept (never purged), for post-mortem.
+    fpath = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"assert": {"eval": "nil"}}],
+    }, "fail.json")
+    code = cli.main(["--json", "run", fpath])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and not out.get("purged")
+    assert os.path.isdir(out["session_dir"])
+    assert running_run_sessions() == []
+
+
+def test_purge_glob_and_name_prefix(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # Failed runs leave stopped run-<hex> sandboxes; purge --glob sweeps them.
+    # (elate_home is module-scoped, so track our own sessions, not a count.)
+    mine = []
+    for i in range(2):
+        p = write_script(tmp_path, {
+            "session": {"config": "bare", "size": "80x24"},
+            "steps": [{"assert": {"eval": "nil"}}],
+        }, f"f{i}.json")
+        cli.main(["--json", "run", p])
+        out = json.loads(capsys.readouterr().out)
+        assert out["session"].startswith("run-") and not out.get("purged")
+        mine.append(out["session"])
+    code = cli.main(["--json", "purge", "--glob", "run-*"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert set(mine) <= {p["name"] for p in out["purged"]}      # ours were swept
+    # A follow-up prefix sweep no longer finds them.
+    cli.main(["--json", "purge", "--name-prefix", "run-"])
+    out = json.loads(capsys.readouterr().out)
+    assert not (set(mine) & {p["name"] for p in out["purged"]})
+    # Glob/prefix cannot combine with explicit names.
+    code = cli.main(["--json", "purge", "--glob", "run-*", "somename"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "cannot be combined" in out["error"]
 
 
 def test_run_script_failing_assertion(

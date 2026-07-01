@@ -203,6 +203,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="only purge sessions inert at least this long "
                          "(e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- "
                          "keeps just-stopped sandboxes during heavy runs")
+    sp.add_argument("--glob", metavar="PATTERN", dest="name_glob",
+                    help="purge sessions whose name matches this glob (e.g. "
+                         "'run-*') -- a bulk selector like --all; running "
+                         "matches are skipped")
+    sp.add_argument("--name-prefix", metavar="PREFIX",
+                    help="purge sessions whose name starts with PREFIX (e.g. "
+                         "'run-') -- a bulk selector like --all")
 
     sp = sub.add_parser(
         "prune",
@@ -217,6 +224,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--stopped-older-than", metavar="DUR", type=_parse_duration,
                     help="only prune sessions inert at least this long "
                          "(e.g. 30s, 15m, 2h, 1d; bare number = seconds)")
+    sp.add_argument("--glob", metavar="PATTERN", dest="name_glob",
+                    help="prune sessions whose name matches this glob "
+                         "(e.g. 'run-*') -- a bulk selector like --all")
+    sp.add_argument("--name-prefix", metavar="PREFIX",
+                    help="prune sessions whose name starts with PREFIX "
+                         "(e.g. 'run-') -- a bulk selector like --all")
 
     sp = sub.add_parser("info", help="show session details")
     sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
@@ -609,7 +622,16 @@ def build_parser() -> argparse.ArgumentParser:
                     "session gives reproducible verdicts.")
     sp.add_argument("script", help="path to the scenario file (JSON)")
     sp.add_argument("--keep", action="store_true",
-                    help="keep the fresh session running afterwards")
+                    help="keep the fresh session running afterwards (named "
+                         "from the scenario's \"name\", or --name)")
+    sp.add_argument("--name", metavar="NAME",
+                    help="name for a kept session (default with --keep: the "
+                         "scenario's \"name\"); a running name collision is "
+                         "an error")
+    sp.add_argument("--no-purge", action="store_true",
+                    help="on success, keep the throwaway sandbox on disk "
+                         "(stopped) instead of removing it; failed runs are "
+                         "always kept for post-mortem")
     sp.add_argument("--keep-on-failure", action="store_true",
                     help="keep the fresh session running when the run "
                          "fails (inspect it with state/screenshot, then "
@@ -869,7 +891,9 @@ def cmd_interrupt(args: argparse.Namespace) -> Result:
 
 def cmd_purge(args: argparse.Namespace) -> Result:
     result = S.purge_sessions(args.names, all_sessions=args.all_sessions,
-                              stopped_older_than=args.stopped_older_than)
+                              stopped_older_than=args.stopped_older_than,
+                              name_glob=args.name_glob,
+                              name_prefix=args.name_prefix)
     purged = result["purged"]
     skipped = result["skipped_running"]
     recent = result.get("skipped_recent") or []
@@ -1782,8 +1806,13 @@ def _run_summary(result: dict[str, Any]) -> str:
         line += ("\nWARNING: session startup code signalled an error: "
                  f"{result['init_error']}")
     if result.get("kept") and result.get("fresh_session"):
-        line += (f"\nsession kept: elate -s {result['session']} state; "
-                 f"elate stop {result['session']}")
+        line += (f"\nsession kept (running): elate -s {result['session']} "
+                 f"state; elate stop {result['session']}")
+    elif result.get("fresh_session") and not result.get("purged"):
+        # Stopped but the sandbox (transcript/logs) is on disk: the default on
+        # a FAILED run (for post-mortem), or a successful run with --no-purge.
+        line += (f"\nsandbox kept: elate -s {result['session']} logs; "
+                 f"elate purge {result['session']} (or purge --glob 'run-*')")
     return line
 
 
@@ -1918,6 +1947,10 @@ def cmd_run(args: argparse.Namespace) -> Result:
         raise ElateError(
             "--emacs cannot apply to an existing session (-s NAME); drop "
             "-s to run a fresh session with that binary")
+    if args.name and not args.keep:
+        # A name is only meaningful for a session that survives the run;
+        # otherwise it just leaves a non-run-* leftover on failure.
+        raise ElateError("--name requires --keep (it names the kept session)")
     script, base = SC.load_script(args.script, dict(args.set_vars))
     target = None
     if args.session:
@@ -1931,10 +1964,16 @@ def cmd_run(args: argparse.Namespace) -> Result:
     if stream:
         def on_step(rec: dict[str, Any]) -> None:
             print(_step_line(rec, total), flush=True)
+    # A kept session's name: --name wins, else (with --keep) the scenario's
+    # "name". Purge the throwaway sandbox on a successful run unless kept or
+    # --no-purge.
+    keep_as_name = args.name or (script.get("name") if args.keep else None)
     result = SC.run_script(
         script, base_dir=base, session=target, emacs=args.emacs,
         keep=args.keep, keep_on_failure=args.keep_on_failure,
         keep_going=args.keep_going,
+        keep_as_name=keep_as_name,
+        purge=not args.no_purge,
         on_step=on_step,
         update_snapshots=args.update_snapshots,
         snapshot_dir=(base / Path(args.snapshot_dir).expanduser()
@@ -2168,6 +2207,7 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
             rendered = SC.render_script(raw, params)
             run = SC.run_script(
                 rendered, base_dir=base, emacs=emacs_bin, on_step=on_step,
+                purge=True,  # purge a passing combo; failed combos are kept
                 update_snapshots=args.update_snapshots,
                 snapshot_dir=(base / Path(args.snapshot_dir).expanduser()
                               if args.snapshot_dir else None),

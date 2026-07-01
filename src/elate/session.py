@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import fnmatch
 import json
 import re
 import secrets
@@ -788,7 +789,9 @@ def _dir_size(path: Path) -> int:
 
 def purge_sessions(names: Sequence[str] | None = None,
                    all_sessions: bool = False,
-                   stopped_older_than: float | None = None) -> dict[str, Any]:
+                   stopped_older_than: float | None = None,
+                   name_glob: str | None = None,
+                   name_prefix: str | None = None) -> dict[str, Any]:
     """Delete the sandbox directories of sessions that are not running.
 
     ``stopped_older_than`` (seconds) restricts the sweep to sessions that
@@ -816,10 +819,15 @@ def purge_sessions(names: Sequence[str] | None = None,
     concurrent ``start`` of a name just classified as not-running can
     race the removal (same disposition as the record-start TOCTOU).
     """
-    if not names and not all_sessions:
+    filtered = name_glob is not None or name_prefix is not None
+    if not names and not all_sessions and not filtered:
         raise ElateError(
-            "purge needs explicit session names or --all "
-            "(purge --all removes every stopped/dead sandbox)")
+            "purge needs explicit session names, --all, --glob, or "
+            "--name-prefix (purge --all removes every stopped/dead sandbox)")
+    if names and filtered:
+        raise ElateError(
+            "purge: --glob/--name-prefix select by pattern and cannot be "
+            "combined with explicit session names")
     root = sessions_root()
     listing = {s["name"]: s for s in list_sessions()}
     if names:
@@ -837,7 +845,15 @@ def purge_sessions(names: Sequence[str] | None = None,
                 "never removes a running session; stop first "
                 "(elate stop NAME)")
     else:
+        # --all / --glob / --name-prefix are bulk selectors: a running match
+        # is skipped and reported (never a hard error, unlike a named one).
         targets = list(listing.values())
+        if name_glob is not None:
+            targets = [t for t in targets
+                       if fnmatch.fnmatch(t["name"], name_glob)]
+        if name_prefix is not None:
+            targets = [t for t in targets
+                       if t["name"].startswith(name_prefix)]
     purged: list[dict[str, Any]] = []
     skipped: list[str] = []
     too_young: list[str] = []

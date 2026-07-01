@@ -341,6 +341,13 @@ def elate_purge(
         "idle_for); fresher ones are kept and reported under skipped_recent. "
         "Lets a heavy parallel run GC stale sandboxes without removing "
         "just-stopped ones."))] = None,
+    name_glob: Annotated[str | None, Field(description=(
+        "Purge sessions whose name matches this glob (e.g. 'run-*') -- a "
+        "bulk selector like all_sessions; running matches are skipped. "
+        "Cannot combine with explicit names."))] = None,
+    name_prefix: Annotated[str | None, Field(description=(
+        "Purge sessions whose name starts with this prefix (e.g. 'run-') -- "
+        "a bulk selector. Cannot combine with explicit names."))] = None,
 ) -> str:
     """Delete the sandboxes (transcripts included) of stopped/dead sessions.
 
@@ -355,10 +362,13 @@ def elate_purge(
     """
     try:
         names = names or []
-        if not names and not all_sessions:
-            raise ElateError("elate_purge needs names or all_sessions=true")
+        if not names and not all_sessions and not name_glob and not name_prefix:
+            raise ElateError(
+                "elate_purge needs names, all_sessions=true, name_glob, or "
+                "name_prefix")
         return _ok(S.purge_sessions(names, all_sessions=all_sessions,
-                                    stopped_older_than=stopped_older_than))
+                                    stopped_older_than=stopped_older_than,
+                                    name_glob=name_glob, name_prefix=name_prefix))
     except Exception as exc:
         return _fail(exc)
 
@@ -1087,6 +1097,11 @@ def elate_run_script(
         "first (a failed run still reports success=false); use for a "
         "regression matrix that must report every check. A step with "
         "\"optional\": true never gates the run."))] = False,
+    no_purge: Annotated[bool, Field(description=(
+        "On success, keep the throwaway sandbox on disk (stopped) instead of "
+        "removing it. By default a successful run purges its sandbox; a "
+        "FAILED run is always kept (with keep_on_failure it stays running)."))]
+        = False,
     timeout: Annotated[float, Field(gt=0, le=600, description=(
         "Overall wall-clock budget for the whole run in seconds "
         "(0 < timeout <= 600). Steps not started by the deadline fail; "
@@ -1136,6 +1151,7 @@ def elate_run_script(
         result = SC.run_script(sc, base_dir=base, emacs=emacs,
                                keep_on_failure=keep_on_failure,
                                keep_going=keep_going,
+                               purge=not no_purge,
                                deadline=time.monotonic() + timeout,
                                origin="mcp",
                                update_snapshots=update_snapshots,

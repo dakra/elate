@@ -673,6 +673,8 @@ def run_script(
     keep: bool = False,
     keep_on_failure: bool = False,
     keep_going: bool = False,
+    keep_as_name: str | None = None,
+    purge: bool = False,
     deadline: float | None = None,
     on_step: Callable[[dict[str, Any]], None] | None = None,
     origin: str | None = None,
@@ -713,7 +715,7 @@ def run_script(
     t_start = time.monotonic()
     fresh = session is None
     if fresh:
-        sess = _start_for(script, base, emacs)
+        sess = _start_for(script, base, emacs, keep_as_name)
     else:
         sess = session
         sess.require_alive()
@@ -877,16 +879,51 @@ def run_script(
         "steps": records,
     })
     sess.log("run-script-result", success=success, **counts)
+    # Purge the throwaway sandbox LAST -- after the final transcript write,
+    # which would otherwise recreate the directory we just removed. Only on a
+    # clean successful teardown; a FAILED run is left on disk for post-mortem,
+    # and `purge --glob 'run-*'` can sweep it later.
+    if (fresh and not kept and purge and success
+            and "teardown_error" not in result):
+        try:
+            S.purge_sessions([sess.name])
+            result["purged"] = True
+        except ElateError as exc:
+            result["teardown_error"] = str(exc)
     return result
 
 
+_SANE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _run_session_name(prefer: str | None) -> str:
+    """A kept run's session name: PREFER (sanitized) if usable, else run-<hex>.
+
+    So `run --keep` on a scenario named "evil-ghostel" keeps a session you
+    can find by name, while an unnamed throwaway stays run-<hex>. The name
+    is capped (it becomes a directory) and cannot squat the reserved
+    "run-" throwaway namespace that `purge --glob 'run-*'` sweeps.
+    """
+    if prefer:
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", str(prefer)).strip("-._")[:64]
+        if cleaned.startswith("run-"):
+            raise ElateError(
+                f"a kept session name cannot start with 'run-' (reserved for "
+                f"throwaway run sessions, swept by purge --glob 'run-*'): "
+                f"{cleaned!r}")
+        if cleaned and _SANE_NAME_RE.match(cleaned):
+            return cleaned
+    return f"run-{uuid.uuid4().hex[:10]}"
+
+
 def _start_for(script: dict[str, Any], base: Path,
-               emacs_override: str | None) -> S.Session:
+               emacs_override: str | None,
+               prefer_name: str | None = None) -> S.Session:
     cfg = script.get("session") or {}
     m = _SIZE_RE.match(cfg.get("size") or "120x36")
     assert m is not None  # validated
     return S.start_session(
-        f"run-{uuid.uuid4().hex[:10]}",
+        _run_session_name(prefer_name),
         emacs=emacs_override or cfg.get("emacs"),
         config=cfg.get("config", "minimal"),
         init_file=_resolve(cfg.get("init_file"), base),

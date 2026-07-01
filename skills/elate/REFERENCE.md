@@ -110,6 +110,8 @@ Delete the sandbox directories (transcripts included) of sessions that are no lo
 - `[NAME]` (repeatable) -- session to purge (repeatable)
 - `--all` -- purge every session that is not running
 - `--stopped-older-than DUR` -- only purge sessions inert at least this long (e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- keeps just-stopped sandboxes during heavy runs
+- `--glob PATTERN` -- purge sessions whose name matches this glob (e.g. 'run-*') -- a bulk selector like --all; running matches are skipped
+- `--name-prefix PREFIX` -- purge sessions whose name starts with PREFIX (e.g. 'run-') -- a bulk selector like --all
 
 ## elate prune
 
@@ -120,6 +122,8 @@ Alias for `purge`: delete the sandbox directories of sessions that are no longer
 - `[NAME]` (repeatable) -- session to prune (repeatable)
 - `--all` -- prune every session that is not running
 - `--stopped-older-than DUR` -- only prune sessions inert at least this long (e.g. 30s, 15m, 2h, 1d; bare number = seconds)
+- `--glob PATTERN` -- prune sessions whose name matches this glob (e.g. 'run-*') -- a bulk selector like --all
+- `--name-prefix PREFIX` -- prune sessions whose name starts with PREFIX (e.g. 'run-') -- a bulk selector like --all
 
 ## elate info
 
@@ -375,7 +379,9 @@ run a scenario script: fresh session, steps, assertions, exit 0/1 (CI)
 Execute a JSON scenario script: create a fresh sandboxed session from the script's "session" config (or target an existing one with -s NAME, in which case that config is ignored and nothing is torn down), run the steps in order, evaluate the assertions, then stop the fresh session. Exits 0 when every step and assertion passed, 1 otherwise; a failed step embeds a state snapshot. Fresh sessions are the default deliberately: lint executes compile-time code and lint/test results depend on session history, so only a throwaway session gives reproducible verdicts.
 
 - `script` -- path to the scenario file (JSON)
-- `--keep` -- keep the fresh session running afterwards
+- `--keep` -- keep the fresh session running afterwards (named from the scenario's "name", or --name)
+- `--name NAME` -- name for a kept session (default with --keep: the scenario's "name"); a running name collision is an error
+- `--no-purge` -- on success, keep the throwaway sandbox on disk (stopped) instead of removing it; failed runs are always kept for post-mortem
 - `--keep-on-failure` -- keep the fresh session running when the run fails (inspect it with state/screenshot, then stop it)
 - `--keep-going` -- run every step even after a failure instead of stopping at the first (a failed run still exits non-zero); use for a matrix that must report every check. Per-step "optional": true never gates.
 - `--emacs PATH` -- override the script's emacs binary (CI matrix)
