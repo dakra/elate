@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.12.0
+
+One scenario file, one command, out pops the grid: named **variants** make
+co-varying bindings a first-class matrix axis, and a known break can be
+scoped to exactly the variant where it happens.
 
 - **Variants — named sets of co-varying bindings** (scenario `"variants"`
   block, `run --variant NAME`, `matrix --variant n1,n2`, MCP
