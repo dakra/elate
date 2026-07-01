@@ -1536,7 +1536,80 @@ def test_matrix_of_one(elate_home: str, tmp_path: Path,
     code = cli.main(["--human", "matrix", "--emacs", emacs, path])
     human = capsys.readouterr().out
     assert code == 0
-    assert "1/1 version(s) passed" in human
+    assert "1/1 combo(s) passed" in human
+
+
+def test_matrix_param_axis(elate_home: str, tmp_path: Path,
+                           capsys: pytest.CaptureFixture[str]) -> None:
+    # --param crosses with the Emacs axis: one Emacs x two n values = two
+    # combos, each rendering {{n}} differently.
+    emacs = shutil.which("emacs")
+    path = write_script(tmp_path, {
+        "params": {"n": "1"},
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"assert": {"eval": "(= {{n}} 1)"}}],
+    }, "matrix-param.json")
+    code = cli.main(["--json", "matrix", "--emacs", emacs,
+                     "--param", "n=1,2", "--", path])
+    out = json.loads(capsys.readouterr().out)
+    assert out["axes"] == ["n"]
+    assert len(out["results"]) == 2                 # 1 emacs x 2 values of n
+    by_n = {r["axes"]["n"]: r for r in out["results"]}
+    assert by_n["1"]["success"] is True             # (= 1 1)
+    assert by_n["2"]["success"] is False            # (= 2 1)
+    assert by_n["1"]["axes"]["emacs"] == emacs
+    assert code == 1 and out["success"] is False    # not all combos passed
+    # A duplicate axis is a loud error.
+    code = cli.main(["--json", "matrix", "--emacs", emacs,
+                     "--param", "n=1", "--param", "n=2", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "more than once" in out["error"]
+    assert running_run_sessions() == []
+
+
+def test_matrix_param_guards(elate_home: str, tmp_path: Path,
+                             capsys: pytest.CaptureFixture[str]) -> None:
+    # These fail before any session boots (no Emacs is spawned).
+    emacs = shutil.which("emacs")
+    path = write_script(tmp_path, {
+        "session": {"config": "bare"},
+        "steps": [{"assert": {"eval": "(= {{n}} 1)"}}],
+    }, "guard.json")
+    # An axis the scenario never references is a loud error.
+    code = cli.main(["--json", "matrix", "--emacs", emacs,
+                     "--param", "n=1", "--param", "unused=9", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "never referenced" in out["error"]
+    # 'emacs' is a reserved axis name.
+    code = cli.main(["--json", "matrix", "--emacs", emacs,
+                     "--param", "emacs=x", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "reserved" in out["error"]
+
+
+def test_matrix_param_snapshot_stem_collision(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # Two param values that sanitize to the same stem ("a/b" and "a-b" both
+    # -> "a-b") must NOT share a golden directory.
+    emacs = shutil.which("emacs")
+    snapdir = tmp_path / "snaps"
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"eval": '(progn (switch-to-buffer "*scratch*") (erase-buffer) '
+                     '(insert "{{p}}"))'},
+            {"assert": {"snapshot": "buf"}},
+        ],
+    }, "coll.json")
+    code = cli.main(["--json", "matrix", "--emacs", emacs, "--param", "p=a/b,a-b",
+                     "--snapshot-dir", str(snapdir), "--update-snapshots",
+                     "--", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    stems = sorted(d.name for d in snapdir.iterdir() if d.is_dir())
+    assert len(stems) == 2, stems      # collision disambiguated into 2 goldens
+    assert running_run_sessions() == []
 
 
 def test_matrix_failure_and_bad_binary(elate_home: str, tmp_path: Path,

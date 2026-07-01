@@ -414,13 +414,15 @@ Capture a frame every INTERVAL seconds into frame-NNNN.png/.txt plus a manifest.
 
 ## elate matrix
 
-run a scenario script against several Emacs binaries
+run a scenario across Emacs binaries and parameter axes
 
-Run SCRIPT once per Emacs binary, each in a fresh session, and aggregate the per-version verdicts into one summary. Exits 0 only when every version passed. With a single binary this is a matrix of one -- the same scripts then scale to a CI matrix.
+Run SCRIPT once per combination of the Emacs binary axis and any --param axes (their Cartesian product), each in a fresh session, and aggregate the verdicts into one grid. Each --param NAME=v1,v2 binds the scenario's {{NAME}} template per combo, so one file drives many shells/configs x Emacs versions. Exits 0 only when every combo passed (xfail honored).
 
 - `--emacs PATHS` (repeatable) -- emacs binary, or comma-separated list (repeatable)
 - `--emacs-glob GLOB` -- glob matching emacs binaries, e.g. '/opt/emacs-*/bin/emacs'
-- `--update-snapshots` -- write/overwrite golden snapshots (per Emacs version) instead of comparing
+- `--param NAME=V1,V2` (repeatable) -- a parameter axis: bind {{NAME}} to each comma-separated value in turn (repeatable; every axis is crossed with the Emacs axis)
+- `--format {json,human}` -- output format: 'human' (default) the grid, 'json' the structured results. Overrides --json/--human.
+- `--update-snapshots` -- write/overwrite golden snapshots (per Emacs version and param combo) instead of comparing
 - `--snapshot-dir DIR` -- base directory for golden snapshots (default: <scenario-dir>/__snapshots__)
 - `script` -- path to the scenario file (JSON)
 

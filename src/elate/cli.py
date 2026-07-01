@@ -687,20 +687,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "matrix",
-        help="run a scenario script against several Emacs binaries",
-        description="Run SCRIPT once per Emacs binary, each in a fresh "
-                    "session, and aggregate the per-version verdicts "
-                    "into one summary. Exits 0 only when every version "
-                    "passed. With a single binary this is a matrix of "
-                    "one -- the same scripts then scale to a CI matrix.")
+        help="run a scenario across Emacs binaries and parameter axes",
+        description="Run SCRIPT once per combination of the Emacs binary "
+                    "axis and any --param axes (their Cartesian product), "
+                    "each in a fresh session, and aggregate the verdicts "
+                    "into one grid. Each --param NAME=v1,v2 binds the "
+                    "scenario's {{NAME}} template per combo, so one file "
+                    "drives many shells/configs x Emacs versions. Exits 0 "
+                    "only when every combo passed (xfail honored).")
     sp.add_argument("--emacs", action="append", default=[], metavar="PATHS",
                     help="emacs binary, or comma-separated list (repeatable)")
     sp.add_argument("--emacs-glob", metavar="GLOB",
                     help="glob matching emacs binaries, e.g. "
                          "'/opt/emacs-*/bin/emacs'")
+    sp.add_argument("--param", action="append", default=[], metavar="NAME=V1,V2",
+                    help="a parameter axis: bind {{NAME}} to each "
+                         "comma-separated value in turn (repeatable; every "
+                         "axis is crossed with the Emacs axis)")
+    sp.add_argument("--format", choices=("json", "human"),
+                    help="output format: 'human' (default) the grid, 'json' "
+                         "the structured results. Overrides --json/--human.")
     sp.add_argument("--update-snapshots", action="store_true",
                     help="write/overwrite golden snapshots (per Emacs "
-                         "version) instead of comparing")
+                         "version and param combo) instead of comparing")
     sp.add_argument("--snapshot-dir", metavar="DIR",
                     help="base directory for golden snapshots "
                          "(default: <scenario-dir>/__snapshots__)")
@@ -2021,8 +2030,21 @@ def cmd_snap(args: argparse.Namespace) -> Result:
     return data, f"{state}: {data['frames']} frame(s) in {data['dir']}", 0
 
 
+def _safe_param(value: str) -> str:
+    """A param value reduced to a filename-safe token (for snapshot stems)."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-") or "x"
+
+
+def _matrix_label(emacs: str, params: dict[str, str],
+                  version: str | None = None) -> str:
+    head = f"emacs {version}" if version else Path(emacs).name
+    tail = "  ".join(f"{k}={v}" for k, v in params.items())
+    return f"{head}  {tail}".rstrip()
+
+
 def cmd_matrix(args: argparse.Namespace) -> Result:
     import glob as globlib
+    import itertools
     import shutil
 
     from . import script as SC
@@ -2057,56 +2079,139 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
         raise ElateError("matrix needs at least one --emacs PATH "
                          "(or --emacs-glob)")
 
-    script, base = SC.load_script(args.script)
-    total = len(script.get("steps") or [])
+    # Parameter axes: --param NAME=v1,v2 (repeatable), crossed with the
+    # Emacs axis into a Cartesian product.
+    axes: dict[str, list[str]] = {}
+    for spec in args.param:
+        name, sep, vals = spec.partition("=")
+        name = name.strip()
+        if not sep or not name:
+            raise ElateError(f"--param expects NAME=v1,v2,..., got {spec!r}")
+        if name == "emacs":
+            raise ElateError(
+                "--param 'emacs' is reserved (the Emacs binary is its own "
+                "axis; use --emacs / --emacs-glob)")
+        if name in axes:
+            raise ElateError(f"--param {name!r} given more than once")
+        values = [v for v in (s.strip() for s in vals.split(",")) if v]
+        if not values:
+            raise ElateError(f"--param {name!r} lists no values")
+        axes[name] = values
+
+    raw, base = SC.load_raw(args.script)
+    if not isinstance(raw, dict):
+        raise ElateError('a script must be a JSON object with a "steps" list')
+    total = len(raw.get("steps") or [])
+
+    # An axis the scenario never references is almost certainly a mistake (a
+    # typo'd name, or a spurious axis silently multiplying the run). A
+    # deliberate "repeat" axis can reference {{name}} in a comment.
+    referenced = SC.template_vars({k: v for k, v in raw.items()
+                                   if k != "params"})
+    unused = [n for n in axes if n not in referenced]
+    if unused:
+        raise ElateError(
+            f"--param axis/axes {sorted(unused)} are never referenced by a "
+            "{{name}} template in the scenario")
+
+    axis_names = list(axes)
+    combos: list[tuple[str, dict[str, str]]] = []
+    for point in itertools.product(uniq, *(axes[n] for n in axis_names)):
+        params = {n: point[i + 1] for i, n in enumerate(axis_names)}
+        combos.append((point[0], params))
+
+    # Fail once, up front, on a combo-independent template/params error (an
+    # unknown {{var}} depends only on the axis NAMES, identical across
+    # combos) instead of the same error N times.
+    if combos:
+        SC.render_script(raw, combos[0][1])
+
+    # Snapshot stems fold in the param combo (the Emacs axis is separated by
+    # @<version> in the filename). _safe_param is lossy, so two distinct
+    # param combos can sanitize to the same suffix -- disambiguate only the
+    # ones that actually collide with a short hash, keeping clean stems for
+    # the common (no-collision) case, including no params at all.
+    import hashlib
+    from collections import Counter
+    raw_suffix: dict[tuple, str] = {}
+    for _, params in combos:
+        key = tuple(sorted(params.items()))
+        raw_suffix.setdefault(key, "".join(
+            f"+{k}-{_safe_param(v)}" for k, v in key))
+    dupes = Counter(raw_suffix.values())
+    suffix = {
+        key: (suf + "-" + hashlib.sha1(repr(key).encode()).hexdigest()[:6]
+              if suf and dupes[suf] > 1 else suf)
+        for key, suf in raw_suffix.items()
+    }
+
+    fmt = args.format
+    stream = fmt == "human" or (fmt is None and not args.json)
     on_step = None
-    if not args.json:
+    if stream:
         def on_step(rec: dict[str, Any]) -> None:
             print(_step_line(rec, total), flush=True)
+    if len(combos) > 1:
+        # To stderr so it surfaces even in --json/CI mode without dirtying
+        # the machine-readable stdout.
+        print(f"matrix: running {len(combos)} combo(s)", file=sys.stderr,
+              flush=True)
+
+    base_stem = Path(args.script).stem
     results: list[dict[str, Any]] = []
-    for b in uniq:
-        if not args.json:
-            print(f"=== {b} ===", flush=True)
+    for emacs_bin, params in combos:
+        if stream:
+            print(f"=== {_matrix_label(emacs_bin, params)} ===", flush=True)
+        stem = base_stem + suffix[tuple(sorted(params.items()))]
+        axes_out = {"emacs": emacs_bin, **params}
         try:
-            run = SC.run_script(script, base_dir=base, emacs=b,
-                                on_step=on_step,
-                                update_snapshots=args.update_snapshots,
-                                snapshot_dir=(base / Path(args.snapshot_dir).expanduser()
-                                             if args.snapshot_dir else None),
-                                snapshot_stem=Path(args.script).stem)
+            rendered = SC.render_script(raw, params)
+            run = SC.run_script(
+                rendered, base_dir=base, emacs=emacs_bin, on_step=on_step,
+                update_snapshots=args.update_snapshots,
+                snapshot_dir=(base / Path(args.snapshot_dir).expanduser()
+                              if args.snapshot_dir else None),
+                snapshot_stem=stem)
             entry = {
-                "emacs": b,
+                "axes": axes_out,
+                "emacs": emacs_bin,
                 "version": run.get("emacs_version"),
                 "success": run["success"],
                 "passed": run["passed"],
                 "failed": run["failed"],
+                "xpass": run.get("xpass", 0),
+                "xfail": run.get("xfail", 0),
                 "duration": run["duration"],
                 # The step that caused the FAIL: a real (non-optional)
-                # failure, or an xpass (a known-broken step that started
-                # passing) -- both gate the run, an optional failure does not.
+                # failure, or an xpass -- both gate; an optional failure and a
+                # plain xfail do not.
                 "failed_step": next(
                     (r["summary"] for r in run["steps"]
                      if (r["status"] == "failed" and not r.get("optional"))
                      or r["status"] == "xpass"), None),
             }
         except ElateError as exc:
-            # One broken binary must not abort the rest of the matrix.
-            entry = {"emacs": b, "version": None, "success": False,
-                     "error": str(exc)}
+            # One broken combo must not abort the rest of the matrix.
+            entry = {"axes": axes_out, "emacs": emacs_bin, "version": None,
+                     "success": False, "error": str(exc)}
         results.append(entry)
+
     success = all(r["success"] for r in results)
-    lines = [f"{'EMACS':<44} {'VERSION':<10} {'RESULT':<7} TIME"]
+    passed = sum(1 for r in results if r["success"])
+    lines = [f"{'RESULT':<6} {'TIME':>7}  COMBO"]
     for r in results:
         took = f"{r['duration']:.1f}s" if r.get("duration") is not None else "-"
-        lines.append(f"{r['emacs']:<44} {r.get('version') or '-':<10} "
-                     f"{'pass' if r['success'] else 'FAIL':<7} {took}")
+        params = {k: v for k, v in r["axes"].items() if k != "emacs"}
+        lines.append(
+            f"{'pass' if r['success'] else 'FAIL':<6} {took:>7}  "
+            f"{_matrix_label(r['emacs'], params, r.get('version'))}")
         if r.get("error"):
-            lines.append(f"  error: {r['error']}")
+            lines.append(f"    error: {r['error']}")
         elif r.get("failed_step"):
-            lines.append(f"  failed at: {r['failed_step']}")
-    passed = sum(1 for r in results if r["success"])
-    lines.append(f"{passed}/{len(results)} version(s) passed")
-    return ({"success": success, "script": args.script, "results": results},
+            lines.append(f"    failed at: {r['failed_step']}")
+    lines.append(f"{passed}/{len(results)} combo(s) passed")
+    return ({"success": success, "script": args.script,
+             "axes": axis_names, "results": results},
             "\n".join(lines), 0 if success else 1)
 
 

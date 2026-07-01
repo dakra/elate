@@ -176,6 +176,20 @@ def _substitute(node: Any, bindings: dict[str, str], missing: set[str]) -> Any:
     return node
 
 
+def template_vars(node: Any) -> set[str]:
+    """Every {{var}} name referenced in NODE's string values (recursively)."""
+    names: set[str] = set()
+    if isinstance(node, str):
+        names.update(_TEMPLATE_RE.findall(node))
+    elif isinstance(node, list):
+        for x in node:
+            names |= template_vars(x)
+    elif isinstance(node, dict):
+        for v in node.values():
+            names |= template_vars(v)
+    return names
+
+
 def render_script(raw: Any, overrides: dict[str, str]) -> dict[str, Any]:
     """Apply {{var}} templating to a raw scenario dict; return the result.
 
@@ -207,6 +221,21 @@ def render_script(raw: Any, overrides: dict[str, str]) -> dict[str, Any]:
     return rendered
 
 
+def load_raw(path: str | Path) -> tuple[Any, Path]:
+    """Read a scenario file to a raw value + base_dir (no templating/validation).
+
+    For callers that render per parameter combo (matrix): read the file
+    once, then `render_script` + `validate_script` per combo.
+    """
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise ElateError(f"script file does not exist: {path}")
+    try:
+        return json.loads(p.read_text(encoding="utf-8")), p.parent.resolve()
+    except (OSError, ValueError) as exc:
+        raise ElateError(f"cannot read script {path}: {exc}") from exc
+
+
 def load_script(path: str | Path,
                 overrides: dict[str, str] | None = None
                 ) -> tuple[dict[str, Any], Path]:
@@ -216,16 +245,10 @@ def load_script(path: str | Path,
     BASE_DIR is the script file's directory: relative paths inside the
     script resolve against it.
     """
-    p = Path(path).expanduser()
-    if not p.is_file():
-        raise ElateError(f"script file does not exist: {path}")
-    try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ElateError(f"cannot read script {path}: {exc}") from exc
+    raw, base = load_raw(path)
     script = render_script(raw, overrides or {})
     validate_script(script)
-    return script, p.parent.resolve()
+    return script, base
 
 
 def validate_script(script: Any) -> None:
