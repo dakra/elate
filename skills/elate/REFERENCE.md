@@ -220,6 +220,7 @@ Drop into the session's tmux client so a human can drive Emacs directly, then de
 evaluate an elisp form
 
 - `form`
+- `--buffer NAME` -- evaluate in this buffer (default: the selected window's buffer, so current-buffer/point/line see what is on screen, not an arbitrary buffer)
 - `--timeout SECS` (default: 15)
 - `--backtrace` -- on error, also return structured backtrace frames (each frame's function + printed args), not just the rendered backtrace string
 - `--on-timeout {none,sample}` (default: none) -- on timeout with Emacs still busy: 'sample' captures a thread backtrace of the wedged Emacs (macOS `sample`; Linux eu-stack/gdb) and attaches it to the error; 'none' (default) does not

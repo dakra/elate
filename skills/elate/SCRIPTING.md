@@ -87,7 +87,7 @@ Timeouts are numbers in `(0, 600]` seconds.
 |---|---|---|
 | `keys` | kbd string | `delivery`: `"semantic"`(default)/`"events"`/`"raw"`; `timeout` (15) |
 | `type` | literal string | — |
-| `eval` | elisp form string | `timeout` (15) |
+| `eval` | elisp form string | `timeout` (15); `buffer` (name; default: the **selected window's buffer**, so `current-buffer`/point/line see what is on screen) |
 | `wait` | `"idle"` \| `"text"` \| `"prompt"` | idle: `min_idle` (number 0–60, default 0.2); text: `pattern` (required, **Python** regexp), `buffer` (string); all: `timeout` (10). Options on the wrong wait kind are rejected. |
 | `mouse` | `"click"` \| `"double"` \| `"drag"` \| `"wheel"` | `button` (int 1–3, 1); `buffer`; `pos`/`line`/`to_pos`/`to_line` (int >= 1); `col`/`to_col` (int >= 0); `part`: `"text"`(default)/`"mode-line"`; `direction`: `"down"`(default)/`"up"`; `count` (int 1–50, 1); `delivery`: `"macro"`(default)/`"events"`; `timeout` (15) |
 | `focus` | `"in"` \| `"out"` | `frame` (string); `set_focus_state` (bool); `timeout` (15) |
@@ -117,7 +117,7 @@ Failure semantics:
 | `popup` | popup kind string, or `true` for any | — |
 | `tests` | non-empty object of count-field → expected (`{"unexpected": 0, "timed-out": false}`), checked against the **last `test` step** | — |
 | `lint_clean` | `true`/`false`, checked against the **last `lint` step** | — |
-| `eval` | elisp form; passes when it evaluates without error to non-`nil` (the catch-all) | `timeout` (10) |
+| `eval` | elisp form; passes when it evaluates without error to non-`nil` (the catch-all) | `timeout` (10); `buffer` (name; default: the selected window's buffer) |
 | `snapshot` | a name string, or `{"name", "of"}` — compare the current render against a committed golden (see below) | — |
 
 `tests`/`lint_clean` need a preceding `test`/`lint` step in the same run.

@@ -701,14 +701,17 @@ multi-megabyte value would blow the controller's subprocess timeout and
 masquerade as a busy/blocked Emacs.  Truncated results carry
 :truncated t and the full :value-length.")
 
-(defun elate--rpc-eval (form-b64 &optional timeout want-frames)
+(defun elate--rpc-eval (form-b64 &optional timeout want-frames buffer)
   "Evaluate the elisp source decoded from FORM-B64.
 Returns printed value (truncated at `elate--max-value-len'), *Messages*
 delta, and error + backtrace on failure.  TIMEOUT (seconds) arms a
 `with-timeout' guard; note that it can only fire if the evaluated code
 reaches a timer-servicing point.  With WANT-FRAMES, the error reply also
 carries structured :frames (function + printed args per backtrace frame)
-captured from the same live stack as the rendered :backtrace string."
+captured from the same live stack as the rendered :backtrace string.
+The form evaluates in BUFFER (a name) when given, else in the selected
+window's buffer -- so `current-buffer', point, and line functions see
+what a user looking at the frame would, not an arbitrary RPC-time buffer."
   (let* ((src (elate--decode-string form-b64))
          (form (read (concat "(progn\n" src "\n)")))
          (msg-start (with-current-buffer (messages-buffer)
@@ -737,10 +740,11 @@ captured from the same live stack as the rendered :backtrace string."
                 (let ((print-length 4096)
                       (print-level 64))
                   (prin1-to-string
-                   (if (and (numberp timeout) (> timeout 0))
-                       (with-timeout (timeout (error "elate: eval timed out after %gs" timeout))
-                         (eval form t))
-                     (eval form t)))))
+                   (with-current-buffer (elate--resolve-buffer buffer)
+                     (if (and (numberp timeout) (> timeout 0))
+                         (with-timeout (timeout (error "elate: eval timed out after %gs" timeout))
+                           (eval form t))
+                       (eval form t))))))
           ((debug error) (setq errstr (error-message-string err))))))
     (let* ((vlen (if value (length value) 0))
            (truncated (> vlen elate--max-value-len)))

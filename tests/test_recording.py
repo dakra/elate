@@ -184,6 +184,8 @@ def test_validate_script_errors() -> None:
         ({"steps": [{"eval": "1"}], "session": {"eval_file": [1]}},
          "list of strings"),
         ({"steps": [{"eval": "1"}], "session": {"home_seed": 5}}, "string path"),
+        ({"steps": [{"eval": "1", "buffer": 5}]}, "buffer"),
+        ({"steps": [{"assert": {"eval": "t", "buffer": 5}}]}, "buffer"),
         ({"steps": [{"test": "t", "allow_unexpected": 1}]}, "allow_unexpected"),
         ({"steps": [{"lint": ["f.el"], "allow_findings": "no"}]},
          "allow_findings"),
@@ -766,6 +768,35 @@ def test_run_script_env_key_injection_is_rejected(
     assert code == 1 and out["ok"] is False
     assert "env var name" in out["error"]
     assert not marker.exists()          # the injected command never ran
+
+
+def test_run_script_eval_buffer_context(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # eval/assert-eval default to the SELECTED window's buffer (so a
+    # current-line read sees content, not ""), and "buffer" targets another.
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"eval": '(progn (switch-to-buffer "*scratch*") (erase-buffer) '
+                     '(insert "visible-line"))'},
+            # Default buffer = the visible one: the current line is readable.
+            {"assert": {"eval": '(equal (buffer-substring-no-properties '
+                                '(line-beginning-position) (line-end-position)) '
+                                '"visible-line")'}},
+            {"eval": '(with-current-buffer (get-buffer-create "eg-other") '
+                     '(insert "other-content"))'},
+            # An eval STEP with "buffer" runs in that buffer.
+            {"eval": '(insert " more")', "buffer": "eg-other"},
+            # An assert-eval with "buffer" reads that buffer.
+            {"assert": {"eval": '(equal (buffer-string) "other-content more")',
+                        "buffer": "eg-other"}},
+        ],
+    })
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["success"] is True, out
+    assert running_run_sessions() == []
 
 
 def test_run_script_failing_step_elisp_error(

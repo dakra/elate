@@ -193,7 +193,8 @@ class SemanticChannel:
             return False
 
     def eval_form(self, source: str, timeout: float = DEFAULT_TIMEOUT,
-                  backtrace: bool = False) -> dict[str, Any]:
+                  backtrace: bool = False,
+                  buffer: str | None = None) -> dict[str, Any]:
         """Evaluate elisp SOURCE (one or more forms) with full error capture.
 
         Returns {"value": str|None, "error": str|None, "backtrace": str|None,
@@ -201,7 +202,11 @@ class SemanticChannel:
         base64-encoded to dodge double escaping, and the agent also arms an
         in-Emacs `with-timeout` slightly below our hard subprocess timeout.
         With BACKTRACE, an error reply also carries structured "frames".
+        BUFFER selects the buffer the form evaluates in (its name); without
+        it the form runs in the selected window's buffer, not an arbitrary
+        RPC-time buffer.
         """
         b64 = base64.b64encode(source.encode("utf-8")).decode("ascii")
         inner = max(timeout - 1.0, timeout * 0.8)
-        return self.rpc("eval", b64, round(inner, 3), backtrace, timeout=timeout)
+        return self.rpc("eval", b64, round(inner, 3), backtrace, buffer,
+                        timeout=timeout)

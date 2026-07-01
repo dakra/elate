@@ -371,6 +371,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("eval", help="evaluate an elisp form")
     sp.add_argument("form")
+    sp.add_argument("--buffer", metavar="NAME",
+                    help="evaluate in this buffer (default: the selected "
+                         "window's buffer, so current-buffer/point/line see "
+                         "what is on screen, not an arbitrary buffer)")
     sp.add_argument("--timeout", type=float, default=15.0, metavar="SECS")
     sp.add_argument("--backtrace", action="store_true",
                     help="on error, also return structured backtrace frames "
@@ -1044,10 +1048,11 @@ def cmd_resize(args: argparse.Namespace) -> Result:
 
 def cmd_eval(args: argparse.Namespace) -> Result:
     sess = _require_session(args)
-    sess.log("eval", form=args.form, timeout=args.timeout)
+    sess.log("eval", form=args.form, timeout=args.timeout, buffer=args.buffer)
     try:
         data = sess.semantic().eval_form(args.form, timeout=args.timeout,
-                                          backtrace=args.backtrace)
+                                          backtrace=args.backtrace,
+                                          buffer=args.buffer)
     except EvalTimeout as exc:
         busy = sess.is_busy()
         sess.log("eval-timeout", form=args.form)

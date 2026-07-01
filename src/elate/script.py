@@ -89,7 +89,7 @@ _COMMON_KEYS = {"comment", "skip", "optional", "expect", "xfail", "reason",
 _STEP_OPTIONS: dict[str, set[str]] = {
     "keys": {"delivery", "timeout"},
     "type": set(),
-    "eval": {"timeout"},
+    "eval": {"timeout", "buffer"},
     "wait": {"pattern", "buffer", "timeout", "min_idle"},
     "mouse": {"button", "buffer", "pos", "line", "col", "part", "to_pos",
               "to_line", "to_col", "direction", "count", "delivery",
@@ -121,7 +121,7 @@ _ASSERT_KINDS: dict[str, set[str]] = {
     "popup": set(),
     "tests": set(),
     "lint_clean": set(),
-    "eval": {"timeout"},
+    "eval": {"timeout", "buffer"},
     "snapshot": set(),  # options live inside the value object, not as siblings
 }
 
@@ -365,6 +365,8 @@ def _validate_step(step: Any, index: int) -> None:
     val = step[verb]
     if verb in ("keys", "type", "eval") and not isinstance(val, str):
         raise ElateError(f'{where}: "{verb}" takes a string')
+    if verb == "eval":
+        _check_str(step, "buffer", where)
     if verb == "keys" and step.get("delivery", "semantic") not in (
             "semantic", "events", "raw"):
         raise ElateError(
@@ -480,6 +482,7 @@ def _validate_assert(spec: Any, where: str) -> None:
         _check_str(spec, "buffer", f"{where} (assert {kind})")
     if kind == "eval":
         _check_timeout(spec, f"{where} (assert eval)")
+        _check_str(spec, "buffer", f"{where} (assert eval)")
     if kind in ("buffer_matches", "messages_match"):
         try:
             re.compile(val)
@@ -935,8 +938,10 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
 
     if verb == "eval":
         timeout = _step_timeout(step, verb, defaults)
-        sess.log("eval", form=step["eval"], timeout=timeout, via="script")
-        data = sess.semantic().eval_form(step["eval"], timeout=timeout)
+        sess.log("eval", form=step["eval"], timeout=timeout,
+                 buffer=step.get("buffer"), via="script")
+        data = sess.semantic().eval_form(step["eval"], timeout=timeout,
+                                         buffer=step.get("buffer"))
         sess.log("eval-result", **data)
         if data.get("error"):
             raise _StepFailure(
@@ -1160,7 +1165,8 @@ def _eval_assert(sess: S.Session, spec: dict[str, Any],
     # kind == "eval": passes when the form evaluates without error to non-nil
     timeout = float(spec.get("timeout",
                              (ctx.get("_defaults") or {}).get("timeout", 10.0)))
-    data = sess.semantic().eval_form(val, timeout=timeout)
+    data = sess.semantic().eval_form(val, timeout=timeout,
+                                     buffer=spec.get("buffer"))
     if data.get("error"):
         raise _StepFailure(f"assertion form signalled: {data['error']}",
                            {"backtrace": data.get("backtrace")})

@@ -716,6 +716,10 @@ def elate_eval(
     session: Annotated[str, Field(description="Session name.")],
     form: Annotated[str, Field(description=(
         "Elisp source: one or more forms, evaluated as (progn ...)."))],
+    buffer: Annotated[str | None, Field(description=(
+        "Buffer (by name) to evaluate in. Default: the selected window's "
+        "buffer, so current-buffer / point / line functions see what is on "
+        "screen rather than an arbitrary RPC-time buffer."))] = None,
     timeout: Annotated[float, Field(gt=0, le=600, description=(
         "Hard timeout in seconds (0 < timeout <= 600). A blocking form is "
         "interrupted (or, if truly wedged, reported as busy)."))] = 15.0,
@@ -743,9 +747,9 @@ def elate_eval(
     sess = None
     try:
         sess = _load(session)
-        sess.log("eval", form=form, timeout=timeout, via="mcp")
+        sess.log("eval", form=form, timeout=timeout, buffer=buffer, via="mcp")
         data = sess.semantic().eval_form(form, timeout=timeout,
-                                         backtrace=backtrace)
+                                         backtrace=backtrace, buffer=buffer)
         sess.log("eval-result", **data)
         if data.get("error"):
             payload: dict[str, Any] = {"ok": False, **data}
