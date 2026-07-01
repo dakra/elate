@@ -93,7 +93,11 @@ VERBS = ("keys", "type", "eval", "wait", "mouse", "focus", "send_events",
 #   "expect": "fail" (a.k.a. "xfail": true) marks a KNOWN failure: if the
 #   step fails it is reported as xfail (non-gating, run continues); if it
 #   unexpectedly passes it is an xpass (fails the run -- drop the marker).
-#   "reason" annotates why a step is optional/xfail.
+#   "xfail" may instead be a map {variant name -> reason}: the step is
+#   expected to fail only under those variants (the matching reason lands
+#   in the record), and gates normally everywhere else.
+#   "reason" annotates why a step is optional/xfail (bool form only; the
+#   map form carries its reasons as the values).
 #   "group" (sticky) names a test group: the step and every following step
 #   belong to it until another "group" appears, so a run reports named
 #   verdicts ("dw: PASS, u: XFAIL, cc: FAIL") instead of bare indices. A
@@ -297,7 +301,42 @@ def render_script(raw: Any, overrides: dict[str, str],
         raise ElateError(
             f"unknown template variable(s) {sorted(missing)}: define them in "
             f"a {hint}, or pass --set NAME=VALUE (matrix: --param)")
+    _check_xfail_variants(rendered, variants)
     return rendered
+
+
+def _check_xfail_variants(rendered: dict[str, Any],
+                          variants: dict[str, dict[str, str]]) -> None:
+    """Every map-form "xfail" key must name a declared variant.
+
+    A typo'd key would otherwise make the step silently gate everywhere --
+    the exact quiet failure the map exists to prevent. The walk is lenient
+    (only dict steps with dict "xfail" values): validate_script owns the
+    precise shape errors; this cross-check lives here because only
+    render_script still has the "variants" block.
+    """
+    steps = rendered.get("steps")
+    if not isinstance(steps, list):
+        return
+    for index, step in enumerate(steps, 1):
+        if not isinstance(step, dict) or not any(v in step for v in VERBS):
+            # A verbless step (comment/group marker) never reaches runtime
+            # classification and validate_script rejects any "xfail" on it
+            # with the precise message -- don't preempt that with a
+            # misleading "needs a variants block" here.
+            continue
+        xf = step.get("xfail")
+        if not isinstance(xf, dict):
+            continue
+        if not variants:
+            raise ElateError(
+                f'step {index}: a map-form "xfail" needs a "variants" '
+                "block -- its keys are variant names")
+        unknown = sorted(k for k in xf if k not in variants)
+        if unknown:
+            raise ElateError(
+                f'step {index}: "xfail" variant(s) {unknown} are not '
+                f'declared in "variants" (declared: {sorted(variants)})')
 
 
 def load_raw(path: str | Path) -> tuple[Any, Path]:
@@ -365,6 +404,31 @@ def _check_str(obj: dict[str, Any], key: str, where: str) -> None:
     val = obj.get(key)
     if val is not None and not isinstance(val, str):
         raise ElateError(f'{where}: "{key}" must be a string, got {val!r}')
+
+
+def _check_xfail(step: dict[str, Any], where: str) -> None:
+    """"xfail" is a bool, or a conditional {variant name -> reason} map."""
+    val = step.get("xfail")
+    if val is None or isinstance(val, bool):
+        return
+    if not isinstance(val, dict):
+        raise ElateError(
+            f'{where}: "xfail" must be true/false or an object of '
+            f"variant name -> reason, got {val!r}")
+    if not val or not all(isinstance(k, str) and k
+                          and isinstance(v, str) and v
+                          for k, v in val.items()):
+        raise ElateError(
+            f'{where}: a map-form "xfail" must be a non-empty object of '
+            "variant name -> non-empty reason string")
+    if step.get("expect") == "fail":
+        raise ElateError(
+            f'{where}: "expect": "fail" marks the step xfail on EVERY '
+            'variant, silently defeating the map-form "xfail" -- drop one')
+    if step.get("reason") is not None:
+        raise ElateError(
+            f'{where}: a map-form "xfail" carries its reasons as the map '
+            'values; a sibling "reason" is ambiguous -- drop one')
 
 
 def _check_group(step: dict[str, Any], where: str) -> None:
@@ -519,7 +583,7 @@ def _validate_step(step: Any, index: int) -> None:
     _check_timeout(step, where)
     _check_bool(step, "skip", where)
     _check_bool(step, "optional", where)
-    _check_bool(step, "xfail", where)
+    _check_xfail(step, where)
     _check_str(step, "reason", where)
     _check_group(step, where)
     if step.get("expect") is not None and step.get("expect") not in (
@@ -785,7 +849,8 @@ def run_script(
     outcome). ON_STEP is called with each step record as it completes (for
     streaming output). ORIGIN tags the transcript's run-script events
     (e.g. "mcp") for forensics. VARIANT names the "variants" entry the
-    script was rendered with; it tags the result.
+    script was rendered with: it tags the result and is what a map-form
+    "xfail" (variant name -> reason) matches against.
     """
     validate_script(script)
     if session is not None and emacs:
@@ -900,7 +965,16 @@ def run_script(
                     rec["error"] = f"internal error: {type(exc).__name__}: {exc}"
                     _embed_state(rec, sess)
                     internal = True
-                xfail = bool(step.get("xfail")) or step.get("expect") == "fail"
+                xf = step.get("xfail")
+                if isinstance(xf, dict):
+                    # Conditional form: expected to fail only under the
+                    # named variant(s), with the matching value as the
+                    # reason. No active variant -> a normal gating step.
+                    xfail = variant is not None and variant in xf
+                    xfail_reason = xf.get(variant) if xfail else None
+                else:
+                    xfail = bool(xf) or step.get("expect") == "fail"
+                    xfail_reason = step.get("reason")
                 if internal:
                     gate_failed = True
                     if not keep_going:
@@ -912,8 +986,8 @@ def run_script(
                     # fails the run so the stale marker gets noticed.
                     rec["status"] = "xfail" if rec["status"] == "failed" \
                         else "xpass"
-                    if step.get("reason"):
-                        rec["reason"] = step["reason"]
+                    if xfail_reason:
+                        rec["reason"] = xfail_reason
                     if rec["status"] == "xpass" and not step.get("optional"):
                         gate_failed = True
                 elif rec["status"] == "failed":

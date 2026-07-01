@@ -16,6 +16,16 @@
   names, never-referenced variant bindings, and `--param` axes colliding
   with a variant-bound variable are all loud errors before anything boots.
 
+- **Conditional xfail — a known break scoped to a variant** (step-level
+  `"xfail": {"nu": "reedline has no C-_"}`): the boolean `"xfail"` marks a
+  step expected-to-fail *everywhere*; the new map form scopes it to the
+  named variant(s), with the reason kept next to the check instead of at
+  the call site. Under a matching variant a failure reports `xfail`
+  (non-gating) and an unexpected pass reports `xpass` (gating); under any
+  other variant — or none — the step gates normally. A map key naming an
+  undeclared variant is a loud error. New `examples/shell-variants.json`
+  shows variants + conditional xfail end to end.
+
 ## 0.11.0
 
 A scenario run can now report *what does not work* — every check, not just the

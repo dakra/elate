@@ -37,7 +37,12 @@ failing or stopping the run; `"expect": "fail"` (a.k.a. `"xfail": true`)
 marks a **known** failure — a failing xfail step is reported `xfail` and
 does not gate the run, while one that unexpectedly passes is an `xpass` and
 **does** fail the run (drop the stale marker); `"reason"` (string) annotates
-why. (`optional` and `expect`/`xfail` are mutually exclusive.) Pass
+why. `"xfail"` may instead be a map `{"nu": "reedline has no C-_"}` keyed by
+**variant name** (see Variants below): the step is expected to fail only
+under those variants — the matching value lands in the record as the
+`reason` — and gates normally everywhere else, keeping the known break and
+its why next to the check instead of at the call site. (`optional` and
+`expect`/`xfail` are mutually exclusive.) Pass
 `--keep-going` to `elate run` to execute every step even after a failure (a
 failed run still exits non-zero). A `"group"` (string) names a test group:
 it and every following step belong to it (**sticky**) until another
@@ -125,10 +130,15 @@ block declares named binding sets:
   scenario declares variants but none is selected). The name `variant` is
   reserved — it cannot be bound by `params`, a variant, `--set`, or
   `--param`.
-- Loud, never silent: an unknown `--variant` name is always an error, and
-  `matrix` additionally rejects a variant binding a variable no template
-  references and a `--param` axis colliding with a variant-bound variable —
-  all before anything boots.
+- A step's `"xfail"` may be a map keyed by variant name (see the failure
+  handling section above): `{"assert": {...}, "xfail": {"nu": "reedline has
+  no C-_"}}` is a known break scoped to the `nu` variant and a normal
+  gating check everywhere else.
+- Loud, never silent: an unknown `--variant` name is always an error, a
+  map-form `"xfail"` key must name a declared variant, and `matrix`
+  additionally rejects a variant binding a variable no template references
+  and a `--param` axis colliding with a variant-bound variable — all before
+  anything boots.
 
 ## Steps — exactly one verb per step
 

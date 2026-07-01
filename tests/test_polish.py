@@ -847,6 +847,23 @@ def test_example_scripts_run_green(elate_home: str, example: str,
     assert out["failed"] == 0 and out["not_run"] == 0
 
 
+def test_example_variants_matrix(elate_home: str,
+                                 capsys: pytest.CaptureFixture[str]) -> None:
+    # The 0.12 showcase runs BOTH its variants under plain `matrix` (no
+    # --variant flag) and stays green: the 'loud' combo passes via its
+    # conditional map-form xfail rather than by dropping the check.
+    emacs = shutil.which("emacs")
+    code = cli.main(["--json", "matrix", "--emacs", emacs,
+                     str(EXAMPLES_DIR / "shell-variants.json")])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    assert out["success"] is True and out["axes"] == ["variant"]
+    by_v = {r["axes"]["variant"]: r for r in out["results"]}
+    assert set(by_v) == {"plain", "loud"}
+    assert by_v["plain"]["xfail"] == 0
+    assert by_v["loud"]["xfail"] == 1        # the known break, scoped
+
+
 def test_examples_exist() -> None:
     # The README recipes point at these by name.
     present = {p.name for p in EXAMPLES_DIR.glob("*.json")}

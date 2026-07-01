@@ -431,6 +431,43 @@ def test_render_script_variant_bindings() -> None:
                           "steps": [{"eval": "{{nope}}"}]}, {})
 
 
+def test_validate_xfail_map() -> None:
+    def step(extra: dict) -> dict:
+        return {"eval": "t", **extra}
+
+    # Bool form (with or without a reason) stays valid, as does a map.
+    SC.validate_script({"steps": [step({"xfail": True, "reason": "why"})]})
+    SC.validate_script({"steps": [step({"xfail": {"nu": "no C-_"}})]})
+    cases = [
+        ({"xfail": "yes"}, "true/false or an object"),
+        ({"xfail": {}}, "non-empty object"),
+        ({"xfail": {"nu": ""}}, "non-empty reason"),
+        ({"xfail": {"nu": 1}}, "non-empty reason"),
+        # expect:"fail" would make the step xfail on EVERY variant,
+        # silently defeating the map -- loud, never silent.
+        ({"xfail": {"nu": "r"}, "expect": "fail"}, "defeating"),
+        # The map values ARE the reasons; a sibling "reason" is ambiguous.
+        ({"xfail": {"nu": "r"}, "reason": "other"}, "ambiguous"),
+        # The existing optional/xfail exclusivity fires for the map too.
+        ({"xfail": {"nu": "r"}, "optional": True}, "mutually exclusive"),
+    ]
+    for extra, msg in cases:
+        with pytest.raises(ElateError, match=msg):
+            SC.validate_script({"steps": [step(extra)]})
+
+
+def test_render_script_xfail_map_unknown_variant() -> None:
+    # A typo'd map key would silently gate everywhere -- render_script
+    # cross-checks every key against the declared variants.
+    raw = {"variants": {"a": {"x": "1"}, "b": {"x": "2"}},
+           "steps": [{"eval": "{{x}}", "xfail": {"a": "r", "c": "r"}}]}
+    with pytest.raises(ElateError, match=r"\['c'\] are not declared"):
+        SC.render_script(raw, {}, variant="a")
+    # A map-form xfail in a scenario without variants can never match.
+    with pytest.raises(ElateError, match='needs a "variants" block'):
+        SC.render_script({"steps": [{"eval": "t", "xfail": {"a": "r"}}]}, {})
+
+
 def test_step_timeout_resolution() -> None:
     # step timeout > scenario default > per-verb builtin.
     assert SC._step_timeout({}, "keys", {}) == SC._DEFAULT_TIMEOUTS["keys"]
@@ -2043,4 +2080,44 @@ def test_matrix_variant_param_cross(elate_home: str, tmp_path: Path,
     stems = sorted(d.name for d in snapdir.iterdir() if d.is_dir())
     assert stems == ["vcross+p-x+variant-a", "vcross+p-x+variant-b",
                      "vcross+p-y+variant-a", "vcross+p-y+variant-b"]
+    assert running_run_sessions() == []
+
+
+def test_run_script_xfail_map_classification(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # One scenario, four runs: a map-form xfail is a known failure ONLY
+    # under its named variants and a normal gating step everywhere else.
+    path = write_script(tmp_path, {
+        "params": {"expr": "(= 1 2)"},
+        "variants": {"nu": {"expr": "(= 1 2)"},
+                     "fixed": {"expr": "(= 1 1)"},
+                     "bash": {"expr": "(= 1 2)"}},
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"assert": {"eval": "{{expr}}"},
+                   "xfail": {"nu": "reedline has no C-_",
+                             "fixed": "stale marker"}}],
+    }, "xmap.json")
+
+    def run(*argv: str) -> tuple[int, dict]:
+        code = cli.main(["--json", "run", *argv, path])
+        return code, json.loads(capsys.readouterr().out)
+
+    # Matching variant + failing step: xfail with the map value as reason.
+    code, out = run("--variant", "nu")
+    assert code == 0 and out["success"] is True, out
+    assert out["steps"][0]["status"] == "xfail"
+    assert out["steps"][0]["reason"] == "reedline has no C-_"
+    # Matching variant + passing step: xpass gates (stale marker noticed),
+    # and the map value still lands as the reason.
+    code, out = run("--variant", "fixed")
+    assert code == 1 and out["steps"][0]["status"] == "xpass"
+    assert out["steps"][0]["reason"] == "stale marker"
+    # Non-matching variant: a plain failure that gates.
+    code, out = run("--variant", "bash")
+    assert code == 1 and out["steps"][0]["status"] == "failed"
+    assert "reason" not in out["steps"][0]
+    # No variant selected: the map can never match -- gates too.
+    code, out = run()
+    assert code == 1 and out["steps"][0]["status"] == "failed"
     assert running_run_sessions() == []

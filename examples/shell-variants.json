@@ -1,0 +1,17 @@
+{
+  "name": "shell-variants",
+  "comment": "Showcases the 0.12 variants features on a self-contained scratch buffer: a 'variants' block of named co-varying bindings ('inserter' and 'expected' move together), the implicit {{variant}} binding, and a conditional map-form xfail (expected to fail ONLY under the 'loud' variant, with the reason kept next to the check). `elate matrix examples/shell-variants.json --emacs emacs` runs every variant; `elate run examples/shell-variants.json --variant loud` runs one. Plain `elate run` uses the params defaults (which mirror the 'plain' variant), so the file also works with no flags.",
+  "params": {"inserter": "(insert \"hello\")", "expected": "hello"},
+  "variants": {
+    "plain": {"inserter": "(insert \"hello\")", "expected": "hello"},
+    "loud":  {"inserter": "(insert (upcase \"hello\"))", "expected": "HELLO"}
+  },
+  "session": {"ui": "tty", "size": "80x24", "config": "bare"},
+  "steps": [
+    {"comment": "active variant: '{{variant}}' (empty when none selected)"},
+    {"eval": "(progn (switch-to-buffer \"*scratch*\") (erase-buffer) {{inserter}})"},
+    {"assert": {"buffer_contains": "{{expected}}"}},
+    {"assert": {"eval": "(string= \"{{expected}}\" \"hello\")"},
+     "xfail": {"loud": "demo: upcasing breaks the lowercase check -- a known break scoped to one variant"}}
+  ]
+}
