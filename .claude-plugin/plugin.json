@@ -1,6 +1,6 @@
 {
   "name": "elate",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Spawn sandboxed Emacs sessions (terminal or GUI) and drive them with keys, mouse, and elisp to interactively test Emacs packages. Ships the elate Agent Skill (act -> wait -> observe workflow, ERT runs, lint, profiling, scenario scripts), backed by the elate CLI via uvx; an optional MCP server exposes the same tools for shell-less harnesses.",
   "author": {
     "name": "Daniel Kraus",

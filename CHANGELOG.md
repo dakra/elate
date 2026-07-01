@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.11.0
+
+A scenario run can now report *what does not work* — every check, not just the
+first to break — and one scenario file can drive a matrix of shells, configs,
+and Emacs versions.
+
+- **Continue-on-failure & optional steps** (`run --keep-going`, step
+  `"optional": true`): `--keep-going` runs every step even after a failure (a
+  failed run still exits non-zero), so a matrix surfaces every check, not just
+  the first. An `"optional"` step may fail without failing or stopping the run.
+  A pure-comment step is now a `comment` annotation, not a `skipped` step, so it
+  no longer inflates the counts.
+
+- **Known failures — xfail / xpass** (`"expect": "fail"`, a.k.a. `"xfail":
+  true`, + optional `"reason"`): a step you know is broken is reported `xfail`
+  (non-gating), so you flag it instead of deleting the check to stay green. If it
+  unexpectedly passes it becomes `xpass` and fails the run — telling you to drop
+  the stale marker.
+
+- **Named groups** (a `{"group": "dw"}` marker or a `"group"` key on a step): a
+  run reports one verdict per group (`dw: PASS · u: XFAIL · cc: FAIL`) instead of
+  bare step indices, and groups map 1:1 to JUnit test-cases.
+
+- **Machine-readable output** (`run --format {json,human,junit,tap}`): emit a
+  JUnit XML testsuite or a TAP 13 stream for CI, alongside the default human
+  summary and full JSON.
+
+- **Parameter templating & matrix** (`{{var}}`, a top-level `params` block, `run
+  --set NAME=VALUE`, `matrix --param NAME=v1,v2`): fill `{{var}}` holes from a
+  scenario default or the CLI, and cross the Emacs-binary axis with any
+  parameter axes — one scenario, N shells × M Emacs versions, aggregated into a
+  grid that exits 0 only when every combo passes (xfail honored).
+
+- **Scenario `defaults`** (top-level `{"defaults": {"timeout": 8, "min_idle":
+  0.3}}`): set per-verb fallbacks once instead of repeating them on every step.
+
+- **Session-config parity for scenarios**: the `session` block now accepts
+  `eval_file`, `profile`, and `home_seed` (like `elate start`), plus a new `env`
+  (extra process environment variables, e.g. `{"SHELL": "/bin/zsh"}`), also
+  exposed as `start --env` and on MCP. `env` cannot override the sandbox
+  HOME/XDG_* isolation, and each key must be a POSIX variable name.
+
+- **`eval` runs in the buffer you see** (`eval --buffer`, and the new default):
+  an `eval` / assert-`eval` now runs in the selected window's buffer instead of
+  an arbitrary RPC-time one, so `current-buffer` / point / line read what is on
+  screen; `--buffer NAME` targets another buffer.
+
+- **Assert comparison/regex operators**: a `state` matcher value may be an
+  operator object — `{">": n}` / `{">=":}` / `{"<":}` / `{"<=":}` / `{"!=":}` /
+  `{"equals":}` / `{"matches": "regexp"}` — not only a bare equality check.
+
+- **Lifecycle ergonomics**: a successful `run` purges its throwaway sandbox by
+  default (`--no-purge` to keep; failed runs are always kept for post-mortem);
+  `run --keep` names the kept session from the scenario `"name"` (or `--name`);
+  `purge`/`prune` gain `--glob 'run-*'` and `--name-prefix` bulk selectors.
+
+- **Robust TTY failure snapshots**: a failed step's `screen_tail` no longer
+  comes back empty when the capture lands mid-redraw (retry + scrollback
+  fallback); the fix also covers wait-timeout snapshots.
+
+- **`export-script --clean`**: prune transient temp-path references (a recorded
+  `(setenv "HOME" "/tmp/…")` / `(load "/tmp/…")`) so an export replays on another
+  machine; transient session `load`/`eval` are dropped (and named in the header
+  comment) and a transient `eval` step is marked `skip`.
+
 ## 0.10.0
 
 `keys` now tells you whether a keystroke actually reached the command you meant.
