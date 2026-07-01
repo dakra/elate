@@ -21,8 +21,10 @@ A script:
 
     {
       "name": "demo",
+      "params": {"shell": "/bin/zsh"},
       "session": {"ui": "tty", "size": "100x30", "config": "minimal",
-                  "load": ["./my-pkg.el"], "eval": ["(my-setup)"]},
+                  "load": ["./my-pkg.el"], "eval": ["(my-setup)"],
+                  "env": {"SHELL": "{{shell}}"}},
       "defaults": {"timeout": 8, "min_idle": 0.3},
       "steps": [
         {"keys": "M-x my-mode RET"},
@@ -32,6 +34,11 @@ A script:
         {"assert": {"tests": {"unexpected": 0}}}
       ]
     }
+
+A "params" block declares {{var}} template defaults; every {{var}} in a
+string value is substituted before validation, and `--set NAME=VALUE`
+(matrix: `--param`) overrides a default -- so one scenario drives N shells
+(an unknown {{var}} is a loud error).
 
 Relative paths in a script (session load/init_file, test load_files,
 lint files, screenshot output) resolve against the script file's
@@ -141,9 +148,71 @@ _DEFAULT_TIMEOUTS = {"keys": 15.0, "eval": 15.0, "wait": 10.0,
 # ---------------------------------------------------------------------------
 # Loading & validation
 
-def load_script(path: str | Path) -> tuple[dict[str, Any], Path]:
-    """Read and validate a scenario file; return (script, base_dir).
+# A {{var}} reference: any single non-space, non-brace token (so kebab-case
+# and dotted names like {{my-var}} / {{a.b}} are real references, substituted
+# or reported-missing -- never silently left literal). A brace run with
+# whitespace inside ({{ not a var }}) is not a reference and stays literal.
+_TEMPLATE_RE = re.compile(r"\{\{\s*([^\s{}]+)\s*\}\}")
 
+
+def _substitute(node: Any, bindings: dict[str, str], missing: set[str]) -> Any:
+    """Replace every {{var}} in string values of NODE using BINDINGS.
+
+    Recurses through lists and dict VALUES (keys are never templated); a
+    {{var}} with no binding is collected into MISSING (reported at once).
+    """
+    if isinstance(node, str):
+        def repl(m: "re.Match[str]") -> str:
+            name = m.group(1)
+            if name in bindings:
+                return bindings[name]
+            missing.add(name)
+            return m.group(0)
+        return _TEMPLATE_RE.sub(repl, node)
+    if isinstance(node, list):
+        return [_substitute(x, bindings, missing) for x in node]
+    if isinstance(node, dict):
+        return {k: _substitute(v, bindings, missing) for k, v in node.items()}
+    return node
+
+
+def render_script(raw: Any, overrides: dict[str, str]) -> dict[str, Any]:
+    """Apply {{var}} templating to a raw scenario dict; return the result.
+
+    Bindings are the scenario's own "params" block (defaults) overlaid with
+    OVERRIDES (CLI --set, matrix --param). The "params" block is consumed
+    (not templated, and dropped from the result). An unknown {{var}} is a
+    loud error before anything boots. Called once per matrix combo, so it
+    must not mutate RAW.
+    """
+    if not isinstance(raw, dict):
+        raise ElateError('a script must be a JSON object with a "steps" list')
+    raw = dict(raw)
+    params = raw.pop("params", None)
+    bindings: dict[str, str] = {}
+    if params is not None:
+        if not (isinstance(params, dict) and all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in params.items())):
+            raise ElateError(
+                'script "params" must be an object of string -> string')
+        bindings.update(params)
+    bindings.update(overrides)
+    missing: set[str] = set()
+    rendered = _substitute(raw, bindings, missing)
+    if missing:
+        raise ElateError(
+            f"unknown template variable(s) {sorted(missing)}: define them in a "
+            '"params" block, or pass --set NAME=VALUE (matrix: --param)')
+    return rendered
+
+
+def load_script(path: str | Path,
+                overrides: dict[str, str] | None = None
+                ) -> tuple[dict[str, Any], Path]:
+    """Read, template, and validate a scenario file; return (script, base_dir).
+
+    OVERRIDES bind {{var}} templates (over any scenario "params" defaults).
     BASE_DIR is the script file's directory: relative paths inside the
     script resolve against it.
     """
@@ -151,9 +220,10 @@ def load_script(path: str | Path) -> tuple[dict[str, Any], Path]:
     if not p.is_file():
         raise ElateError(f"script file does not exist: {path}")
     try:
-        script = json.loads(p.read_text(encoding="utf-8"))
+        raw = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ElateError(f"cannot read script {path}: {exc}") from exc
+    script = render_script(raw, overrides or {})
     validate_script(script)
     return script, p.parent.resolve()
 

@@ -1104,6 +1104,10 @@ def elate_run_script(
         "Base directory for golden snapshots; resolved against the "
         "scenario's directory. Default: <scenario-dir>/__snapshots__."))]
         = None,
+    params: Annotated[dict[str, str] | None, Field(description=(
+        "Bind {{var}} template variables in the scenario (overriding any "
+        "scenario \"params\" defaults), e.g. {\"shell\": \"/bin/zsh\"} so one "
+        "scenario file drives many configs."))] = None,
 ) -> str:
     """Execute a whole scenario script in one call: fresh session, steps,
     assertions, teardown.
@@ -1127,7 +1131,7 @@ def elate_run_script(
     try:
         from . import script as SC
 
-        sc, base = SC.load_script(script)
+        sc, base = SC.load_script(script, params or {})
         sdir = (base / snapshot_dir) if snapshot_dir else None
         result = SC.run_script(sc, base_dir=base, emacs=emacs,
                                keep_on_failure=keep_on_failure,

@@ -31,11 +31,11 @@ def _parse_size(value: str) -> tuple[int, int]:
     return int(m.group(1)), int(m.group(2))
 
 
-def _parse_env_pair(value: str) -> tuple[str, str]:
+def _parse_kv_pair(value: str) -> tuple[str, str]:
     key, sep, val = value.partition("=")
     if not sep or not key:
         raise argparse.ArgumentTypeError(
-            f"--env expects KEY=VALUE with a non-empty KEY, got {value!r}")
+            f"expected NAME=VALUE with a non-empty NAME, got {value!r}")
     return key, val
 
 
@@ -146,7 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "$HOME before launch (rc files in place before any "
                          "subprocess spawns; keeps sandbox isolation)")
     sp.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
-                    type=_parse_env_pair,
+                    type=_parse_kv_pair,
                     help="set an environment variable for the Emacs process "
                          "and the subprocesses it spawns (repeatable); cannot "
                          "override the sandbox's HOME/XDG_* isolation vars")
@@ -629,6 +629,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--snapshot-dir", metavar="DIR",
                     help="base directory for golden snapshots "
                          "(default: <scenario-dir>/__snapshots__)")
+    sp.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
+                    type=_parse_kv_pair, dest="set_vars",
+                    help="bind a {{NAME}} template variable in the scenario "
+                         "(repeatable); overrides a scenario \"params\" "
+                         "default, so one scenario can drive many configs")
     sp.add_argument("--format", choices=("json", "human", "junit", "tap"),
                     help="output format: 'human' (default when not piped) a "
                          "summary + per-group verdicts, 'json' the full "
@@ -1904,7 +1909,7 @@ def cmd_run(args: argparse.Namespace) -> Result:
         raise ElateError(
             "--emacs cannot apply to an existing session (-s NAME); drop "
             "-s to run a fresh session with that binary")
-    script, base = SC.load_script(args.script)
+    script, base = SC.load_script(args.script, dict(args.set_vars))
     target = None
     if args.session:
         target = S.load_session(args.session)

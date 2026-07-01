@@ -335,6 +335,33 @@ def test_state_match_operators() -> None:
     assert m(None, None) is True                         # bare equality asserts null
 
 
+def test_render_script_templating() -> None:
+    raw = {"name": "d", "params": {"a": "1", "b": "B"},
+           "session": {"env": {"X": "{{a}}"}},
+           "steps": [{"eval": "{{b}}-{{a}}"}]}
+    r = SC.render_script(raw, {"a": "override"})
+    assert "params" not in r                          # consumed, not in result
+    assert r["session"]["env"]["X"] == "override"     # --set overrides the default
+    assert r["steps"][0]["eval"] == "B-override"      # default b + overridden a
+    assert raw["session"]["env"]["X"] == "{{a}}"      # did not mutate the input
+    # An unknown var is a loud error.
+    with pytest.raises(ElateError, match="unknown template variable"):
+        SC.render_script({"steps": [{"eval": "{{missing}}"}]}, {})
+    # params must be string -> string.
+    with pytest.raises(ElateError, match="params"):
+        SC.render_script({"params": {"a": 1}, "steps": []}, {})
+    # A non-{{word}} brace sequence is left literal (no escape needed).
+    out = SC.render_script({"steps": [{"eval": "{{a}} {{ not a var }}"}]},
+                           {"a": "x"})
+    assert out["steps"][0]["eval"] == "x {{ not a var }}"
+    # A kebab-case/dotted var IS a reference: substituted when bound...
+    assert SC.render_script({"steps": [{"eval": "{{my-var}}"}]},
+                            {"my-var": "ok"})["steps"][0]["eval"] == "ok"
+    # ...and a loud error when not (never a silent literal passthrough).
+    with pytest.raises(ElateError, match="unknown template variable"):
+        SC.render_script({"steps": [{"eval": "{{my-var}}"}]}, {})
+
+
 def test_step_timeout_resolution() -> None:
     # step timeout > scenario default > per-verb builtin.
     assert SC._step_timeout({}, "keys", {}) == SC._DEFAULT_TIMEOUTS["keys"]
@@ -822,6 +849,24 @@ def test_run_script_eval_buffer_context(
     code = cli.main(["--json", "run", path])
     out = json.loads(capsys.readouterr().out)
     assert code == 0 and out["success"] is True, out
+    assert running_run_sessions() == []
+
+
+def test_run_script_templating_set_overrides(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # A scenario `params` default renders and runs; --set substitutes a
+    # different value (observably changing the outcome).
+    path = write_script(tmp_path, {
+        "params": {"n": "1"},
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"assert": {"eval": "(= {{n}} 1)"}}],
+    })
+    assert cli.main(["--json", "run", path]) == 0          # default n=1 -> (= 1 1)
+    capsys.readouterr()
+    code = cli.main(["--json", "run", path, "--set", "n=2"])  # -> (= 2 1)
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["success"] is False
     assert running_run_sessions() == []
 
 

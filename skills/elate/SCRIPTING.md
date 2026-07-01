@@ -79,6 +79,25 @@ from any cwd.
 signalled an error **fails the run before any step executes** (the package
 under test may not even be loaded) — unless `"allow_init_error": true`.
 
+## Templating: `params` + `{{var}}`
+
+A top-level `"params"` block declares template variables with defaults;
+every `{{var}}` in a string value (anywhere in the scenario) is substituted
+**before** validation. `elate run --set NAME=VALUE` (repeatable) overrides a
+default, and `matrix --param NAME=v1,v2` turns one into an axis — so a
+single scenario drives many shells/configs. An unknown `{{var}}` (no
+default, no `--set`) is a loud error before anything boots. The `params`
+block is consumed (it is not itself templated and never reaches the run).
+Only **string** values are templated, so numeric fields (`timeout`,
+`min_idle`) can't be parameterized — a substituted `"{{t}}"` stays a
+string and fails number validation.
+
+```json
+{"params": {"shell": "/bin/zsh"},
+ "session": {"env": {"SHELL": "{{shell}}"}},
+ "steps": [{"send_process": "{{shell}} --version\n"}]}
+```
+
 ## Steps — exactly one verb per step
 
 Timeouts are numbers in `(0, 600]` seconds.
