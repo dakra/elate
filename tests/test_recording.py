@@ -2216,3 +2216,69 @@ def test_matrix_set_file(elate_home: str, tmp_path: Path,
     assert code == 0, out                    # the file value won
     assert out["results"][0]["axes"]["variant"] == "a"
     assert running_run_sessions() == []
+
+
+def test_run_session_name_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    import re as _re
+    # A short sessions root leaves the full 40-char hint budget.
+    monkeypatch.setenv("ELATE_HOME", "/tmp/el")
+    # A throwaway with a scenario hint is identifiable, still in the swept
+    # run-* namespace.
+    assert _re.fullmatch(r"run-my-scen-[0-9a-f]{6}",
+                         SC._run_session_name(None, "my-scen"))
+    # Matrix stems carry '+': sanitized into the session-name charset.
+    assert _re.fullmatch(r"run-groups-variant-nu-[0-9a-f]{6}",
+                         SC._run_session_name(None, "groups+variant-nu"))
+    # An over-long hint is capped (the name becomes a directory).
+    long = SC._run_session_name(None, "x" * 100)
+    assert _re.fullmatch(r"run-x{40}-[0-9a-f]{6}", long)
+    # No hint (or one that sanitizes away): the legacy opaque name.
+    assert _re.fullmatch(r"run-[0-9a-f]{10}", SC._run_session_name(None))
+    assert _re.fullmatch(r"run-[0-9a-f]{10}", SC._run_session_name(None, "++"))
+    # The name rides in the Emacs server SOCKET path (~104-byte cap): a
+    # deep sessions root shrinks the hint, then drops it entirely, keeping
+    # the whole path at/below the legacy worst case -- never a session
+    # that dies with "Service name too long".
+    monkeypatch.setenv("ELATE_HOME", "/x" * 30)   # root >= 69 chars
+    shrunk = SC._run_session_name(None, "my-scen")
+    assert _re.fullmatch(r"run-my[a-z-]*-[0-9a-f]{6}", shrunk)  # "run-my-sce-…"
+    assert (len(str(SC.paths.sessions_root())) + 1 + len(shrunk)
+            + len("/server/elate")) <= 100
+    monkeypatch.setenv("ELATE_HOME", "/x" * 60)   # hopeless: legacy name
+    assert _re.fullmatch(r"run-[0-9a-f]{10}",
+                         SC._run_session_name(None, "my-scen"))
+    # The PREFER branch is untouched: kept names win over the hint and the
+    # reserved-namespace rejection still fires.
+    assert SC._run_session_name("kept-name", "my-scen") == "kept-name"
+    with pytest.raises(ElateError, match="reserved"):
+        SC._run_session_name("run-squat", "my-scen")
+
+
+def test_failed_run_session_named_after_scenario(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # An auto-kept FAILURE carries the scenario stem, so a post-mortem in a
+    # pile of sandboxes is findable -- and a targeted glob sweeps the whole
+    # campaign. A SHORT sessions root (not the deep pytest tmpdir the
+    # module fixture uses) so the full stem survives the socket budget.
+    home = tempfile.mkdtemp(prefix="el-", dir="/tmp")
+    monkeypatch.setenv("ELATE_HOME", home)
+    try:
+        path = write_script(tmp_path, {
+            "session": {"config": "bare", "size": "80x24"},
+            "steps": [{"assert": {"eval": "nil"}}],
+        }, "my-scen.json")
+        code = cli.main(["--json", "run", path])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 1 and out["success"] is False
+        assert out["session"].startswith("run-my-scen-")
+        assert out["kept"] is False                   # stopped, not running
+        assert os.path.isdir(out["session_dir"])      # but kept on disk
+        code = cli.main(["--json", "purge", "--glob", "run-my-scen-*"])
+        purged = json.loads(capsys.readouterr().out)
+        assert code == 0
+        assert out["session"] in [p["name"] for p in purged["purged"]]
+        assert not os.path.isdir(out["session_dir"])
+        assert running_run_sessions() == []
+    finally:
+        shutil.rmtree(home, ignore_errors=True)

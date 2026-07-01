@@ -77,6 +77,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from . import paths
 from . import session as S
 from .errors import ElateError, WaitTimeout
 
@@ -863,7 +864,11 @@ def run_script(
     t_start = time.monotonic()
     fresh = session is None
     if fresh:
-        sess = _start_for(script, base, emacs, keep_as_name)
+        # The scenario stem in the throwaway name makes an auto-kept
+        # failure findable (`run-evil-ghostel-3fa2c1`, sweepable via
+        # `purge --glob 'run-evil-ghostel-*'`) instead of an opaque hex.
+        run_hint = snapshot_stem or _safe_stem(script.get("name"))
+        sess = _start_for(script, base, emacs, keep_as_name, run_hint)
     else:
         sess = session
         sess.require_alive()
@@ -1054,13 +1059,17 @@ def run_script(
 _SANE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
-def _run_session_name(prefer: str | None) -> str:
-    """A kept run's session name: PREFER (sanitized) if usable, else run-<hex>.
+def _run_session_name(prefer: str | None,
+                      run_hint: str | None = None) -> str:
+    """A kept run's session name: PREFER (sanitized) if usable, else
+    run-[<hint>-]<hex>.
 
     So `run --keep` on a scenario named "evil-ghostel" keeps a session you
-    can find by name, while an unnamed throwaway stays run-<hex>. The name
-    is capped (it becomes a directory) and cannot squat the reserved
-    "run-" throwaway namespace that `purge --glob 'run-*'` sweeps.
+    can find by name, while a throwaway carries the scenario stem
+    (RUN_HINT) inside the reserved "run-" namespace -- an auto-kept
+    FAILURE is then identifiable (`run-evil-ghostel-3fa2c1`) and still
+    swept by `purge --glob 'run-*'`. Names are capped (they become
+    directories), and a PREFER cannot squat the reserved namespace.
     """
     if prefer:
         cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", str(prefer)).strip("-._")[:64]
@@ -1071,17 +1080,34 @@ def _run_session_name(prefer: str | None) -> str:
                 f"{cleaned!r}")
         if cleaned and _SANE_NAME_RE.match(cleaned):
             return cleaned
+    if run_hint:
+        # The name is a component of the Emacs server socket path
+        # (<sessions-root>/<name>/server/elate), and sun_path is capped at
+        # ~104 bytes on macOS: budget the hint against what the sessions
+        # root leaves over (target <= 100 total, the legacy 14-char name's
+        # worst case), so a deep ELATE_HOME degrades to a shorter hint --
+        # or the legacy opaque name -- instead of an Emacs that dies with
+        # "Service name too long". Matrix stems carry '+'
+        # ("groups+variant-nu"): sanitize to the session-name charset.
+        budget = 100 - len(str(paths.sessions_root())) - len("/server/elate")
+        cap = min(40, budget - len("run--") - 6 - 1)  # fixed name parts + "/"
+        if cap >= 2:
+            hint = re.sub(r"[^A-Za-z0-9._-]+", "-",
+                          str(run_hint)).strip("-._")[:cap].rstrip("-._")
+            if hint:
+                return f"run-{hint}-{uuid.uuid4().hex[:6]}"
     return f"run-{uuid.uuid4().hex[:10]}"
 
 
 def _start_for(script: dict[str, Any], base: Path,
                emacs_override: str | None,
-               prefer_name: str | None = None) -> S.Session:
+               prefer_name: str | None = None,
+               run_hint: str | None = None) -> S.Session:
     cfg = script.get("session") or {}
     m = _SIZE_RE.match(cfg.get("size") or "120x36")
     assert m is not None  # validated
     return S.start_session(
-        _run_session_name(prefer_name),
+        _run_session_name(prefer_name, run_hint),
         emacs=emacs_override or cfg.get("emacs"),
         config=cfg.get("config", "minimal"),
         init_file=_resolve(cfg.get("init_file"), base),

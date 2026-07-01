@@ -330,9 +330,11 @@ one's idle age) — stays behind on purpose (transcripts outlive the Emacs).
 Stopped sandboxes are inert; when the transcripts are no longer needed,
 `elate purge NAME…` (or `elate purge --all`; `prune` is the same command)
 deletes them — purge never touches a running session. `elate run` purges
-its own throwaway sandbox on success, so only failed runs pile up: sweep
-them by pattern with `elate purge --glob 'run-*'` (or `--name-prefix
-run-`). During a long parallel run, GC only the stale ones with `elate
+its own throwaway sandbox on success, so only failed runs pile up — named
+`run-<scenario>-<hex>` after the scenario file, so a post-mortem is
+findable: sweep them by pattern with `elate purge --glob 'run-*'` (or a
+targeted `--glob 'run-my-scen-*'`, or `--name-prefix run-`). During a
+long parallel run, GC only the stale ones with `elate
 purge --all --stopped-older-than 1h`, and preview which they are with
 `elate list --older-than 1h`. Sandboxes live under `~/.cache/elate/sessions/<name>`
 (`$ELATE_HOME` overrides the base).

@@ -35,6 +35,15 @@
   `--param` axis are loud errors. (MCP `elate_run_script` needs no
   equivalent: its `params` object carries multi-line values directly.)
 
+- **Auto-kept failed runs are named after the scenario**: a failing `run`
+  keeps its sandbox as `run-<scenario>-<hex>` (e.g. `run-my-scen-3fa2c1`)
+  instead of an opaque `run-<hex>`, so the post-mortem in a pile of
+  sandboxes is findable and `purge --glob 'run-my-scen-*'` sweeps one
+  campaign. Names stay inside the reserved `run-*` namespace (`purge
+  --glob 'run-*'` still sweeps everything), and the scenario part shrinks
+  or drops automatically when a deep `$ELATE_HOME` would push the Emacs
+  server socket path past the OS limit.
+
 ## 0.11.0
 
 A scenario run can now report *what does not work* — every check, not just the
