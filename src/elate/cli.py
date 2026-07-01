@@ -597,6 +597,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="keep the fresh session running when the run "
                          "fails (inspect it with state/screenshot, then "
                          "stop it)")
+    sp.add_argument("--keep-going", action="store_true",
+                    help="run every step even after a failure instead of "
+                         "stopping at the first (a failed run still exits "
+                         "non-zero); use for a matrix that must report every "
+                         "check. Per-step \"optional\": true never gates.")
     sp.add_argument("--emacs", metavar="PATH",
                     help="override the script's emacs binary (CI matrix)")
     sp.add_argument("--update-snapshots", action="store_true",
@@ -1685,11 +1690,14 @@ def cmd_wait(args: argparse.Namespace) -> Result:
 # -- Phase 5: scripts, recording, snap series, matrix -------------------------
 
 _STEP_MARK = {"ok": "ok", "failed": "FAIL", "skipped": "skipped",
-              "not-run": "not run"}
+              "not-run": "not run", "comment": "note"}
 
 
 def _step_line(rec: dict[str, Any], total: int) -> str:
-    line = f"[{rec['index']}/{total}] {rec['summary']} ... {_STEP_MARK[rec['status']]}"
+    mark = _STEP_MARK[rec["status"]]
+    if rec["status"] == "failed" and rec.get("optional"):
+        mark += " (optional)"
+    line = f"[{rec['index']}/{total}] {rec['summary']} ... {mark}"
     if rec.get("duration") is not None:
         line += f" ({rec['duration']:.2f}s)"
     if rec["status"] == "failed":
@@ -1707,10 +1715,17 @@ def _step_line(rec: dict[str, Any], total: int) -> str:
 
 def _run_summary(result: dict[str, Any]) -> str:
     bits = [f"{result['passed']} passed"]
-    for key, label in (("failed", "failed"), ("skipped", "skipped"),
-                       ("not_run", "not run")):
-        if result.get(key):
-            bits.append(f"{result[key]} {label}")
+    # result["failed"] counts every failed-status step; optional failures
+    # are broken out so a passing run never reads "PASS ... 1 failed".
+    optional_failed = result.get("optional_failed", 0)
+    gating_failed = result.get("failed", 0) - optional_failed
+    for key, label, val in (
+            ("failed", "failed", gating_failed),
+            ("optional_failed", "optional-failed", optional_failed),
+            ("skipped", "skipped", result.get("skipped", 0)),
+            ("not_run", "not run", result.get("not_run", 0))):
+        if val:
+            bits.append(f"{val} {label}")
     line = (("PASS" if result["success"] else "FAIL")
             + f": {', '.join(bits)} in {result['duration']:.2f}s")
     if result.get("error"):
@@ -1746,6 +1761,7 @@ def cmd_run(args: argparse.Namespace) -> Result:
     result = SC.run_script(
         script, base_dir=base, session=target, emacs=args.emacs,
         keep=args.keep, keep_on_failure=args.keep_on_failure,
+        keep_going=args.keep_going,
         on_step=on_step,
         update_snapshots=args.update_snapshots,
         snapshot_dir=(base / Path(args.snapshot_dir).expanduser()

@@ -6,9 +6,11 @@ other elate surface (--json, the MCP contract, the JSONL transcript)
 already speaks it, so one grammar serves the whole tool and the
 transcript->script exporter is a near-identity mapping. The affordances
 YAML would have added are replaced explicitly: a "comment" key is allowed
-on every step (a step with only a comment is recorded as skipped),
-"skip": true disables a step without deleting it (the exporter marks its
-assertion stubs this way), and unknown *top-level* keys are ignored so
+on every step (a step with only a comment is recorded as a "comment"
+annotation, not a skipped step), "skip": true disables a step without
+deleting it (the exporter marks its assertion stubs this way), and
+"optional": true lets a step fail without failing or stopping the run;
+unknown *top-level* keys are ignored so
 scripts can carry metadata ("name", "exported_at", ...). Step keys AND
 their value types are validated strictly up front -- a typoed option, a
 wrong-typed number/bool, a bad enum value, or an option on the wrong
@@ -38,8 +40,10 @@ from any working directory.
 `run_script` runs the steps in order against a fresh throwaway session
 (the default -- lint executes compile-time code and lint/test results
 depend on session history, so a shared session gives non-reproducible
-verdicts) and stops at the first failure; a failed step embeds a state
-snapshot, matching the error convention everywhere else in elate.
+verdicts) and, by default, stops at the first failure; a failed step
+embeds a state snapshot, matching the error convention everywhere else
+in elate. `keep_going` runs every step regardless (for a regression
+matrix that must report every check, not just the first to break).
 """
 
 from __future__ import annotations
@@ -66,7 +70,9 @@ VERBS = ("keys", "type", "eval", "wait", "mouse", "focus", "send_events",
          "test", "lint", "screenshot", "resize", "assert")
 
 # Keys allowed on every step besides the verb itself.
-_COMMON_KEYS = {"comment", "skip"}
+#   "optional": a failing step does not fail the run and does not stop it
+#   (later steps still run) -- for checks that are allowed to fail.
+_COMMON_KEYS = {"comment", "skip", "optional"}
 
 # Option keys allowed per verb (mirroring the CLI flags).
 _STEP_OPTIONS: dict[str, set[str]] = {
@@ -277,6 +283,7 @@ def _validate_step(step: Any, index: int) -> None:
             f"allowed: {sorted(allowed)}")
     _check_timeout(step, where)
     _check_bool(step, "skip", where)
+    _check_bool(step, "optional", where)
     val = step[verb]
     if verb in ("keys", "type", "eval") and not isinstance(val, str):
         raise ElateError(f'{where}: "{verb}" takes a string')
@@ -479,6 +486,7 @@ def run_script(
     emacs: str | None = None,
     keep: bool = False,
     keep_on_failure: bool = False,
+    keep_going: bool = False,
     deadline: float | None = None,
     on_step: Callable[[dict[str, Any]], None] | None = None,
     origin: str | None = None,
@@ -496,8 +504,11 @@ def run_script(
     code signalled an error FAILS the run without executing any step
     (the package under test may not even be loaded) unless the script's
     session config sets "allow_init_error": true. Steps run in order;
-    the first failure stops the run (later steps are recorded as
-    not-run) and the failed step record embeds a state snapshot.
+    by default the first failure stops the run (later steps are recorded
+    as not-run) and the failed step record embeds a state snapshot. With
+    KEEP_GOING every step runs regardless of failures (a failed run still
+    exits non-zero); a step with "optional": true never gates or stops
+    the run whatever the mode.
     DEADLINE is a time.monotonic() instant: steps not started by then
     fail. ON_STEP is called with each step record as it completes (for
     streaming output). ORIGIN tags the transcript's run-script events
@@ -527,7 +538,8 @@ def run_script(
         "emacs": sess.emacs,
         "emacs_version": sess.emacs_version,
     }
-    failed = False
+    gate_failed = False  # a real, non-optional failure occurred (fails the run)
+    stopped = False      # halt: remaining steps recorded as not-run
     if fresh:
         init_error = sess.init_error()
         if init_error:
@@ -541,7 +553,8 @@ def run_script(
                     '"allow_init_error": true in the script\'s "session" '
                     "block to run regardless")
                 _embed_state(result, sess)
-                failed = True
+                gate_failed = True
+                stopped = True
     steps = script.get("steps") or []
     sess.log("run-script", name=script.get("name"), steps=len(steps),
              **({"origin": origin} if origin else {}))
@@ -561,15 +574,22 @@ def run_script(
             verb = next((v for v in VERBS if v in step), None)
             rec: dict[str, Any] = {"index": index, "verb": verb,
                                    "summary": _summary(step, verb)}
-            if failed:
+            if stopped:
                 rec["status"] = "not-run"
-            elif step.get("skip") or verb is None:
+            elif verb is None:
+                # A pure comment/annotation: it never ran and never can
+                # fail, so it is not a "skipped" step (which would inflate
+                # the skipped count and the pass/fail math) -- record it
+                # distinctly.
+                rec["status"] = "comment"
+            elif step.get("skip"):
                 rec["status"] = "skipped"
             elif deadline is not None and time.monotonic() > deadline:
                 rec["status"] = "failed"
                 rec["error"] = ("script deadline exceeded before this step; "
                                 "raise the run timeout or split the script")
-                failed = True
+                gate_failed = True
+                stopped = True  # every later step would also be past the wall
             else:
                 t0 = time.monotonic()
                 try:
@@ -581,17 +601,14 @@ def run_script(
                     if exc.detail:
                         rec["detail"] = exc.detail
                     _embed_state(rec, sess)
-                    failed = True
                 except WaitTimeout as exc:
                     rec["status"] = "failed"
                     rec["error"] = str(exc)
                     rec.update(exc.state)  # state/screen_tail as siblings
-                    failed = True
                 except ElateError as exc:
                     rec["status"] = "failed"
                     rec["error"] = str(exc)
                     _embed_state(rec, sess)
-                    failed = True
                 except Exception as exc:
                     # Safety net: a controller-side bug must surface as a
                     # failed step (records kept, structured output, exit 1)
@@ -600,7 +617,13 @@ def run_script(
                     rec["status"] = "failed"
                     rec["error"] = f"internal error: {type(exc).__name__}: {exc}"
                     _embed_state(rec, sess)
-                    failed = True
+                if rec["status"] == "failed":
+                    if step.get("optional"):
+                        rec["optional"] = True  # reported, but never gates
+                    else:
+                        gate_failed = True
+                    if not (keep_going or step.get("optional")):
+                        stopped = True
                 rec["duration"] = round(time.monotonic() - t0, 3)
             records.append(rec)
             if on_step is not None:
@@ -609,7 +632,7 @@ def run_script(
                 except Exception:
                     pass  # a broken progress printer must not fail the run
     finally:
-        success = not failed
+        success = not gate_failed
         kept = True if not fresh else (keep or (not success and keep_on_failure))
         if fresh and not kept:
             try:
@@ -618,14 +641,21 @@ def run_script(
                 result["teardown_error"] = str(exc)
 
     counts = {status: sum(1 for r in records if r["status"] == status)
-              for status in ("ok", "failed", "skipped", "not-run")}
+              for status in ("ok", "failed", "skipped", "not-run", "comment")}
+    # An optional step that fails is still "failed" status, but it did not
+    # gate the run; break it out so the summary can read "PASS ... 1
+    # optional-failed" without contradiction.
+    optional_failed = sum(1 for r in records
+                          if r["status"] == "failed" and r.get("optional"))
     result.update({
         "success": success,
         "kept": kept,
         "passed": counts["ok"],
         "failed": counts["failed"],
+        "optional_failed": optional_failed,
         "skipped": counts["skipped"],
         "not_run": counts["not-run"],
+        "comment": counts["comment"],
         "duration": round(time.monotonic() - t_start, 3),
         "steps": records,
     })

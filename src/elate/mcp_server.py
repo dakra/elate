@@ -1073,6 +1073,11 @@ def elate_run_script(
         "can inspect it (elate_state / elate_screenshot) -- then "
         "elate_stop it yourself; the response's 'session' field has its "
         "name. On success the session is always torn down."))] = False,
+    keep_going: Annotated[bool, Field(description=(
+        "Run every step even after a failure instead of stopping at the "
+        "first (a failed run still reports success=false); use for a "
+        "regression matrix that must report every check. A step with "
+        "\"optional\": true never gates the run."))] = False,
     timeout: Annotated[float, Field(gt=0, le=600, description=(
         "Overall wall-clock budget for the whole run in seconds "
         "(0 < timeout <= 600). Steps not started by the deadline fail; "
@@ -1097,8 +1102,9 @@ def elate_run_script(
     The script runs in a fresh throwaway session built from its
     "session" config (deliberate: lint executes compile-time code and
     lint/test results depend on session history, so only a fresh session
-    gives reproducible verdicts), executes the steps in order, and stops
-    at the first failure. Script failures are data, not tool errors: the
+    gives reproducible verdicts), executes the steps in order, and (by
+    default) stops at the first failure -- pass keep_going to run them
+    all. Script failures are data, not tool errors: the
     response stays ok=true -- judge the run by "success" and the
     per-step "steps" list (a failed step embeds the error and a state
     snapshot; later steps are recorded as not-run). A run whose session
@@ -1116,6 +1122,7 @@ def elate_run_script(
         sdir = (base / snapshot_dir) if snapshot_dir else None
         result = SC.run_script(sc, base_dir=base, emacs=emacs,
                                keep_on_failure=keep_on_failure,
+                               keep_going=keep_going,
                                deadline=time.monotonic() + timeout,
                                origin="mcp",
                                update_snapshots=update_snapshots,

@@ -92,7 +92,7 @@ PASS_SCRIPT = {
         {"assert": {"state": {"buffer": "*scratch*"}}},
         {"eval": '(message "script-marker-77")'},
         {"assert": {"messages_match": "script-marker-7[0-9]"}},
-        {"comment": "a pure comment step is recorded as skipped"},
+        {"comment": "a pure comment step is recorded as a comment"},
         {"assert": {"eval": "(= (+ 1 2) 3)"}, "skip": True,
          "comment": "explicitly skipped"},
         {"assert": {"eval": "(= (* 6 7) 42)"}},
@@ -236,10 +236,13 @@ def test_run_script_passes_and_tears_down(
     assert out["fresh_session"] is True and out["kept"] is False
     assert out["emacs_version"]
     assert out["passed"] == 10 and out["failed"] == 0
-    assert out["skipped"] == 2 and out["not_run"] == 0
+    # The pure-comment step is now a "comment" annotation, not a skipped
+    # step; only the explicit "skip": true step counts as skipped.
+    assert out["skipped"] == 1 and out["comment"] == 1 and out["not_run"] == 0
     statuses = [s["status"] for s in out["steps"]]
-    assert statuses.count("skipped") == 2
-    assert all(s["status"] in ("ok", "skipped") for s in out["steps"])
+    assert statuses.count("skipped") == 1
+    assert statuses.count("comment") == 1
+    assert all(s["status"] in ("ok", "skipped", "comment") for s in out["steps"])
     # Fresh session torn down: nothing left running.
     assert running_run_sessions() == []
     # The sandbox (with its transcript) is kept on disk for forensics.
@@ -271,6 +274,53 @@ def test_run_script_failing_assertion(
     assert "state" in failed or "screen_tail" in failed
     assert failed["detail"]["buffer_tail"]
     assert out["steps"][3]["status"] == "not-run"
+    assert running_run_sessions() == []
+
+
+def test_run_script_keep_going_runs_every_step(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # With --keep-going a failure does not stop the run: every later step
+    # still executes, and every failure is reported (not just the first).
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"assert": {"eval": "(= 1 2)"}},   # fails
+            {"eval": "(+ 2 2)"},               # would be not-run without --keep-going
+            {"assert": {"eval": "(= 3 4)"}},   # also fails -- still reported
+        ],
+    })
+    code = cli.main(["--json", "run", path, "--keep-going"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["success"] is False   # a failed run still exits 1
+    assert out["steps"][0]["status"] == "failed"
+    assert out["steps"][1]["status"] == "ok"       # ran despite the earlier failure
+    assert out["steps"][2]["status"] == "failed"
+    assert out["failed"] == 2 and out["not_run"] == 0
+    assert running_run_sessions() == []
+
+
+def test_run_script_optional_step_does_not_gate_or_stop(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # A step marked "optional" may fail without failing the run and without
+    # stopping it -- even in the default fail-fast mode (no --keep-going).
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"assert": {"eval": "(= 1 2)"}, "optional": True},  # fails, but optional
+            {"eval": "(+ 2 2)"},                                # still runs
+        ],
+    })
+    code = cli.main(["--json", "run", path])   # default: fail-fast
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["success"] is True
+    assert out["steps"][0]["status"] == "failed"
+    assert out["steps"][0]["optional"] is True
+    assert out["steps"][1]["status"] == "ok"
+    # Raw "failed" count includes the optional failure; it is broken out so
+    # a passing run never reads as failed.
+    assert out["failed"] == 1 and out["optional_failed"] == 1
     assert running_run_sessions() == []
 
 

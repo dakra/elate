@@ -375,6 +375,7 @@ Execute a JSON scenario script: create a fresh sandboxed session from the script
 - `script` -- path to the scenario file (JSON)
 - `--keep` -- keep the fresh session running afterwards
 - `--keep-on-failure` -- keep the fresh session running when the run fails (inspect it with state/screenshot, then stop it)
+- `--keep-going` -- run every step even after a failure instead of stopping at the first (a failed run still exits non-zero); use for a matrix that must report every check. Per-step "optional": true never gates.
 - `--emacs PATH` -- override the script's emacs binary (CI matrix)
 - `--update-snapshots` -- write/overwrite golden artifacts for snapshot assertions instead of comparing them; the run still executes every step (review the diff before committing)
 - `--snapshot-dir DIR` -- base directory for golden snapshots (default: <scenario-dir>/__snapshots__)
