@@ -617,20 +617,30 @@ finalizes and exits. The manifest is rewritten atomically after every
 frame, so it is sane even after a hard kill. `snap stop` is idempotent
 and identity-checks the snapper pid before signalling anything.
 
-## Version matrix
+## Parameter matrix
 
 ```sh
 elate matrix --emacs /opt/emacs-29/bin/emacs,/opt/emacs-30/bin/emacs -- scenario.json
 elate matrix --emacs-glob '/opt/emacs-*/bin/emacs' scenario.json
 elate matrix --emacs emacs scenario.json     # a matrix of one; bare
                                              # names resolve via PATH
+
+# Cross the Emacs axis with any scenario-parameter axes: one scenario,
+# {{shell}} template holes, run across every combination.
+elate matrix scenario.json --emacs emacs30,emacs31 \
+    --param shell=/bin/bash,/bin/zsh,/opt/homebrew/bin/fish
 ```
 
-Runs the scenario once per binary, each in a fresh session, and prints
-one summary (`--json` for the structured per-version results, including
-the detected `emacs_version` and the first failed step). Exit `0` only
-when every version passed. Binaries are checked up front, and one
-broken binary does not abort the rest of the matrix.
+Runs the scenario once per combination of the Emacs-binary axis and any
+`--param NAME=v1,v2` axes (their Cartesian product), each in a fresh
+session, and prints one grid (`--json` for the structured per-combo
+results, including the detected `version`, the combo `axes`, and the
+first failed step). Each `--param` binds the scenario's `{{NAME}}` template
+per combo (see "Templating" under scenario scripts). Exit `0` only when
+every combo passed — a step marked `expect: "fail"` reports `xfail` and
+does not gate, so a known-broken check need not be deleted to stay green.
+Binaries are checked up front, and one broken combo does not abort the
+rest of the matrix.
 
 ### CI recipe (GitHub Actions)
 

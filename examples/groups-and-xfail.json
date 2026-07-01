@@ -1,0 +1,18 @@
+{
+  "name": "groups-and-xfail",
+  "comment": "Showcases the 0.11 reporting features on a self-contained scratch buffer: a params template default (the 'greeting' variable), named groups (run reports 'insert: PASS · mode: PASS · known-broken: XFAIL'), comparison/regex assert operators, and an xfail (a known failure that does not fail the run). Override the template with `elate run examples/groups-and-xfail.json --set greeting=hi`, or add axes with `elate matrix ... --param greeting=hello,hi`.",
+  "params": {"greeting": "hello"},
+  "session": {"ui": "tty", "size": "80x24", "config": "bare"},
+  "steps": [
+    {"group": "insert"},
+    {"eval": "(progn (switch-to-buffer \"*scratch*\") (erase-buffer) (insert \"{{greeting}} world\"))"},
+    {"assert": {"state": {"point": {">": 1}, "column": {">=": 0}}}},
+    {"assert": {"buffer_contains": "{{greeting}}"}},
+
+    {"group": "mode"},
+    {"assert": {"state": {"major-mode": {"matches": "mode$"}}}},
+
+    {"group": "known-broken", "assert": {"eval": "(= 1 2)"}, "expect": "fail",
+     "reason": "demo: a known failure is reported xfail, not a run failure"}
+  ]
+}

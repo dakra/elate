@@ -177,6 +177,17 @@ uvx elate -s sh faces-at --pos 12 --run 4 --buffer '*shell*'
 uvx elate stop sh
 ```
 
+**Reset to a clean prompt between independent checks.** When you drive one
+shell/REPL through several unrelated checks, abandon any half-typed or
+running input first, then resync on the fresh prompt — so a check never
+inherits the previous one's line:
+
+```sh
+uvx elate -s sh send-process --char C-c --buffer '*shell*'   # abandon pending input
+uvx elate -s sh wait stable --buffer '*shell*' --quiet-ms 300 # fresh prompt settled
+# ... next independent check ...
+```
+
 ## Reproduce a focus-vs-click ordering bug
 
 Window systems deliver a focus change and a click as separate, ordered
@@ -273,4 +284,55 @@ leaked descendants as `orphans`).
 Heavy parallel runs: `start --replace` recreates a name in place, `start`
 without `--name` auto-generates one, `stop --all` clears everything
 running, and `elate list --older-than 1h` / `elate purge --all
---stopped-older-than 1h` find and GC stale sandboxes.
+--stopped-older-than 1h` find and GC stale sandboxes. A successful `elate
+run` purges its own throwaway sandbox; failed runs stay on disk — sweep
+them with `elate purge --glob 'run-*'`.
+
+## Regression-test one scenario across shells / configs / Emacs versions
+
+Write the scenario once with `{{var}}` template holes and named groups,
+then cross it over parameter axes and Emacs binaries. Each combo runs in a
+fresh session; a step you know is broken is marked `expect: "fail"` so it
+reports `xfail` (and starts failing the matrix as `xpass` the day it gets
+fixed) instead of forcing you to delete the check to stay green.
+
+`shell-matrix.json` (steps use only real verbs — keys/type/eval/wait/assert):
+
+```json
+{
+  "name": "shell-matrix",
+  "params": {"shell": "/bin/bash"},
+  "session": {"config": "bare", "home_seed": "./fixtures/home",
+              "env": {"SHELL": "{{shell}}"}},
+  "steps": [
+    {"group": "env"},
+    {"eval": "(equal (getenv \"SHELL\") \"{{shell}}\")", "comment": "sanity"},
+    {"assert": {"eval": "(equal (getenv \"SHELL\") \"{{shell}}\")"}},
+
+    {"group": "dw"},
+    {"eval": "(progn (switch-to-buffer \"*scratch*\") (erase-buffer) (insert \"one two three\"))"},
+    {"assert": {"state": {"column": {">": 0}}}},
+
+    {"group": "u", "expect": "fail", "reason": "undo feature absent in this shell",
+     "assert": {"eval": "(bound-and-true-p some-undo-feature)"}}
+  ]
+}
+```
+
+```sh
+# One scenario x 3 shells x 2 Emacs = 6 combos; --keep-going runs every
+# check, junit for CI. Exits 0 only if every combo passes (xfail is fine).
+uvx elate matrix shell-matrix.json \
+    --emacs emacs30,emacs31 \
+    --param shell=/bin/bash,/bin/zsh,/opt/homebrew/bin/fish
+
+# A single config, every check, machine-readable:
+uvx elate run shell-matrix.json --set shell=/bin/zsh --keep-going --format junit
+```
+
+Reads as `env: PASS · dw: PASS · u: XFAIL` per group. `--set` (run) and
+`--param` (matrix axis) fill the `{{shell}}` template; a scenario-level
+`params` block is the default. To drive an actual subprocess/REPL (which a
+scenario step can't — `send-process` is CLI-only), record the CLI session
+and `export-script --clean` it. See `examples/groups-and-xfail.json` for a
+self-contained, dependency-free version.

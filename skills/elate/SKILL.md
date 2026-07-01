@@ -250,15 +250,24 @@ Everything you did in a session is in its transcript. Turn it into a
 replayable script:
 
 ```sh
-uvx elate -s s export-script -o scenario.json   # works on stopped sessions too
+uvx elate -s s export-script --clean -o scenario.json  # --clean strips transient temp paths
 # edit: observations were exported as skipped assertion stubs — fill them in
 uvx elate run scenario.json                     # fresh session, steps, exit 0/1
-uvx elate matrix --emacs-glob '/opt/emacs-*/bin/emacs' scenario.json
+uvx elate run scenario.json --keep-going --format junit   # every check + a CI report
+uvx elate matrix scenario.json --emacs emacs30,emacs31 --param shell=/bin/bash,/bin/zsh
 ```
-`elate run` boots a fresh session per run, stops at the first failure
-(embedding a state snapshot), and exits 0/1 — the CI entry point.
-`--keep-on-failure` keeps the session for inspection. Scenario format,
-every step and assertion kind: see [SCRIPTING.md](SCRIPTING.md).
+`elate run` boots a fresh session per run and exits 0/1 — the CI entry
+point; by default it stops at the first failure (embedding a state
+snapshot) and purges its sandbox on success (failed runs are kept —
+`purge --glob 'run-*'` sweeps them). For a regression matrix that reports
+what does **not** work: `--keep-going` runs every step; a step marked
+`"expect": "fail"` reports `xfail` (a known break that never gates, and
+flips to a run-failing `xpass` if it starts passing); a `{"group": "dw"}`
+marker names verdicts (`dw: PASS · u: XFAIL`); `--format junit`/`tap`
+emits CI-ready output; and `{{var}}` + `--set` / `matrix --param` drive
+one scenario across many shells/configs. `--keep`/`--keep-on-failure`
+keep the session for inspection. Scenario format, every step and
+assertion kind: see [SCRIPTING.md](SCRIPTING.md).
 
 ## JSON output and exit codes
 
@@ -317,8 +326,10 @@ sandbox dir — and its `stopped` entry in `elate list` (which shows each
 one's idle age) — stays behind on purpose (transcripts outlive the Emacs).
 Stopped sandboxes are inert; when the transcripts are no longer needed,
 `elate purge NAME…` (or `elate purge --all`; `prune` is the same command)
-deletes them — purge never touches a running session. During a long
-parallel run, GC only the stale ones with `elate purge --all
---stopped-older-than 1h`, and preview which they are with `elate list
---older-than 1h`. Sandboxes live under `~/.cache/elate/sessions/<name>`
+deletes them — purge never touches a running session. `elate run` purges
+its own throwaway sandbox on success, so only failed runs pile up: sweep
+them by pattern with `elate purge --glob 'run-*'` (or `--name-prefix
+run-`). During a long parallel run, GC only the stale ones with `elate
+purge --all --stopped-older-than 1h`, and preview which they are with
+`elate list --older-than 1h`. Sandboxes live under `~/.cache/elate/sessions/<name>`
 (`$ELATE_HOME` overrides the base).
