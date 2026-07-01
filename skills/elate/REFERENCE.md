@@ -388,6 +388,7 @@ Execute a JSON scenario script: create a fresh sandboxed session from the script
 - `--update-snapshots` -- write/overwrite golden artifacts for snapshot assertions instead of comparing them; the run still executes every step (review the diff before committing)
 - `--snapshot-dir DIR` -- base directory for golden snapshots (default: <scenario-dir>/__snapshots__)
 - `--set NAME=VALUE` (repeatable) -- bind a {{NAME}} template variable in the scenario (repeatable); overrides a scenario "params" default, so one scenario can drive many configs
+- `--variant NAME` -- select one entry of the scenario's "variants" block: its bindings overlay the "params" defaults as a set ({{variant}} binds the name; --set still wins per variable). `matrix` runs every variant.
 - `--format {json,human,junit,tap}` -- output format: 'human' (default when not piped) a summary + per-group verdicts, 'json' the full result, 'junit' a JUnit XML testsuite (one testcase per group / ungrouped step), 'tap' TAP version 13. Overrides the global --json/--human for this run.
 
 ## elate export-script
@@ -421,13 +422,14 @@ Capture a frame every INTERVAL seconds into frame-NNNN.png/.txt plus a manifest.
 
 ## elate matrix
 
-run a scenario across Emacs binaries and parameter axes
+run a scenario across Emacs binaries, variants, and parameter axes
 
-Run SCRIPT once per combination of the Emacs binary axis and any --param axes (their Cartesian product), each in a fresh session, and aggregate the verdicts into one grid. Each --param NAME=v1,v2 binds the scenario's {{NAME}} template per combo, so one file drives many shells/configs x Emacs versions. Exits 0 only when every combo passed (xfail honored).
+Run SCRIPT once per combination of the Emacs binary axis, the scenario's "variants" (every declared variant by default; a variant is a NAMED set of co-varying {{var}} bindings), and any --param axes -- their Cartesian product -- each in a fresh session, and aggregate the verdicts into one grid. Each --param NAME=v1,v2 binds the scenario's {{NAME}} template per combo, so one file drives many shells/configs x Emacs versions. Exits 0 only when every combo passed (xfail honored).
 
 - `--emacs PATHS` (repeatable) -- emacs binary, or comma-separated list (repeatable)
 - `--emacs-glob GLOB` -- glob matching emacs binaries, e.g. '/opt/emacs-*/bin/emacs'
 - `--param NAME=V1,V2` (repeatable) -- a parameter axis: bind {{NAME}} to each comma-separated value in turn (repeatable; every axis is crossed with the Emacs axis)
+- `--variant NAMES` (repeatable) -- filter the variant axis to these "variants" entries (comma-separated, repeatable); default: every declared variant
 - `--format {json,human}` -- output format: 'human' (default) the grid, 'json' the structured results. Overrides --json/--human.
 - `--update-snapshots` -- write/overwrite golden snapshots (per Emacs version and param combo) instead of comparing
 - `--snapshot-dir DIR` -- base directory for golden snapshots (default: <scenario-dir>/__snapshots__)

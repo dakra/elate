@@ -1123,6 +1123,13 @@ def elate_run_script(
         "Bind {{var}} template variables in the scenario (overriding any "
         "scenario \"params\" defaults), e.g. {\"shell\": \"/bin/zsh\"} so one "
         "scenario file drives many configs."))] = None,
+    variant: Annotated[str | None, Field(description=(
+        "Select one entry of the scenario's \"variants\" block (a NAMED set "
+        "of co-varying {{var}} bindings): it overlays the \"params\" "
+        "defaults, and {{variant}} binds the name. Mirrors `elate run "
+        "--variant`; running every variant crossed with Emacs binaries is "
+        "the CLI-only `matrix` verb -- call this once per variant "
+        "instead."))] = None,
 ) -> str:
     """Execute a whole scenario script in one call: fresh session, steps,
     assertions, teardown.
@@ -1146,8 +1153,9 @@ def elate_run_script(
     try:
         from . import script as SC
 
-        sc, base = SC.load_script(script, params or {})
+        sc, base = SC.load_script(script, params or {}, variant=variant)
         sdir = (base / snapshot_dir) if snapshot_dir else None
+        stem = Path(script).stem + (f"+variant-{variant}" if variant else "")
         result = SC.run_script(sc, base_dir=base, emacs=emacs,
                                keep_on_failure=keep_on_failure,
                                keep_going=keep_going,
@@ -1156,7 +1164,8 @@ def elate_run_script(
                                origin="mcp",
                                update_snapshots=update_snapshots,
                                snapshot_dir=sdir,
-                               snapshot_stem=Path(script).stem)
+                               snapshot_stem=stem,
+                               variant=variant)
         return _ok(result)
     except Exception as exc:
         return _fail(exc)

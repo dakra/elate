@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **Variants — named sets of co-varying bindings** (scenario `"variants"`
+  block, `run --variant NAME`, `matrix --variant n1,n2`, MCP
+  `elate_run_script(variant=...)`): independent `--param` axes cross every
+  value with every other, which cannot express "this shell needs its
+  interpreter *and* its echo alias *and* its setup snippet to change as one
+  unit". A `"variants"` block declares named binding sets; `matrix` runs
+  every declared variant by default (crossed with the Emacs axis and any
+  `--param` axes; the combo `axes` carry `"variant"`, snapshot stems get
+  `+variant-<name>`), and `run --variant` picks one. Precedence per
+  variable: `params` default < variant binding < `--set`. `{{variant}}`
+  implicitly binds the active name; the name `variant` is reserved. Unknown
+  names, never-referenced variant bindings, and `--param` axes colliding
+  with a variant-bound variable are all loud errors before anything boots.
+
 ## 0.11.0
 
 A scenario run can now report *what does not work* — every check, not just the

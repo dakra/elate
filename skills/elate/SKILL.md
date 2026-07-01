@@ -265,7 +265,10 @@ what does **not** work: `--keep-going` runs every step; a step marked
 flips to a run-failing `xpass` if it starts passing); a `{"group": "dw"}`
 marker names verdicts (`dw: PASS · u: XFAIL`); `--format junit`/`tap`
 emits CI-ready output; and `{{var}}` + `--set` / `matrix --param` drive
-one scenario across many shells/configs. `--keep`/`--keep-on-failure`
+one scenario across many shells/configs. When several variables must move
+together (a shell + its aliases + its setup snippet), declare a
+`"variants"` block of named binding sets: `matrix` runs every variant by
+default, `run --variant NAME` picks one. `--keep`/`--keep-on-failure`
 keep the session for inspection. Scenario format, every step and
 assertion kind: see [SCRIPTING.md](SCRIPTING.md).
 

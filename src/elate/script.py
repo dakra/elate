@@ -40,6 +40,16 @@ string value is substituted before validation, and `--set NAME=VALUE`
 (matrix: `--param`) overrides a default -- so one scenario drives N shells
 (an unknown {{var}} is a loud error).
 
+A "variants" block declares NAMED binding sets that move together (a
+nushell config needs its shell, its echo alias, and its setup snippet to
+change as one), e.g. {"variants": {"bash": {"shell": "/bin/bash"},
+"nu": {"shell": "/usr/bin/nu", "setup": "def e ..."}}}. `run --variant
+NAME` overlays one set on the params defaults ({{variant}} binds the
+active name, "" when none is selected); `matrix` runs every declared
+variant by default, crossed with the Emacs axis and any --param axes.
+Precedence per variable: params default < variant binding < --set. The
+name "variant" is reserved for the implicit binding.
+
 Relative paths in a script (session load/init_file, test load_files,
 lint files, screenshot output) resolve against the script file's
 directory, so a script can live next to the package it tests and run
@@ -190,18 +200,63 @@ def template_vars(node: Any) -> set[str]:
     return names
 
 
-def render_script(raw: Any, overrides: dict[str, str]) -> dict[str, Any]:
+def declared_variants(raw: Any) -> dict[str, dict[str, str]]:
+    """Validate and return the scenario's "variants" block ({} if absent).
+
+    A variant is a NAMED set of {{var}} bindings that co-vary (one shell's
+    interpreter + echo alias + setup snippet move together, which
+    independent --param axes cannot express). Names are restricted to the
+    same charset as session names and capped: they become CLI tokens
+    (--variant n1,n2 splits on commas), snapshot-stem components
+    (+variant-<name>) and axis values, so no downstream sanitization is
+    ever needed.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    block = raw.get("variants")
+    if block is None:
+        return {}
+    if not isinstance(block, dict) or not block:
+        raise ElateError(
+            'script "variants" must be a non-empty object of '
+            "name -> {var -> value}")
+    for name, bindings in block.items():
+        if not (isinstance(name, str) and len(name) <= 32
+                and _SANE_NAME_RE.match(name)):
+            raise ElateError(
+                f"variant name {name!r} must be alphanumeric with ._- "
+                "(no commas/spaces; max 32 chars) -- it becomes a CLI "
+                "token and a snapshot-stem component")
+        if not (isinstance(bindings, dict) and all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in bindings.items())):
+            raise ElateError(
+                f'variant {name!r} must be an object of string -> string')
+        if "variant" in bindings:
+            raise ElateError(
+                f"variant {name!r} binds 'variant', which is reserved: "
+                "{{variant}} is bound implicitly to the active variant name")
+    return block
+
+
+def render_script(raw: Any, overrides: dict[str, str],
+                  variant: str | None = None) -> dict[str, Any]:
     """Apply {{var}} templating to a raw scenario dict; return the result.
 
-    Bindings are the scenario's own "params" block (defaults) overlaid with
-    OVERRIDES (CLI --set, matrix --param). The "params" block is consumed
-    (not templated, and dropped from the result). An unknown {{var}} is a
-    loud error before anything boots. Called once per matrix combo, so it
-    must not mutate RAW.
+    Bindings are the scenario's own "params" block (defaults), overlaid
+    with the VARIANT's binding set from the "variants" block, the implicit
+    "variant" -> active-name binding (present whenever a variants block is
+    declared; "" when none is selected), then OVERRIDES (CLI --set /
+    --set-file, matrix --param). The "params" and "variants" blocks are
+    consumed (not templated, and dropped from the result). An unknown
+    {{var}} or variant name is a loud error before anything boots. Called
+    once per matrix combo, so it must not mutate RAW.
     """
     if not isinstance(raw, dict):
         raise ElateError('a script must be a JSON object with a "steps" list')
+    variants = declared_variants(raw)
     raw = dict(raw)
+    raw.pop("variants", None)
     params = raw.pop("params", None)
     bindings: dict[str, str] = {}
     if params is not None:
@@ -210,14 +265,38 @@ def render_script(raw: Any, overrides: dict[str, str]) -> dict[str, Any]:
                 for k, v in params.items())):
             raise ElateError(
                 'script "params" must be an object of string -> string')
+        if "variant" in params:
+            raise ElateError(
+                "params key 'variant' is reserved: {{variant}} is bound "
+                "implicitly to the active variant name (select one with "
+                "--variant)")
         bindings.update(params)
+    if variant is not None:
+        if not variants:
+            raise ElateError(
+                f"variant {variant!r} selected but the scenario declares "
+                'no "variants" block')
+        if variant not in variants:
+            raise ElateError(
+                f"unknown variant {variant!r}; the scenario declares "
+                f"{sorted(variants)}")
+        bindings.update(variants[variant])
+    if variants:
+        bindings["variant"] = variant or ""
+    if "variant" in overrides:
+        raise ElateError(
+            "'variant' cannot be bound directly (--set/--param/params): it "
+            "is reserved for the active variant name; select a variant "
+            "with --variant instead")
     bindings.update(overrides)
     missing: set[str] = set()
     rendered = _substitute(raw, bindings, missing)
     if missing:
+        hint = ('"params"/"variants" block' if variants
+                else '"params" block')
         raise ElateError(
-            f"unknown template variable(s) {sorted(missing)}: define them in a "
-            '"params" block, or pass --set NAME=VALUE (matrix: --param)')
+            f"unknown template variable(s) {sorted(missing)}: define them in "
+            f"a {hint}, or pass --set NAME=VALUE (matrix: --param)")
     return rendered
 
 
@@ -237,16 +316,18 @@ def load_raw(path: str | Path) -> tuple[Any, Path]:
 
 
 def load_script(path: str | Path,
-                overrides: dict[str, str] | None = None
+                overrides: dict[str, str] | None = None,
+                variant: str | None = None,
                 ) -> tuple[dict[str, Any], Path]:
     """Read, template, and validate a scenario file; return (script, base_dir).
 
-    OVERRIDES bind {{var}} templates (over any scenario "params" defaults).
+    OVERRIDES bind {{var}} templates (over any scenario "params" defaults);
+    VARIANT selects one named "variants" binding set (between the two).
     BASE_DIR is the script file's directory: relative paths inside the
     script resolve against it.
     """
     raw, base = load_raw(path)
-    script = render_script(raw, overrides or {})
+    script = render_script(raw, overrides or {}, variant=variant)
     validate_script(script)
     return script, base
 
@@ -681,6 +762,7 @@ def run_script(
     update_snapshots: bool = False,
     snapshot_dir: Path | None = None,
     snapshot_stem: str | None = None,
+    variant: str | None = None,
 ) -> dict[str, Any]:
     """Execute SCRIPT; return the structured run result.
 
@@ -702,7 +784,8 @@ def run_script(
     KEEP_GOING or "optional" (a blown global budget is not a step
     outcome). ON_STEP is called with each step record as it completes (for
     streaming output). ORIGIN tags the transcript's run-script events
-    (e.g. "mcp") for forensics.
+    (e.g. "mcp") for forensics. VARIANT names the "variants" entry the
+    script was rendered with; it tags the result.
     """
     validate_script(script)
     if session is not None and emacs:
@@ -722,6 +805,7 @@ def run_script(
 
     result: dict[str, Any] = {
         "name": script.get("name"),
+        **({"variant": variant} if variant else {}),
         "session": sess.name,
         "session_dir": sess.session_dir,
         "fresh_session": fresh,

@@ -914,6 +914,33 @@ def test_run_script_tool(elate_home: str, tmp_path) -> None:
     with_client(elate_home, fn)
 
 
+def test_run_script_variant_tool(elate_home: str, tmp_path) -> None:
+    path = tmp_path / "mcp-var.json"
+    path.write_text(json.dumps({
+        "variants": {"good": {"expr": "(= 1 1)"}, "bad": {"expr": "(= 1 2)"}},
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"assert": {"eval": "{{expr}}"}}],
+    }), encoding="utf-8")
+
+    async def fn(cs: ClientSession) -> None:
+        # The variant's binding reaches the step and the result is tagged.
+        out = await call(cs, "elate_run_script",
+                         {"script": str(path), "variant": "good"})
+        assert out["ok"] is True and out["success"] is True
+        assert out["variant"] == "good"
+        out = await call(cs, "elate_run_script",
+                         {"script": str(path), "variant": "bad"})
+        assert out["ok"] is True and out["success"] is False
+        # An unknown variant cannot run at all: flat ok=false listing the
+        # declared names, no session boots.
+        out = await call(cs, "elate_run_script",
+                         {"script": str(path), "variant": "nope"})
+        assert out["ok"] is False and "unknown variant" in out["error"]
+        assert "good" in out["error"] and "bad" in out["error"]
+
+    with_client(elate_home, fn)
+
+
 def test_record_tool(elate_home: str, mcp_session: dict[str, Any],
                      tmp_path) -> None:
     cast = tmp_path / "mcp.cast"

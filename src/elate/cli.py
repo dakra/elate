@@ -656,6 +656,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="bind a {{NAME}} template variable in the scenario "
                          "(repeatable); overrides a scenario \"params\" "
                          "default, so one scenario can drive many configs")
+    sp.add_argument("--variant", metavar="NAME",
+                    help="select one entry of the scenario's \"variants\" "
+                         "block: its bindings overlay the \"params\" defaults "
+                         "as a set ({{variant}} binds the name; --set still "
+                         "wins per variable). `matrix` runs every variant.")
     sp.add_argument("--format", choices=("json", "human", "junit", "tap"),
                     help="output format: 'human' (default when not piped) a "
                          "summary + per-group verdicts, 'json' the full "
@@ -714,14 +719,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "matrix",
-        help="run a scenario across Emacs binaries and parameter axes",
+        help="run a scenario across Emacs binaries, variants, and parameter "
+             "axes",
         description="Run SCRIPT once per combination of the Emacs binary "
-                    "axis and any --param axes (their Cartesian product), "
-                    "each in a fresh session, and aggregate the verdicts "
-                    "into one grid. Each --param NAME=v1,v2 binds the "
-                    "scenario's {{NAME}} template per combo, so one file "
-                    "drives many shells/configs x Emacs versions. Exits 0 "
-                    "only when every combo passed (xfail honored).")
+                    "axis, the scenario's \"variants\" (every declared "
+                    "variant by default; a variant is a NAMED set of "
+                    "co-varying {{var}} bindings), and any --param axes -- "
+                    "their Cartesian product -- each in a fresh session, "
+                    "and aggregate the verdicts into one grid. Each --param "
+                    "NAME=v1,v2 binds the scenario's {{NAME}} template per "
+                    "combo, so one file drives many shells/configs x Emacs "
+                    "versions. Exits 0 only when every combo passed (xfail "
+                    "honored).")
     sp.add_argument("--emacs", action="append", default=[], metavar="PATHS",
                     help="emacs binary, or comma-separated list (repeatable)")
     sp.add_argument("--emacs-glob", metavar="GLOB",
@@ -731,6 +740,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="a parameter axis: bind {{NAME}} to each "
                          "comma-separated value in turn (repeatable; every "
                          "axis is crossed with the Emacs axis)")
+    sp.add_argument("--variant", action="append", default=[], metavar="NAMES",
+                    help="filter the variant axis to these \"variants\" "
+                         "entries (comma-separated, repeatable); default: "
+                         "every declared variant")
     sp.add_argument("--format", choices=("json", "human"),
                     help="output format: 'human' (default) the grid, 'json' "
                          "the structured results. Overrides --json/--human.")
@@ -1956,7 +1969,8 @@ def cmd_run(args: argparse.Namespace) -> Result:
         # A name is only meaningful for a session that survives the run;
         # otherwise it just leaves a non-run-* leftover on failure.
         raise ElateError("--name requires --keep (it names the kept session)")
-    script, base = SC.load_script(args.script, dict(args.set_vars))
+    script, base = SC.load_script(args.script, dict(args.set_vars),
+                                  variant=args.variant)
     target = None
     if args.session:
         target = S.load_session(args.session)
@@ -1983,7 +1997,11 @@ def cmd_run(args: argparse.Namespace) -> Result:
         update_snapshots=args.update_snapshots,
         snapshot_dir=(base / Path(args.snapshot_dir).expanduser()
                       if args.snapshot_dir else None),
-        snapshot_stem=Path(args.script).stem,
+        # Fold the variant into the stem so `--variant a --update-snapshots`
+        # and `--variant b` never share goldens (matches matrix's stems).
+        snapshot_stem=Path(args.script).stem
+        + (f"+variant-{args.variant}" if args.variant else ""),
+        variant=args.variant,
     )
     if fmt == "junit":
         text = _format_junit(result)
@@ -2135,6 +2153,11 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
             raise ElateError(
                 "--param 'emacs' is reserved (the Emacs binary is its own "
                 "axis; use --emacs / --emacs-glob)")
+        if name == "variant":
+            raise ElateError(
+                "--param 'variant' is reserved (variants are their own "
+                'axis; declare a "variants" block in the scenario and '
+                "filter with --variant)")
         if name in axes:
             raise ElateError(f"--param {name!r} given more than once")
         values = [v for v in (s.strip() for s in vals.split(",")) if v]
@@ -2147,41 +2170,98 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
         raise ElateError('a script must be a JSON object with a "steps" list')
     total = len(raw.get("steps") or [])
 
+    # The variant axis: every declared "variants" entry by default (the
+    # whole point is "one file, one command, out pops the grid");
+    # --variant filters. [None] when the scenario declares none.
+    variants = SC.declared_variants(raw)
+    selected: list[str] = []
+    for spec in args.variant:
+        selected.extend(v for v in (s.strip() for s in spec.split(",")) if v)
+    if selected:
+        if not variants:
+            raise ElateError(
+                '--variant given but the scenario declares no "variants" '
+                "block")
+        unknown_v = [n for n in selected if n not in variants]
+        if unknown_v:
+            raise ElateError(
+                f"unknown --variant name(s) {unknown_v}; the scenario "
+                f"declares {sorted(variants)}")
+        if len(set(selected)) != len(selected):
+            dup = sorted({n for n in selected if selected.count(n) > 1})
+            raise ElateError(f"--variant name(s) {dup} given more than once")
+    variant_axis: list[str | None] = list(selected or variants) or [None]
+
     # An axis the scenario never references is almost certainly a mistake (a
     # typo'd name, or a spurious axis silently multiplying the run). A
-    # deliberate "repeat" axis can reference {{name}} in a comment.
+    # deliberate "repeat" axis can reference {{name}} in a comment. The
+    # same goes for a variant binding a never-referenced variable.
     referenced = SC.template_vars({k: v for k, v in raw.items()
-                                   if k != "params"})
+                                   if k not in ("params", "variants")})
     unused = [n for n in axes if n not in referenced]
     if unused:
         raise ElateError(
             f"--param axis/axes {sorted(unused)} are never referenced by a "
             "{{name}} template in the scenario")
+    for vname in variant_axis:
+        if vname is None:
+            continue
+        dead = [k for k in variants[vname] if k not in referenced]
+        if dead:
+            raise ElateError(
+                f"variant {vname!r} binds {dead} never referenced by a "
+                "{{name}} template in the scenario")
+        # A --param axis crossing a variant-bound variable would silently
+        # mask that binding in EVERY variant (documented precedence),
+        # making the variant columns identical -- loud, never silent.
+        clash = [n for n in axes if n in variants[vname]]
+        if clash:
+            raise ElateError(
+                f"--param axis/axes {clash} collide with binding(s) of "
+                f"variant {vname!r}: a variant's bindings co-vary -- drop "
+                "the --param axis or the variant key")
 
     axis_names = list(axes)
-    combos: list[tuple[str, dict[str, str]]] = []
-    for point in itertools.product(uniq, *(axes[n] for n in axis_names)):
-        params = {n: point[i + 1] for i, n in enumerate(axis_names)}
-        combos.append((point[0], params))
+    combos: list[tuple[str, str | None, dict[str, str]]] = []
+    for point in itertools.product(uniq, variant_axis,
+                                   *(axes[n] for n in axis_names)):
+        params = {n: point[i + 2] for i, n in enumerate(axis_names)}
+        combos.append((point[0], point[1], params))
 
-    # Fail once, up front, on a combo-independent template/params error (an
-    # unknown {{var}} depends only on the axis NAMES, identical across
-    # combos) instead of the same error N times.
+    # Fail once per VARIANT, up front, on a combo-independent
+    # template/params error (an unknown {{var}} depends only on the axis
+    # NAMES plus the variant's binding keys, identical across that
+    # variant's combos) instead of the same error N times.
     if combos:
-        SC.render_script(raw, combos[0][1])
+        first_params = {n: axes[n][0] for n in axis_names}
+        for vname in variant_axis:
+            SC.render_script(raw, first_params, variant=vname)
 
-    # Snapshot stems fold in the param combo (the Emacs axis is separated by
-    # @<version> in the filename). _safe_param is lossy, so two distinct
-    # param combos can sanitize to the same suffix -- disambiguate only the
-    # ones that actually collide with a short hash, keeping clean stems for
-    # the common (no-collision) case, including no params at all.
+    # Snapshot stems fold in the variant + param combo (the Emacs axis is
+    # separated by @<version> in the filename). _safe_param is lossy, so two
+    # distinct param combos can sanitize to the same suffix -- disambiguate
+    # only the ones that actually collide with a short hash, keeping clean
+    # stems for the common (no-collision) case, including no params at all.
+    # The variant rides the same machinery as a pseudo-param ("variant" is
+    # reserved, so it can never clash with a real axis), yielding
+    # "+variant-nu". The name goes in verbatim, NOT through _safe_param:
+    # its charset is already filename-safe by construction, and _safe_param's
+    # edge-stripping would make a name like "nu-" produce a stem that `run
+    # --variant nu-` (which appends the name verbatim) could never match.
     import hashlib
     from collections import Counter
+
+    def combo_key(vname: str | None,
+                  params: dict[str, str]) -> tuple[tuple[str, str], ...]:
+        merged = {**params, **({"variant": vname} if vname else {})}
+        return tuple(sorted(merged.items()))
+
     raw_suffix: dict[tuple, str] = {}
-    for _, params in combos:
-        key = tuple(sorted(params.items()))
+    for _, vname, params in combos:
+        key = combo_key(vname, params)
         raw_suffix.setdefault(key, "".join(
-            f"+{k}-{_safe_param(v)}" for k, v in key))
+            f"+{k}-{v if k == 'variant' else _safe_param(v)}"
+            for k, v in key))
     dupes = Counter(raw_suffix.values())
     suffix = {
         key: (suf + "-" + hashlib.sha1(repr(key).encode()).hexdigest()[:6]
@@ -2203,16 +2283,20 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
 
     base_stem = Path(args.script).stem
     results: list[dict[str, Any]] = []
-    for emacs_bin, params in combos:
+    for emacs_bin, vname, params in combos:
+        # The variant leads in labels/axes: it names the whole binding set
+        # the params merely refine.
+        shown = {**({"variant": vname} if vname else {}), **params}
         if stream:
-            print(f"=== {_matrix_label(emacs_bin, params)} ===", flush=True)
-        stem = base_stem + suffix[tuple(sorted(params.items()))]
-        axes_out = {"emacs": emacs_bin, **params}
+            print(f"=== {_matrix_label(emacs_bin, shown)} ===", flush=True)
+        stem = base_stem + suffix[combo_key(vname, params)]
+        axes_out = {"emacs": emacs_bin, **shown}
         try:
-            rendered = SC.render_script(raw, params)
+            rendered = SC.render_script(raw, params, variant=vname)
             run = SC.run_script(
                 rendered, base_dir=base, emacs=emacs_bin, on_step=on_step,
                 purge=True,  # purge a passing combo; failed combos are kept
+                variant=vname,
                 update_snapshots=args.update_snapshots,
                 snapshot_dir=(base / Path(args.snapshot_dir).expanduser()
                               if args.snapshot_dir else None),
@@ -2256,7 +2340,8 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
             lines.append(f"    failed at: {r['failed_step']}")
     lines.append(f"{passed}/{len(results)} combo(s) passed")
     return ({"success": success, "script": args.script,
-             "axes": axis_names, "results": results},
+             "axes": (["variant"] if variants else []) + axis_names,
+             "results": results},
             "\n".join(lines), 0 if success else 1)
 
 

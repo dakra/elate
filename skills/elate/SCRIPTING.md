@@ -98,6 +98,38 @@ string and fails number validation.
  "steps": [{"send_process": "{{shell}} --version\n"}]}
 ```
 
+### Variants: named sets of co-varying bindings
+
+Independent `--param` axes cross every value with every other — wrong when
+several variables must move **together** (nushell needs its shell path *and*
+its echo alias *and* a setup snippet as one unit). A top-level `"variants"`
+block declares named binding sets:
+
+```json
+{"params": {"setup": ""},
+ "variants": {
+   "bash": {"shell": "/bin/bash", "echo": "echo"},
+   "nu":   {"shell": "/usr/bin/nu", "echo": "e",
+            "setup": "def e [...rest] { print ($rest | str join ' ') }"}},
+ "steps": [{"send_process": "{{setup}}\n"}]}
+```
+
+- `elate run scenario.json --variant nu` overlays one set on the `params`
+  defaults. Precedence per variable: `params` default < variant binding <
+  `--set`.
+- `elate matrix scenario.json` runs **every declared variant** (crossed with
+  the Emacs axis and any `--param` axes); `--variant nu,fish` filters. The
+  per-combo `axes` carry `"variant": "nu"`, and snapshot stems get
+  `+variant-nu`, so per-variant goldens never collide.
+- `{{variant}}` implicitly binds the active variant name (`""` when the
+  scenario declares variants but none is selected). The name `variant` is
+  reserved — it cannot be bound by `params`, a variant, `--set`, or
+  `--param`.
+- Loud, never silent: an unknown `--variant` name is always an error, and
+  `matrix` additionally rejects a variant binding a variable no template
+  references and a `--param` axis colliding with a variant-bound variable —
+  all before anything boots.
+
 ## Steps — exactly one verb per step
 
 Timeouts are numbers in `(0, 600]` seconds.

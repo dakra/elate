@@ -375,6 +375,62 @@ def test_render_script_templating() -> None:
         SC.render_script({"steps": [{"eval": "{{my-var}}"}]}, {})
 
 
+def test_declared_variants_validation() -> None:
+    ok = {"variants": {"a": {"x": "1"}, "b.2-c": {"x": "2", "y": ""}},
+          "steps": []}
+    assert SC.declared_variants(ok) == ok["variants"]
+    assert SC.declared_variants({"steps": []}) == {}      # absent -> {}
+    assert SC.declared_variants("not a dict") == {}       # render errors later
+    cases = [
+        ({"variants": []}, "non-empty object"),           # wrong type
+        ({"variants": {}}, "non-empty object"),           # empty block = typo
+        ({"variants": {"has space": {}}}, "alphanumeric"),
+        ({"variants": {"-lead": {}}}, "alphanumeric"),
+        ({"variants": {"z" * 33: {}}}, "max 32"),
+        ({"variants": {"a": "x"}}, "string -> string"),
+        ({"variants": {"a": {"x": 1}}}, "string -> string"),
+        ({"variants": {"a": {"variant": "x"}}}, "reserved"),
+    ]
+    for raw, msg in cases:
+        with pytest.raises(ElateError, match=msg):
+            SC.declared_variants(raw)
+
+
+def test_render_script_variant_bindings() -> None:
+    raw = {"name": "on-{{variant}}",
+           "params": {"x": "default", "y": "Y"},
+           "variants": {"a": {"x": "ax"}, "b": {"x": "bx", "y": "by"}},
+           "steps": [{"eval": "{{x}}/{{y}}"}]}
+    # Precedence: params default < variant binding < override.
+    r = SC.render_script(raw, {}, variant="a")
+    assert r["steps"][0]["eval"] == "ax/Y"
+    assert r["name"] == "on-a"                        # implicit {{variant}}
+    assert "variants" not in r and "params" not in r  # both consumed
+    r = SC.render_script(raw, {"x": "over"}, variant="b")
+    assert r["steps"][0]["eval"] == "over/by"         # --set wins per variable
+    # No selection: params defaults only, {{variant}} binds "".
+    r = SC.render_script(raw, {})
+    assert r["steps"][0]["eval"] == "default/Y" and r["name"] == "on-"
+    assert raw["name"] == "on-{{variant}}"            # did not mutate the input
+    # {{variant}} without a variants block is an unknown var like any other.
+    with pytest.raises(ElateError, match="unknown template variable"):
+        SC.render_script({"steps": [{"eval": "{{variant}}"}]}, {})
+    # Loud errors: unknown name (listing the declared ones), a selection
+    # without a block, and any attempt to bind the reserved name directly.
+    with pytest.raises(ElateError, match=r"unknown variant 'c'.*'a', 'b'"):
+        SC.render_script(raw, {}, variant="c")
+    with pytest.raises(ElateError, match='no "variants" block'):
+        SC.render_script({"steps": []}, {}, variant="a")
+    with pytest.raises(ElateError, match="reserved"):
+        SC.render_script(raw, {"variant": "x"})
+    with pytest.raises(ElateError, match="reserved"):
+        SC.render_script({"params": {"variant": "x"}, "steps": []}, {})
+    # The missing-var hint mentions variants when a block is declared.
+    with pytest.raises(ElateError, match='"params"/"variants" block'):
+        SC.render_script({"variants": {"a": {"x": "1"}},
+                          "steps": [{"eval": "{{nope}}"}]}, {})
+
+
 def test_step_timeout_resolution() -> None:
     # step timeout > scenario default > per-verb builtin.
     assert SC._step_timeout({}, "keys", {}) == SC._DEFAULT_TIMEOUTS["keys"]
@@ -1829,4 +1885,162 @@ def test_matrix_wrapper_binary_and_broken_binary(
     assert wrapper_entry["emacs"] == str(wrapper)
     assert wrapper_entry["success"] is True
     assert wrapper_entry["version"]
+    assert running_run_sessions() == []
+
+
+VARIANT_SCRIPT = {
+    "variants": {"good": {"expr": "(= 1 1)"}, "bad": {"expr": "(= 1 2)"}},
+    "session": {"config": "bare", "size": "80x24"},
+    "steps": [{"assert": {"eval": "{{expr}}"}}],
+}
+
+
+def test_run_variant_cli(elate_home: str, tmp_path: Path,
+                         capsys: pytest.CaptureFixture[str]) -> None:
+    path = write_script(tmp_path, {
+        "params": {"expr": "(= 2 2)"}, **VARIANT_SCRIPT}, "var.json")
+    code = cli.main(["--json", "run", "--variant", "good", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    assert out["variant"] == "good"        # the result names its variant
+    # No selection: params defaults only, and no "variant" result key.
+    code = cli.main(["--json", "run", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and "variant" not in out
+    # The "bad" variant's binding actually reaches the step.
+    code = cli.main(["--json", "run", "--variant", "bad", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["variant"] == "bad" and out["failed"] == 1
+    # An unknown name is loud and lists the declared ones (no boot).
+    code = cli.main(["--json", "run", "--variant", "nope", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "unknown variant" in out["error"]
+    assert "good" in out["error"] and "bad" in out["error"]
+    assert running_run_sessions() == []
+
+
+def test_matrix_variant_axis(elate_home: str, tmp_path: Path,
+                             capsys: pytest.CaptureFixture[str]) -> None:
+    emacs = shutil.which("emacs")
+    path = write_script(tmp_path, dict(VARIANT_SCRIPT), "vmatrix.json")
+    # Every declared variant runs by default: 1 emacs x 2 variants.
+    code = cli.main(["--json", "matrix", "--emacs", emacs, "--", path])
+    out = json.loads(capsys.readouterr().out)
+    assert out["axes"] == ["variant"]
+    assert len(out["results"]) == 2
+    by_v = {r["axes"]["variant"]: r for r in out["results"]}
+    assert by_v["good"]["success"] is True
+    assert by_v["bad"]["success"] is False          # (= 1 2)
+    assert code == 1 and out["success"] is False
+    # --variant filters the axis.
+    code = cli.main(["--json", "matrix", "--emacs", emacs,
+                     "--variant", "good", "--", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    assert [r["axes"]["variant"] for r in out["results"]] == ["good"]
+    assert running_run_sessions() == []
+    # Guards, all firing before any session boots:
+    for argv, msg in [
+        (["--variant", "nope"], "unknown --variant"),
+        (["--variant", "good,good"], "more than once"),
+        (["--param", "variant=x"], "reserved"),
+        # A --param axis crossing a variant-bound variable is loud.
+        (["--param", "expr=1,2"], "co-vary"),
+    ]:
+        code = cli.main(["--json", "matrix", "--emacs", emacs, *argv, path])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 1 and msg in out["error"], (argv, out)
+    # --variant against a scenario with no variants block is loud too.
+    plain = write_script(tmp_path, {
+        "session": {"config": "bare"},
+        "steps": [{"comment": "hi"}],
+    }, "novar.json")
+    code = cli.main(["--json", "matrix", "--emacs", emacs,
+                     "--variant", "good", plain])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and 'no "variants"' in out["error"]
+
+
+def test_matrix_variant_unused_binding_guard(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # A variant binding a variable the scenario never references is a loud
+    # error naming both (mirrors the unused --param axis check); no boot.
+    emacs = shutil.which("emacs")
+    path = write_script(tmp_path, {
+        "variants": {"a": {"expr": "1", "dead": "x"}},
+        "session": {"config": "bare"},
+        "steps": [{"assert": {"eval": "{{expr}}"}}],
+    }, "vdead.json")
+    code = cli.main(["--json", "matrix", "--emacs", emacs, path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert "'a'" in out["error"] and "dead" in out["error"]
+    assert "never referenced" in out["error"]
+
+
+def test_matrix_variant_snapshot_stem(elate_home: str, tmp_path: Path,
+                                      capsys: pytest.CaptureFixture[str]) -> None:
+    # Each variant gets its own golden directory (+variant-<name>), so
+    # per-variant snapshots never collide -- and `run --variant` writes to
+    # the same stem matrix uses for that combo. The "b-" name pins that
+    # the suffix takes the name VERBATIM (not through _safe_param, whose
+    # edge-stripping would yield "b" and break run/matrix golden sharing).
+    emacs = shutil.which("emacs")
+    snapdir = tmp_path / "snaps"
+    path = write_script(tmp_path, {
+        "variants": {"a": {"text": "aa"}, "b-": {"text": "bb"}},
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"eval": '(progn (switch-to-buffer "*scratch*") (erase-buffer) '
+                     '(insert "{{text}}"))'},
+            {"assert": {"snapshot": "buf"}},
+        ],
+    }, "vsnap.json")
+    code = cli.main(["--json", "matrix", "--emacs", emacs,
+                     "--snapshot-dir", str(snapdir), "--update-snapshots",
+                     "--", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    stems = sorted(d.name for d in snapdir.iterdir() if d.is_dir())
+    assert stems == ["vsnap+variant-a", "vsnap+variant-b-"]
+    # A plain run of one variant COMPARES against the matrix-written golden
+    # (same stem), proving the two surfaces share goldens per variant.
+    for vname in ("a", "b-"):
+        code = cli.main(["--json", "run", "--variant", vname,
+                         "--snapshot-dir", str(snapdir), path])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 0, out
+    assert running_run_sessions() == []
+
+
+def test_matrix_variant_param_cross(elate_home: str, tmp_path: Path,
+                                    capsys: pytest.CaptureFixture[str]) -> None:
+    # The variant axis crosses with --param axes: 2 variants x 2 param
+    # values = 4 combos, each carrying both in its axes, and the snapshot
+    # stem folds both in (sorted key order: +p-...+variant-...).
+    emacs = shutil.which("emacs")
+    snapdir = tmp_path / "snaps"
+    path = write_script(tmp_path, {
+        "variants": {"a": {"text": "aa"}, "b": {"text": "bb"}},
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [
+            {"eval": '(progn (switch-to-buffer "*scratch*") (erase-buffer) '
+                     '(insert "{{text}}-{{p}}"))'},
+            {"assert": {"snapshot": "buf"}},
+        ],
+    }, "vcross.json")
+    code = cli.main(["--json", "matrix", "--emacs", emacs,
+                     "--param", "p=x,y",
+                     "--snapshot-dir", str(snapdir), "--update-snapshots",
+                     "--", path])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    assert out["axes"] == ["variant", "p"]      # variant leads the axis list
+    assert len(out["results"]) == 4             # full Cartesian product
+    seen = {(r["axes"]["variant"], r["axes"]["p"]) for r in out["results"]}
+    assert seen == {("a", "x"), ("a", "y"), ("b", "x"), ("b", "y")}
+    stems = sorted(d.name for d in snapdir.iterdir() if d.is_dir())
+    assert stems == ["vcross+p-x+variant-a", "vcross+p-x+variant-b",
+                     "vcross+p-y+variant-a", "vcross+p-y+variant-b"]
     assert running_run_sessions() == []

@@ -636,7 +636,10 @@ Runs the scenario once per combination of the Emacs-binary axis and any
 session, and prints one grid (`--json` for the structured per-combo
 results, including the detected `version`, the combo `axes`, and the
 first failed step). Each `--param` binds the scenario's `{{NAME}}` template
-per combo (see "Templating" under scenario scripts). Exit `0` only when
+per combo (see "Templating" under scenario scripts); when several
+variables must move together, a scenario's `"variants"` block declares
+named binding sets and `matrix` runs every one by default (`--variant`
+filters, `run --variant NAME` picks one). Exit `0` only when
 every combo passed — a step marked `expect: "fail"` reports `xfail` and
 does not gate, so a known-broken check need not be deleted to stay green.
 Binaries are checked up front, and one broken combo does not abort the
