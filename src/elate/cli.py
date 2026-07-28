@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, NoReturn
@@ -894,16 +895,19 @@ def build_parser() -> argparse.ArgumentParser:
                     "coding harnesses so they learn to drive the elate CLI. "
                     "Targets: " + ", ".join(install.HARNESS_KEYS) + " (or "
                     "'all'). With no target, installs for every harness "
-                    "detected on this machine. The skill is the CLI-centric "
-                    "integration that works everywhere; --mcp additionally "
-                    "registers the optional MCP server where it is supported.")
+                    "detected on this machine. By default the skill lands in "
+                    "the current project's skills dirs (e.g. .claude/skills); "
+                    "--global installs user-wide instead. The skill is the "
+                    "CLI-centric integration that works everywhere; --mcp "
+                    "additionally registers the optional MCP server where it "
+                    "is supported.")
     sp.add_argument("harness", nargs="*", metavar="HARNESS",
                     help="harness(es) to install for: "
                          + " ".join(install.HARNESS_KEYS) + " or 'all' "
                          "(default: auto-detect)")
-    sp.add_argument("--project", action="store_true",
-                    help="install into the current project's skills dir "
-                         "(e.g. .claude/skills) instead of the user-global one")
+    sp.add_argument("--global", dest="global_scope", action="store_true",
+                    help="install into the user-global skills dirs (e.g. "
+                         "~/.claude/skills) instead of the current project's")
     sp.add_argument("--mcp", action="store_true",
                     help="also wire the MCP server: `mcp add` where the "
                          "harness has that CLI (Claude Code, Codex), a "
@@ -911,6 +915,21 @@ def build_parser() -> argparse.ArgumentParser:
                          "Antigravity); pi has no MCP")
     sp.add_argument("--dry-run", action="store_true",
                     help="show what would be installed without writing anything")
+
+    sp = sub.add_parser(
+        "update",
+        help="upgrade elate and refresh installed skill copies",
+        description="Upgrade the elate package via whatever installed it "
+                    "(Homebrew, uvx, uv tool, pipx, pip), then rerun `elate "
+                    "install` for every skill copy found on this machine so "
+                    "the copies match the new CLI. Prints the plan and asks "
+                    "before running anything; already-running sessions keep "
+                    "the old in-Emacs agent until restarted.")
+    sp.add_argument("--yes", action="store_true",
+                    help="run without the interactive confirmation "
+                         "(required when stdin is not a terminal)")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="print the plan without executing anything")
 
     return p
 
@@ -1012,6 +1031,9 @@ def cmd_start(args: argparse.Namespace) -> Result:
             info["wm_warning"] = wm_warning
             print(f"elate: WARNING: {wm_warning}", file=sys.stderr)
             human += f"\nWARNING: {wm_warning}"
+    notice = install.staleness_notice()
+    if notice:
+        print(notice, file=sys.stderr)
     return info, human, 0
 
 
@@ -2558,11 +2580,82 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
 def cmd_install(args: argparse.Namespace) -> Result:
     result = install.run_install(
         args.harness,
-        project=args.project,
+        project=not args.global_scope,
         with_mcp=args.mcp,
         dry_run=args.dry_run,
     )
+    for notice in result["notices"]:
+        print(f"elate: {notice}", file=sys.stderr)
     return result, install.format_summary(result), 0
+
+
+def cmd_update(args: argparse.Namespace) -> Result:
+    channel = install.install_channel()
+    steps = install.update_steps(channel)
+    for step in steps:
+        step["pretty"] = " ".join(shlex.quote(word) for word in step["cmd"])
+    plan = "\n".join(
+        [f"update plan (installed via {channel}):"]
+        + [f"  $ {s['pretty']}"
+           + (f"   (in {s['cwd']})" if s.get("cwd") else "")
+           for s in steps])
+    running = [s for s in S.list_sessions() if s["status"] == "running"]
+    if args.dry_run:
+        return ({"channel": channel,
+                 "steps": [{"cmd": s["pretty"], "cwd": s.get("cwd"),
+                            "status": "planned"} for s in steps],
+                 "sessions_running": len(running), "dry_run": True},
+                plan, 0)
+    # The plan goes to stderr (also under --yes, where it is the only
+    # trace of what ran until the steps finish) so a piped stdout stays
+    # clean for the final result.
+    print(plan, file=sys.stderr)
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise UsageError(
+                "elate update runs upgrade commands; confirm with --yes "
+                "(or preview with --dry-run)")
+        # input() echoes its prompt to stdout, so keep it bare and put
+        # the question on stderr too; EOF (^D) declines.
+        print("proceed? [y/N] ", end="", file=sys.stderr, flush=True)
+        try:
+            answer = input()
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            # ok:False here wins over main()'s {"ok": True, **result}
+            # spread -- the declined run must not read as success.
+            return ({"ok": False, "channel": channel, "steps": [],
+                     "aborted": True},
+                    "update aborted", 1)
+    executed: list[dict] = []
+    for step in steps:
+        try:
+            proc = subprocess.run(step["cmd"], capture_output=True,
+                                  text=True, cwd=step.get("cwd"))
+        except OSError as exc:
+            raise ElateError(
+                f"update step failed: {step['pretty']}: {exc}") from exc
+        if proc.returncode != 0:
+            tail = "\n".join(
+                (proc.stderr or proc.stdout or "").strip().splitlines()[-5:])
+            raise ElateError(
+                f"update step failed (exit {proc.returncode}): "
+                f"{step['pretty']}\n{tail}")
+        executed.append({"cmd": step["pretty"], "cwd": step.get("cwd"),
+                         "status": "ok"})
+    human_lines = [f"updated via {channel}:"] + [
+        f"  ✓ {e['cmd']}" for e in executed]
+    if running:
+        human_lines.append(
+            f"{len(running)} running session(s) still use the old in-Emacs "
+            "agent — `elate stop --all` and restart them")
+    human_lines.append(
+        "if `elate mcp` is registered, restart the MCP client to pick up "
+        "the new server")
+    return ({"channel": channel, "steps": executed,
+             "sessions_running": len(running)},
+            "\n".join(human_lines), 0)
 
 
 _COMMANDS = {
@@ -2604,6 +2697,7 @@ _COMMANDS = {
     "snap": cmd_snap,
     "matrix": cmd_matrix,
     "install": cmd_install,
+    "update": cmd_update,
 }
 
 

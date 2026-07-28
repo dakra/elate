@@ -59,6 +59,7 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 - [`elate snap`](#elate-snap)
 - [`elate matrix`](#elate-matrix)
 - [`elate install`](#elate-install)
+- [`elate update`](#elate-update)
 
 ## elate start
 
@@ -463,9 +464,18 @@ Run SCRIPT once per combination of the Emacs binary axis, the scenario's "varian
 
 install the elate skill into AI coding harnesses
 
-Copy elate's Agent Skill (SKILL.md) into one or more AI coding harnesses so they learn to drive the elate CLI. Targets: claude, codex, opencode, pi, antigravity (or 'all'). With no target, installs for every harness detected on this machine. The skill is the CLI-centric integration that works everywhere; --mcp additionally registers the optional MCP server where it is supported.
+Copy elate's Agent Skill (SKILL.md) into one or more AI coding harnesses so they learn to drive the elate CLI. Targets: claude, codex, opencode, pi, antigravity (or 'all'). With no target, installs for every harness detected on this machine. By default the skill lands in the current project's skills dirs (e.g. .claude/skills); --global installs user-wide instead. The skill is the CLI-centric integration that works everywhere; --mcp additionally registers the optional MCP server where it is supported.
 
 - `[HARNESS]` (repeatable) -- harness(es) to install for: claude codex opencode pi antigravity or 'all' (default: auto-detect)
-- `--project` -- install into the current project's skills dir (e.g. .claude/skills) instead of the user-global one
+- `--global` -- install into the user-global skills dirs (e.g. ~/.claude/skills) instead of the current project's
 - `--mcp` -- also wire the MCP server: `mcp add` where the harness has that CLI (Claude Code, Codex), a paste-ready snippet otherwise (opencode, Antigravity); pi has no MCP
 - `--dry-run` -- show what would be installed without writing anything
+
+## elate update
+
+upgrade elate and refresh installed skill copies
+
+Upgrade the elate package via whatever installed it (Homebrew, uvx, uv tool, pipx, pip), then rerun `elate install` for every skill copy found on this machine so the copies match the new CLI. Prints the plan and asks before running anything; already-running sessions keep the old in-Emacs agent until restarted.
+
+- `--yes` -- run without the interactive confirmation (required when stdin is not a terminal)
+- `--dry-run` -- print the plan without executing anything

@@ -1,6 +1,44 @@
 # Changelog
 
-## 0.13.0
+## 0.14.0 (unreleased)
+
+The update story: installed skill copies and the CLI can no longer drift
+apart silently — staleness is detected in both directions, one command
+fixes it, and new installs default to the project so the skill only loads
+where Emacs work actually happens.
+
+- **`elate install` is project-local by default** (`--global` for
+  user-wide): the skill lands in the current project's skills dirs (e.g.
+  `.claude/skills/`), so "drive Emacs" guidance stops leaking into every
+  unrelated project's agent context. Guard rails: running from `$HOME`
+  installs user-global with a notice (project dirs half-collide with
+  global ones there), a directory without any project marker (`.git`,
+  `.claude`, `AGENTS.md`, …) warns but proceeds. Install also preflights
+  `emacs`/`emacsclient`/`tmux` on PATH and warns (non-fatally) about
+  what's missing.
+
+- **Skill content version + staleness notice**: `SKILL.md` now carries a
+  `version:` stamp that bumps only when skill content actually changes
+  (a checked-in hash record enforces the bump). `elate start` compares
+  the bundled skill against every installed copy (global dirs plus
+  project dirs walking up from cwd) and prints a one-line stderr notice
+  per direction: an outdated copy says "rerun `elate install`", a copy
+  *newer* than the CLI (a cloned repo ahead of a cached `uvx` elate)
+  names the exact upgrade command for how elate was installed.
+
+- **`elate update`**: upgrades elate via whatever installed it (Homebrew,
+  uvx, `uv tool`, pipx, pip — detected from `sys.prefix`; the pip
+  fallback runs through the current interpreter so it cannot target a
+  different environment), then reruns `elate install` for every copy it
+  finds — global dirs plus the project dirs above cwd — naming each
+  copy's harness explicitly, so a harness no longer auto-detected still
+  gets its copy refreshed. Symlinked skill dirs are left alone (they
+  track a checkout, not a copy). For `uvx`, upgrade and refresh collapse
+  into `uvx --refresh elate install`. Prints the plan first; `--dry-run`
+  stops there, `--yes` skips the confirmation (and is required when
+  stdin is not a terminal). Afterwards it reports what the upgrade
+  cannot reach: running sessions keep the old in-Emacs agent until
+  restarted, and a registered MCP client needs a restart.
 
 Friction fixes from driving fleets of concurrent agents: input can no
 longer silently target the wrong process, any elisp predicate is now a

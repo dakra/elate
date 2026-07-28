@@ -49,11 +49,13 @@ def _frontmatter() -> tuple[dict[str, str], str]:
     return fields, m.group(2)
 
 
-def test_skill_frontmatter_has_only_name_and_description():
+def test_skill_frontmatter_has_only_known_keys():
     fields, _ = _frontmatter()
-    # The skill format recognizes exactly these two keys; anything else
-    # is silently ignored at best and a validation error at worst.
-    assert set(fields) == {"name", "description"}
+    # name/description are what the skill format recognizes; version is
+    # elate's skill CONTENT version (read by `elate start`'s staleness
+    # check, harnesses ignore it). Anything else is silently ignored at
+    # best and a validation error at worst.
+    assert set(fields) == {"name", "description", "version"}
 
 
 def test_skill_name_constraints():
@@ -78,6 +80,50 @@ def test_skill_description_constraints():
     # instructions to the model, not capability descriptions.
     assert not desc.lower().startswith(("i ", "you ", "use this")), (
         "description should be third person")
+
+
+def _skill_content_hash() -> str:
+    """sha256 over the skill's files: sorted names + bytes."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    for path in sorted(SKILL_DIR.iterdir()):
+        if path.name.startswith("."):
+            continue
+        assert path.is_file(), (
+            f"skill dir grew a non-file entry ({path.name}); extend the "
+            "content hash to cover it")
+        digest.update(path.name.encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def test_skill_content_version_tracks_content():
+    """The frontmatter `version:` must bump whenever skill content changes.
+
+    tests/skill_content_version.txt records `<version> <sha256>` for the
+    current skill files; editing any of them without bumping the version
+    (and refreshing the record) fails here instead of silently shipping a
+    stale staleness stamp.
+    """
+    from elate.install import skill_content_version
+
+    record = (REPO / "tests" / "skill_content_version.txt").read_text(
+        encoding="utf-8").split()
+    assert len(record) == 2, "record must be `<version> <sha256>`"
+    recorded_version, recorded_hash = record
+    fields, _ = _frontmatter()
+    assert fields["version"] == recorded_version, (
+        f"SKILL.md frontmatter version {fields['version']!r} != recorded "
+        f"{recorded_version!r} in tests/skill_content_version.txt")
+    assert skill_content_version(SKILL) is not None, (
+        "SKILL.md `version:` must parse as a dotted int version")
+    actual = _skill_content_hash()
+    assert actual == recorded_hash, (
+        "skill content changed: bump `version:` in SKILL.md frontmatter to "
+        "the next release and update tests/skill_content_version.txt "
+        f"(new hash: {actual})")
 
 
 def test_skill_body_under_500_lines():

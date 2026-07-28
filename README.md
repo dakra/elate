@@ -15,7 +15,27 @@ Emacs packages interactively — the things `emacs --batch` + ERT can't see.
 See `CHANGELOG.md` for what each release added; ready-to-run walkthroughs
 live in [Recipes](#recipes) and `examples/`.
 
+## Quick start
+
+Just go to your project where you want to use elate, and install the skill with:
+
+```sh
+uvx elate install
+```
+
+That's it. Then just ask something like
+
+> Use elate to run my ERT suite and show me what fails.
+
+> Spawn 3 Sonnet elate agents and test all edge cases for our just implemented features.
+
+How it works and every other setup option (`--global`, `--mcp`, the Claude
+Code plugin) is in [Using elate from AI harnesses](#using-elate-from-ai-harnesses).
+
 ## Requirements
+
+elate spawns a real, sandboxed Emacs (fresh fake `$HOME`, generated init),
+so wherever the agent runs it needs:
 
 - Emacs 29+ (for `--init-directory`) and a matching `emacsclient`
 - tmux (TTY sessions)
@@ -26,12 +46,15 @@ live in [Recipes](#recipes) and `examples/`.
 
 ## Install
 
-elate is on PyPI as [`elate`](https://pypi.org/project/elate/):
+`uvx elate …` needs no install step at all — the [Quick start](#quick-start)
+runs on that alone. For a real `elate` on PATH (nicer for your own shell
+use, and version-controlled by you rather than uvx's cache), elate is on
+PyPI as [`elate`](https://pypi.org/project/elate/):
 
 ```sh
-uvx elate --help          # no install — uvx runs it straight from PyPI
-pipx run elate --help     # same, via pipx
-pip install elate         # or install it like any Python package
+uv tool install elate     # a persistent `elate` on PATH
+pip install elate         # or like any Python package
+pipx run elate --help     # or run-without-install via pipx
 ```
 
 Or via [Homebrew](https://brew.sh) (also pulls in `tmux`):
@@ -43,64 +66,15 @@ brew install dakra/tap/elate
 For development, from a checkout:
 
 ```sh
-uv sync          # development
+uv sync
 uv run elate --help
 
 # or as a tool
 uv tool install .
 ```
 
-## Quick start
-
-elate is a CLI — an agent drives it by running `elate …` shell commands, and
-that CLI is the full feature set. Put `elate` on PATH, hand your agent the
-usage guide, then just ask. (elate spawns real Emacs + tmux, so both must be
-installed wherever the agent runs — see [Requirements](#requirements).)
-
-**1. Install the CLI** so it's on PATH — or skip this and let the agent call
-`uvx elate …` / `pipx run elate …` straight off:
-
-```sh
-uv tool install elate     # or: pip install elate
-```
-
-**2. Give your agent the usage guide** — `elate install` copies elate's Agent
-Skill (it teaches the CLI) into each harness's skills directory:
-
-```sh
-elate install                 # auto-detect installed harnesses
-elate install codex opencode  # …or name them: claude codex opencode pi antigravity (or all)
-elate install --mcp           # also register the optional MCP server where supported
-```
-
-The skill is the same SKILL.md format Claude Code, Codex CLI, opencode, pi,
-and Antigravity all read, so one command wires them all. Add `--project` to
-install into the current repo's skills dir instead of the user-global one;
-`--dry-run` previews without writing.
-
-Claude Code users can instead install the full **plugin** — same skill plus
-the `emacs-tester` subagent and leftover-session hooks:
-
-```sh
-claude plugin marketplace add dakra/elate
-claude plugin install elate
-```
-
-**3. Ask, in your agent's own prompt:**
-
-> Use elate to start a sandboxed Emacs, load `./my-pkg.el`, run my ERT suite,
-> and show me any failures.
-
-The agent runs the start → act → observe → stop loop for you.
-
-**Shell-less harness, or want typed tools / inline GUI screenshots?** The MCP
-server is an opt-in add-on that exposes the same commands 1:1 as MCP tools —
-`elate install --mcp` registers it where supported, or wire `uvx elate mcp`
-by hand. Per-harness setup (opencode, Codex CLI, Cursor, Zed, Gemini CLI,
-Claude Desktop) is in
-[Using elate from AI harnesses](#using-elate-from-ai-harnesses).
-
-To drive elate yourself from the shell, see the [CLI tour](#cli-tour) below.
+However you install it, `elate update` later upgrades elate through the same
+channel and refreshes every installed skill copy in one go.
 
 ## CLI tour
 
@@ -843,7 +817,8 @@ Script equivalent: `elate run examples/focus-ordering.json` (self-contained).
 
 elate is built to be driven by AI agents, and it's CLI-centric: the
 integration that works everywhere is the **Agent Skill**, which teaches a
-harness to drive the `elate` CLI. Pick by harness:
+harness to drive the `elate` CLI — the agent runs the whole start → act →
+observe → stop loop for you. Pick by harness:
 
 - **One command for most harnesses** → `elate install` copies the skill into
   Claude Code, Codex CLI, opencode, pi, and Antigravity (they share the
@@ -944,19 +919,28 @@ plain `pip install elate` / `uvx` install can materialize it without a
 checkout:
 
 ```sh
-elate install                 # auto-detect installed harnesses
+elate install                 # into this project's skills dirs, auto-detecting harnesses
 elate install claude codex    # …or name them (claude codex opencode pi antigravity | all)
-elate install --project       # into the current repo's skills dir, not user-global
+elate install --global        # user-wide skills dirs instead of the project's
 elate install --mcp           # also register the MCP server where supported
 elate install --dry-run all   # preview the destinations without writing
 ```
 
-Per-harness skill destinations (global): Claude Code `~/.claude/skills/`,
+The default is project-local (e.g. `./.claude/skills/`) so "drive Emacs"
+guidance only loads for agents working where Emacs Lisp actually lives.
+Per-harness destinations with `--global`: Claude Code `~/.claude/skills/`,
 Codex `~/.agents/skills/`, opencode `~/.config/opencode/skills/`, pi
-`~/.pi/agent/skills/`, Antigravity `~/.gemini/skills/`. Re-run after an elate
-upgrade to refresh the copy. From a checkout you can also just symlink it
-(`ln -s "$(pwd)/skills/elate" ~/.claude/skills/elate`). Harnesses without
-skill support get the same distillation from `AGENTS.md` at the repo root.
+`~/.pi/agent/skills/`, Antigravity `~/.gemini/skills/`. From a checkout you
+can also just symlink it (`ln -s "$(pwd)/skills/elate"
+~/.claude/skills/elate`). Harnesses without skill support get the same
+distillation from `AGENTS.md` at the repo root.
+
+Installed copies carry a skill **content version**; when a copy disagrees
+with the running CLI, `elate start` prints a one-line stderr notice saying
+which side is stale and how to fix it. `elate update` fixes both sides at
+once — it upgrades elate via whatever installed it (Homebrew, uvx, uv tool,
+pipx, pip) and reruns `elate install` for every copy it finds (`--dry-run`
+previews the plan, `--yes` skips the confirmation for scripts/agents).
 
 ### MCP server
 

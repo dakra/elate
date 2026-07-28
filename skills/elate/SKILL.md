@@ -1,7 +1,11 @@
 ---
 # Keep this frontmatter to plain `key: value` scalars (indented
 # continuation lines are fine): tests/test_skill.py parses it without YAML.
+# `version` is the skill CONTENT version: bump it only in releases whose
+# skill files change (tests/skill_content_version.txt pins this); `elate
+# start` compares it against installed copies to nudge about staleness.
 name: elate
+version: 0.14.0
 description: Spawns sandboxed Emacs sessions (terminal or GUI) and drives them
   with keys, mouse, and elisp to test Emacs Lisp interactively - run ERT tests
   in a live session, inspect faces/overlays/popups structurally, lint, profile,
@@ -394,7 +398,7 @@ available in your session (someone registered the server — the plugin is
 CLI-first and does not register it for you), use them directly — do **not**
 register a duplicate; otherwise register it with
 `claude mcp add elate -- uvx elate mcp`. The 31 `elate_*` tools cover the core surface (`attach`, `resize`,
-`prune`, `stderr`, `export-script`, `snap`, `matrix`, and `install` stay CLI-only); `prune`
+`prune`, `stderr`, `export-script`, `snap`, `matrix`, `install`, and `update` stay CLI-only); `prune`
 aliases `purge` and `stderr` aliases `logs`. Sessions are shared
 between both (same names, same sandboxes), so you can mix.
 

@@ -17,8 +17,10 @@ left to the user to avoid clobbering existing servers and comments.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +29,20 @@ from . import paths
 from .errors import UsageError
 
 MCP_COMMAND = ["uvx", "elate", "mcp"]
+
+# How to upgrade the elate package itself, per install channel.
+UPDATE_HINTS = {
+    "homebrew": "brew upgrade dakra/tap/elate",
+    "uvx": "uvx --refresh elate install",
+    "uv-tool": "uv tool upgrade elate",
+    "pipx": "pipx upgrade elate",
+    "pip": "pip install -U elate",
+}
+
+# Files/dirs whose presence marks a directory as a project root worth a
+# project-local skill install.
+_PROJECT_MARKERS = (".git", ".claude", ".agents", ".opencode", ".pi",
+                    ".gemini", "AGENTS.md", "CLAUDE.md")
 
 _OPENCODE_SNIPPET = """\
 {
@@ -52,7 +68,7 @@ class McpPlan:
     cli_bin: str | None = None
     # Whether the harness's `mcp add` takes a --scope flag. Claude Code
     # defaults to cwd-local scope, so a global skill install must pass
-    # --scope user (and --project must pass --scope project) to match.
+    # --scope user (and a project install --scope project) to match.
     cli_supports_scope: bool = False
     config_path: Callable[[], Path] | None = None
     snippet: str | None = None
@@ -243,6 +259,231 @@ def _wire_mcp(harness: Harness, project: bool, dry_run: bool) -> dict:
     }
 
 
+def install_channel() -> str:
+    """Classify how this elate got installed, from sys.prefix.
+
+    Homebrew runs from a Cellar keg, `uv tool install` from a tools venv,
+    `uvx` from a throwaway environment inside uv's cache, pipx from its
+    venvs dir; anything else is treated as a plain pip venv. Matching is
+    on whole path components so a user's own directory that merely
+    contains e.g. "uv" in its name cannot misclassify.
+    """
+    parts = Path(sys.prefix).parts
+    if "Cellar" in parts:
+        return "homebrew"
+    for parent, child in zip(parts, parts[1:]):
+        if parent == "uv" and child == "tools":
+            return "uv-tool"
+    if "uv" in parts and any(
+            p.startswith(("archive-", "environments")) for p in parts):
+        return "uvx"
+    for parent, child in zip(parts, parts[1:]):
+        if child == "uv" and parent in (".cache", "Caches"):
+            return "uvx"
+    if "pipx" in parts:
+        return "pipx"
+    return "pip"
+
+
+def skill_content_version(skill_md: Path) -> tuple[int, ...] | None:
+    """The `version:` stamp in a SKILL.md's frontmatter, as an int tuple.
+
+    This is the skill *content* version: it bumps only in releases whose
+    skill files actually change, and it travels inside every copy, so
+    comparing a copy's stamp to the bundled one detects staleness in both
+    directions. ``None`` (no parseable stamp: pre-0.14 copies) sorts as
+    oldest at the call sites.
+    """
+    try:
+        head = skill_md.read_text(encoding="utf-8", errors="replace")[:2048]
+    except OSError:
+        return None
+    m = re.search(r"(?m)^version:\s*(\S+)", head)
+    if not m:
+        return None
+    try:
+        return tuple(int(part) for part in m.group(1).split("."))
+    except ValueError:
+        return None
+
+
+def find_skill_copies() -> list[Path]:
+    """Every installed copy of the skill's SKILL.md reachable from here.
+
+    Project copies first (each harness's project skills dir, walking up
+    from cwd to the filesystem root), then the global ones, deduplicated
+    by resolved path -- which also collapses the ``~/.claude/skills``
+    project/global collision when cwd sits under $HOME.
+    """
+    seen: set[Path] = set()
+    copies: list[Path] = []
+
+    def add(candidate: Path) -> None:
+        try:
+            if not candidate.is_file():
+                return
+            resolved = candidate.resolve()
+        except OSError:
+            return
+        if resolved not in seen:
+            seen.add(resolved)
+            copies.append(candidate)
+
+    cwd = Path.cwd()
+    for directory in (cwd, *cwd.parents):
+        for harness in HARNESSES.values():
+            add(directory / harness.skill_root_project / "elate" / "SKILL.md")
+    for harness in HARNESSES.values():
+        add(harness.skill_root_global() / "elate" / "SKILL.md")
+    return copies
+
+
+def classify_copy(copy: Path) -> tuple[str, Path | None] | None:
+    """Map a SKILL.md copy to (harness key, project root).
+
+    The root is None for a copy at some harness's global skills location;
+    a project copy maps back to the directory its install ran from (the
+    path above the harness-relative skills dir). None when the path
+    matches no known harness layout. Harnesses sharing a directory (codex
+    and antigravity both use .agents/skills for project scope) resolve to
+    whichever comes first -- the install destination is identical.
+    """
+    try:
+        resolved = copy.resolve()
+    except OSError:
+        return None
+    for harness in HARNESSES.values():
+        try:
+            location = harness.skill_root_global() / "elate" / "SKILL.md"
+            if location.resolve() == resolved:
+                return harness.key, None
+        except OSError:
+            continue
+    for harness in HARNESSES.values():
+        rel = Path(harness.skill_root_project) / "elate" / "SKILL.md"
+        if copy.parts[-len(rel.parts):] == rel.parts:
+            return harness.key, copy.parents[len(rel.parts) - 1]
+    return None
+
+
+def staleness_notice() -> str | None:
+    """Stderr nudge when an installed skill copy disagrees with this elate.
+
+    Compares each copy's content version to the bundled skill's: an older
+    copy teaches agents a CLI surface that has since grown, a *newer* copy
+    (a cloned repo ahead of the machine's cached CLI) invokes flags this
+    binary does not have yet. At most one line per direction, project
+    copies preferred. Never raises -- a notice must not break `start`.
+    """
+    try:
+        bundled = skill_content_version(paths.skill_dir() / "SKILL.md")
+        if bundled is None:
+            return None
+        older: Path | None = None
+        newer: Path | None = None
+        for copy in find_skill_copies():
+            version = skill_content_version(copy) or (0,)
+            if version < bundled and older is None:
+                older = copy
+            elif version > bundled and newer is None:
+                newer = copy
+        lines = []
+        if older is not None:
+            lines.append(
+                f"elate: skill copy at {older.parent} is outdated — rerun "
+                "'elate install' there (or 'elate install --global')")
+        if newer is not None:
+            lines.append(
+                f"elate: skill copy at {newer.parent} expects a newer elate "
+                f"— upgrade with: {UPDATE_HINTS[install_channel()]}")
+        return "\n".join(lines) if lines else None
+    except Exception:
+        return None
+
+
+def update_steps(channel: str) -> list[dict]:
+    """The commands `elate update` runs, in order.
+
+    First the channel's upgrade command, then a skill refresh per copy
+    location with the upgraded binary (the console-script path survives
+    the upgrade). Each refresh names its copies' harnesses explicitly so
+    it cannot depend on auto-detection -- the found copy must be the one
+    refreshed, even for a harness no longer detected on the machine.
+    Symlinked skill dirs are skipped: they track a checkout, not a copy.
+    uvx keeps no installed binary at all -- `--refresh` re-resolves the
+    cached environment, so the upgrade and each refresh collapse into one
+    command there.
+    """
+    project_targets: dict[Path, list[str]] = {}
+    global_keys: list[str] = []
+    for copy in find_skill_copies():
+        try:
+            if copy.parent.is_symlink():
+                continue
+        except OSError:
+            continue
+        classified = classify_copy(copy)
+        if classified is None:
+            continue
+        key, root = classified
+        if root is None:
+            if key not in global_keys:
+                global_keys.append(key)
+        else:
+            keys = project_targets.setdefault(root, [])
+            if key not in keys:
+                keys.append(key)
+    steps: list[dict] = []
+    if channel == "uvx":
+        base = ["uvx", "--refresh", "elate"]
+        for root, keys in project_targets.items():
+            steps.append({"cmd": [*base, "install", *keys],
+                          "cwd": str(root)})
+        if global_keys:
+            steps.append(
+                {"cmd": [*base, "install", *global_keys, "--global"],
+                 "cwd": None})
+        if not steps:
+            steps.append({"cmd": [*base, "--version"], "cwd": None})
+        return steps
+    if channel == "pip":
+        # The first `pip` on PATH may belong to a different environment
+        # (or none at all); target the interpreter running this elate.
+        upgrade = [sys.executable, "-m", "pip", "install", "-U", "elate"]
+    else:
+        upgrade = UPDATE_HINTS[channel].split()
+    steps.append({"cmd": upgrade, "cwd": None})
+    elate_bin = shutil.which("elate") or "elate"
+    for root, keys in project_targets.items():
+        steps.append({"cmd": [elate_bin, "install", *keys],
+                      "cwd": str(root)})
+    if global_keys:
+        steps.append({"cmd": [elate_bin, "install", *global_keys, "--global"],
+                      "cwd": None})
+    return steps
+
+
+def _preflight_notices() -> list[str]:
+    """Non-fatal runtime-dependency warnings for the install summary."""
+    notices: list[str] = []
+    emacs = shutil.which("emacs")
+    if emacs is None:
+        notices.append(
+            "no emacs found on PATH — sessions need one "
+            "(or pass `elate start --emacs PATH`)")
+    else:
+        sibling = Path(emacs).parent / "emacsclient"
+        if not sibling.is_file() and shutil.which("emacsclient") is None:
+            notices.append(
+                "no emacsclient found next to emacs or on PATH — "
+                "elate's semantic channel needs it")
+    if shutil.which("tmux") is None:
+        notices.append(
+            "tmux not found on PATH — TTY sessions need tmux "
+            "(`brew install tmux`); GUI sessions work without it")
+    return notices
+
+
 def run_install(
     selected: list[str],
     *,
@@ -251,12 +492,48 @@ def run_install(
     dry_run: bool = False,
 ) -> dict:
     """Copy the bundled skill into each target harness (and optionally MCP)."""
+    notices: list[str] = []
+    project_base = Path.cwd()
+    if project:
+        home = _home().resolve()
+        if project_base.resolve() == home:
+            # A "project" install in $HOME would half-collide with the
+            # global one (.claude/skills IS the global dir there, the other
+            # harnesses' project dirs are not) -- treat it as global.
+            project = False
+            notices.append(
+                "current directory is your home directory — installing "
+                "user-global instead")
+        else:
+            # The skill must land at the project ROOT (a harness launched
+            # there never loads a subdirectory's skills dir), so walk up
+            # to the nearest marker -- stopping below $HOME, which is
+            # never a project root.
+            root = None
+            for directory in (project_base, *project_base.parents):
+                if directory.resolve() == home:
+                    break
+                if any((directory / marker).exists()
+                       for marker in _PROJECT_MARKERS):
+                    root = directory
+                    break
+            if root is None:
+                notices.append(
+                    f"no agent/project files found in {project_base} or "
+                    "above — installing project-local anyway; use --global "
+                    "for a user-wide install")
+            elif root != project_base:
+                notices.append(
+                    f"installing into project root {root} (the nearest "
+                    "directory with project files)")
+                project_base = root
+    notices.extend(_preflight_notices())
     targets = _resolve_targets(selected)
     src = paths.skill_dir()
     entries: list[dict] = []
     for harness in targets:
         if project:
-            root = Path.cwd() / harness.skill_root_project
+            root = project_base / harness.skill_root_project
         else:
             root = harness.skill_root_global()
         dest = root / "elate"
@@ -290,6 +567,7 @@ def run_install(
         "scope": "project" if project else "global",
         "dry_run": dry_run,
         "with_mcp": with_mcp,
+        "notices": notices,
     }
 
 
