@@ -24,7 +24,8 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   `send-process` (and `focus`/`send-events` for window-system focus events,
   ordered against clicks/keys), then `wait stable --buffer B --quiet-ms N`
   (subprocess/REPL output settled) / `wait idle` (command-loop idle) /
-  `wait text REGEXP` / `wait prompt` (never sleep-and-poll), then `state`
+  `wait text REGEXP` / `wait prompt` / `wait until '<elisp-pred>'` (any
+  other condition — never sleep-and-poll or eval-poll), then `state`
   (one-call scene snapshot — run it first when confused) or
   `buffer`/`messages`/`faces-at`/`popups`/`screenshot`.
 - Key delivery: semantic `keys 'M-x foo RET'` by default. Semantic keys run
@@ -44,11 +45,21 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
 - Drive a **subprocess** (shell/REPL/terminal) with `send-process`: it writes
   straight to the buffer's process (`send-process --char C-c` interrupts,
   `send-process 'cmd\n'` feeds input) — `keys`/`type` drive Emacs, this drives
-  the process. `faces-at --pos N` / `--run K` reads cells by position / a run
-  at once.
+  the process. A buffer with several live processes is an error naming them
+  (pick one with `--process NAME`); the result echoes the target's name +
+  command line — check it when input vanishes, and `eval` the package's own
+  send function when it writes through a raw fd no process fronts. To see
+  which internal functions ran (args, order), use `trace on FN…` / `trace
+  read` instead of advice spies. `faces-at --pos N` / `--run K` reads cells
+  by position / a run at once.
 - Eval forms don't run in the selected window's buffer — wrap
   buffer-mutating forms in `(with-current-buffer …)`. Output truncates at
   64 KiB. `wait text` patterns are **Python** regexps, not elisp.
+  The default `value` is a printed sexp string — for structured probes use
+  `eval --json-result` (real JSON in `value`; fallback flagged by
+  `value-encoding`), `eval --raw` (bare value, no envelope, stdout empty on
+  error), or the global `--field NAME` (one envelope field bare) — never
+  regex a printed plist.
 - Crashes/hangs: a form that crashes Emacs comes back as `session_died`
   with the fatal `signal` + OS `crash_report` path (also via `wait dead` /
   `info` / `list`, which renders `dead (SIGABRT)`); `eval --on-timeout
@@ -56,6 +67,11 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   (alias `stderr`) tails the Emacs stderr, including the fatal-signal line.
 - Sandbox `$HOME` is fake. For files a **subprocess** needs at spawn (shell
   rc files), `start --home-seed DIR` copies a fixture tree in before launch.
+  Put your own setup files/artifacts in the session's private scratch dir:
+  `elate -s NAME path` prints it; in-Emacs code sees `$ELATE_SCRATCH`.
+  Several agents on one machine: `start --owner ME --ttl 30m`, then
+  `list/stop/purge --owner ME` (a session idle past its `--ttl` is reaped
+  automatically).
   Startup forms run before `emacs-startup-hook`: inline `--eval`, or reuse
   `--eval-file PATH` / `--profile NAME` (`$XDG_CONFIG_HOME/elate/profiles/`).
 - Tests/lint/profile/bench want a **fresh throwaway session** (results

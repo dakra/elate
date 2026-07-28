@@ -112,7 +112,7 @@ _STEP_OPTIONS: dict[str, set[str]] = {
     "keys": {"delivery", "timeout"},
     "type": set(),
     "eval": {"timeout", "buffer"},
-    "wait": {"pattern", "buffer", "timeout", "min_idle"},
+    "wait": {"pattern", "pred", "buffer", "timeout", "min_idle"},
     "mouse": {"button", "buffer", "pos", "line", "col", "part", "to_pos",
               "to_line", "to_col", "direction", "count", "delivery",
               "timeout"},
@@ -132,6 +132,7 @@ _WAIT_OPTIONS: dict[str, set[str]] = {
     "idle": {"min_idle"},
     "text": {"pattern", "buffer"},
     "prompt": set(),
+    "until": {"pred", "buffer"},
 }
 
 # Assertion kinds -> extra option keys each kind accepts.
@@ -612,10 +613,11 @@ def _validate_step(step: Any, index: int) -> None:
             f"{where}: keys delivery must be semantic/events/raw, "
             f"got {step.get('delivery')!r}")
     if verb == "wait":
-        if val not in ("idle", "text", "prompt"):
+        if val not in ("idle", "text", "prompt", "until"):
             raise ElateError(
-                f'{where}: wait must be "idle", "text", or "prompt", got {val!r}')
-        stray = (set(step) & {"pattern", "buffer", "min_idle"}) - _WAIT_OPTIONS[val]
+                f'{where}: wait must be "idle", "text", "prompt", or '
+                f'"until", got {val!r}')
+        stray = (set(step) & {"pattern", "pred", "buffer", "min_idle"}) - _WAIT_OPTIONS[val]
         if stray:
             raise ElateError(
                 f'{where}: option(s) {sorted(stray)} do not apply to wait '
@@ -630,6 +632,12 @@ def _validate_step(step: Any, index: int) -> None:
             except re.error as exc:
                 raise ElateError(
                     f"{where}: invalid regexp {pattern!r}: {exc}") from exc
+            _check_str(step, "buffer", where)
+        if val == "until":
+            if not isinstance(step.get("pred"), str):
+                raise ElateError(
+                    f'{where}: wait "until" needs a "pred" (an elisp '
+                    'predicate form, polled until non-nil)')
             _check_str(step, "buffer", where)
         if val == "idle":
             _check_number(step, "min_idle", where, minimum=0, maximum=60)
@@ -1279,8 +1287,8 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
         cond = step["wait"]
         timeout = _step_timeout(step, verb, defaults)
         sess.log("wait", condition=cond, pattern=step.get("pattern"),
-                 buffer=step.get("buffer"), min_idle=step.get("min_idle"),
-                 timeout=timeout, via="script")
+                 pred=step.get("pred"), buffer=step.get("buffer"),
+                 min_idle=step.get("min_idle"), timeout=timeout, via="script")
         if cond == "idle":
             return S.wait_idle(
                 sess,
@@ -1290,6 +1298,9 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
         if cond == "text":
             return S.wait_text(sess, step["pattern"],
                                buffer=step.get("buffer"), timeout=timeout)
+        if cond == "until":
+            return S.wait_until(sess, step["pred"],
+                                buffer=step.get("buffer"), timeout=timeout)
         return S.wait_prompt(sess, timeout=timeout)
 
     if verb == "mouse":
@@ -1827,10 +1838,19 @@ def _event_step(e: dict[str, Any]) -> dict[str, Any] | None:  # noqa: C901
         return step
     if ev == "wait" and isinstance(e.get("condition"), str):
         cond = e["condition"]
-        if cond not in ("idle", "text", "prompt"):
+        if cond not in ("idle", "text", "prompt", "until"):
             return None
         step = {"wait": cond}
         args = e.get("args") or []  # CLI logs positionals; MCP logs fields
+        if cond == "until":
+            pred = e.get("pred")
+            if pred is None and args:
+                pred = args[0]
+            if not isinstance(pred, str):
+                return None
+            step["pred"] = pred
+            if e.get("buffer"):
+                step["buffer"] = e["buffer"]
         if cond == "text":
             pattern = e.get("pattern")
             if pattern is None and args:

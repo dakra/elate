@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -654,6 +655,35 @@ def test_cli_lifecycle(elate_home: str, capsys: pytest.CaptureFixture[str]) -> N
         assert cli.main(["--json", "-s", name, "info"]) == 0
         out = json.loads(capsys.readouterr().out)
         assert out["name"] == name
+        assert out["scratch_dir"].endswith("/scratch")
+        # path: bare scratch path on stdout, dir created, ELATE_SCRATCH
+        # points the in-Emacs code at the same place.
+        assert cli.main(["--human", "-s", name, "path"]) == 0
+        scratch = capsys.readouterr().out.strip()
+        assert scratch == out["scratch_dir"] and Path(scratch).is_dir()
+        sess = S.load_session(name)
+        env = sess.semantic().eval_form('(getenv "ELATE_SCRATCH")')
+        assert env["value"] == f'"{scratch}"'
+        env = sess.semantic().eval_form('(getenv "ELATE_SESSION")')
+        assert env["value"] == f'"{name}"'
+        assert cli.main(["--json", "path", name, "--kind", "dir"]) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["path"] == str(sess.dir)
+        # eval --raw: just the value, shell-comparable; errors keep stdout
+        # empty; --json-result makes `value` a real JSON object.
+        assert cli.main(["-s", name, "eval", "--raw", "(+ 40 2)"]) == 0
+        assert capsys.readouterr().out == "42\n"
+        assert cli.main(["-s", name, "eval", "--raw", "(car nil nil)"]) == 1
+        cap = capsys.readouterr()
+        assert cap.out == "" and "error" in cap.err
+        assert cli.main(["--json", "-s", name, "eval", "--json-result",
+                        "(list :mode 'emacs :point 316)"]) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["value"] == {"mode": "emacs", "point": 316}
+        assert out["value-encoding"] == "json"
+        assert cli.main(["-s", name, "eval", "--raw", "--json-result",
+                        "(list :a (list 1 2))"]) == 0
+        assert json.loads(capsys.readouterr().out) == {"a": [1, 2]}
     finally:
         assert cli.main(["--json", "-s", name, "stop"]) == 0
         out = json.loads(capsys.readouterr().out)

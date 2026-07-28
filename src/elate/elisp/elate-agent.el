@@ -179,6 +179,116 @@ reply can never escape as a raw `json-serialize' error."
   "Decode a base64-encoded UTF-8 string B64."
   (decode-coding-string (base64-decode-string b64) 'utf-8))
 
+(define-error 'elate-unjsonable "value has no faithful JSON shape")
+
+(defconst elate--json-max-depth 64
+  "Recursion limit for `elate--json-value'.
+Also the guard that turns a circular structure into a clean
+`elate-unjsonable' signal instead of an endless walk.")
+
+(defvar elate--json-nodes-left most-positive-fixnum
+  "Remaining node budget for one `elate--json-value' conversion.
+Bound by the caller (`elate--rpc-eval') so converting a huge value --
+which runs outside the eval timeout -- gives up after a bounded amount
+of work instead of walking millions of nodes only to be rejected by
+the size cap anyway.")
+
+(defun elate--json-value (obj depth)
+  "OBJ as a `json-serialize'-ready value, or signal `elate-unjsonable'.
+The eval --json-result converter: t stays true, nil becomes :null
+\(JSON null -- nil's list/false/null ambiguity is resolved to null by
+documented rule), symbols become their names (keywords keep the colon
+in *value* position), keyword plists stay plists, alists and
+string/symbol-keyed hash tables become keyword plists, and any other
+proper list becomes an array.  Anything without a faithful JSON shape
+\(buffers, markers, functions, non-finite floats, improper lists,
+depth/cycle overflow) signals, and the caller falls back to the
+printed representation -- a lossy partial conversion would just move
+the string-surgery problem one level down."
+  (when (> depth elate--json-max-depth)
+    (signal 'elate-unjsonable (list "max depth (circular?)")))
+  (when (<= (setq elate--json-nodes-left (1- elate--json-nodes-left)) 0)
+    (signal 'elate-unjsonable (list "too many nodes")))
+  (let ((d (1+ depth)))
+    (cond
+     ((eq obj t) t)
+     ((null obj) :null)
+     ((symbolp obj) (symbol-name obj))
+     ((stringp obj) (elate--clean-string obj))
+     ((integerp obj) obj)
+     ((floatp obj)
+      (if (or (isnan obj) (= obj 1.0e+INF) (= obj -1.0e+INF))
+          (signal 'elate-unjsonable (list "non-finite float"))
+        obj))
+     ((vectorp obj)
+      (vconcat (mapcar (lambda (x) (elate--json-value x d)) obj)))
+     ((hash-table-p obj)
+      ;; Keys of different types can normalize to the same name (symbol
+      ;; `a' and string "a" both become :a); serializing would silently
+      ;; keep just one entry, so detect the collision and fall back.
+      (let (out seen)
+        (maphash (lambda (k v)
+                   (let ((key (elate--json-key k)))
+                     (when (memq key seen)
+                       (signal 'elate-unjsonable
+                               (list "duplicate key after normalization")))
+                     (push key seen)
+                     (push (elate--json-value v d) out)
+                     (push key out)))
+                 obj)
+        out))
+     ((consp obj)
+      (cond
+       ((elate--json-plistp obj)
+        (let (out)
+          (while obj
+            (push (car obj) out)
+            (push (elate--json-value (cadr obj) d) out)
+            (setq obj (cddr obj)))
+          (nreverse out)))
+       ((elate--json-alistp obj)
+        (mapcan (lambda (pair)
+                  (list (elate--json-key (car pair))
+                        (elate--json-value (cdr pair) d)))
+                obj))
+       ((proper-list-p obj)
+        (vconcat (mapcar (lambda (x) (elate--json-value x d)) obj)))
+       (t (signal 'elate-unjsonable (list "improper list")))))
+     (t (signal 'elate-unjsonable (list (format "%s" (type-of obj))))))))
+
+(defun elate--json-key (k)
+  "K as a plist keyword key, or signal `elate-unjsonable'."
+  (cond ((keywordp k) k)
+        ((symbolp k) (intern (concat ":" (symbol-name k))))
+        ((stringp k) (intern (concat ":" (elate--clean-string k))))
+        (t (signal 'elate-unjsonable (list "non-symbol/string key")))))
+
+(defun elate--json-plistp (obj)
+  "Whether OBJ is a proper plist with keyword keys."
+  (let ((len (proper-list-p obj)))
+    (and len (zerop (% len 2))
+         (let ((ok t) (tail obj))
+           (while (and ok tail)
+             (setq ok (keywordp (car tail)) tail (cddr tail)))
+           ok))))
+
+(defun elate--json-alistp (obj)
+  "Whether OBJ is a proper alist with non-keyword-symbol or string keys.
+A keyword car disqualifies: an element like (:name ...) is a plist, so
+its containing list is a *list of plists* (records) that must convert
+element-wise to an array of objects -- treating it as one alist would
+mapcan the records together and silently drop all but the first."
+  (and (proper-list-p obj)
+       (let ((ok t) (tail obj))
+         (while (and ok tail)
+           (let ((e (car tail)))
+             (setq ok (and (consp e)
+                           (or (and (symbolp (car e))
+                                    (not (keywordp (car e))))
+                               (stringp (car e))))
+                   tail (cdr tail))))
+         ok)))
+
 (defun elate--jnull (x)
   "X, or :null when X is nil (JSON null)."
   (or x :null))
@@ -701,7 +811,8 @@ multi-megabyte value would blow the controller's subprocess timeout and
 masquerade as a busy/blocked Emacs.  Truncated results carry
 :truncated t and the full :value-length.")
 
-(defun elate--rpc-eval (form-b64 &optional timeout want-frames buffer)
+(defun elate--rpc-eval (form-b64 &optional timeout want-frames buffer
+                                 json-result)
   "Evaluate the elisp source decoded from FORM-B64.
 Returns printed value (truncated at `elate--max-value-len'), *Messages*
 delta, and error + backtrace on failure.  TIMEOUT (seconds) arms a
@@ -711,13 +822,22 @@ carries structured :frames (function + printed args per backtrace frame)
 captured from the same live stack as the rendered :backtrace string.
 The form evaluates in BUFFER (a name) when given, else in the selected
 window's buffer -- so `current-buffer', point, and line functions see
-what a user looking at the frame would, not an arbitrary RPC-time buffer."
+what a user looking at the frame would, not an arbitrary RPC-time buffer.
+With JSON-RESULT, the value is returned as real JSON (see
+`elate--json-value'; :value-encoding \"json\") when it has a faithful
+JSON shape and fits the size cap, else as the printed representation
+\(:value-encoding \"printed\") -- check the flag, never guess."
   (let* ((src (elate--decode-string form-b64))
          (form (read (concat "(progn\n" src "\n)")))
          (msg-start (with-current-buffer (messages-buffer)
                       (save-restriction (widen) (point-max))))
          (backtrace nil)
          (frames :null)
+         (raw nil)
+         (got nil)
+         (jval nil)
+         (json-ok nil)
+         (jlen 0)
          (value nil)
          (errstr nil))
     (letrec ((cut-pred
@@ -736,23 +856,44 @@ what a user looking at the frame would, not an arbitrary RPC-time buffer."
                     (setq frames (elate--backtrace-frames capture cut-pred)))))))
       (let ((debugger capture))
         (condition-case err
-          (setq value
-                (let ((print-length 4096)
-                      (print-level 64))
-                  (prin1-to-string
-                   (with-current-buffer (elate--resolve-buffer buffer)
-                     (if (and (numberp timeout) (> timeout 0))
-                         (with-timeout (timeout (error "elate: eval timed out after %gs" timeout))
-                           (eval form t))
-                       (eval form t))))))
+          (setq raw (with-current-buffer (elate--resolve-buffer buffer)
+                      (if (and (numberp timeout) (> timeout 0))
+                          (with-timeout (timeout (error "elate: eval timed out after %gs" timeout))
+                            (eval form t))
+                        (eval form t)))
+                got t)
           ((debug error) (setq errstr (error-message-string err))))))
+    (when (and got json-result)
+      ;; The whole value converts or none of it does: a lossy partial
+      ;; conversion would silently reintroduce string surgery downstream.
+      (condition-case nil
+          (let* ((elate--json-nodes-left 100000)
+                 (cand (elate--json-value raw 0)))
+            ;; Serializing the wrapped candidate both measures it against
+            ;; the size cap and proves json-serialize really accepts it;
+            ;; the {"v":...} wrapper adds exactly 6 characters.
+            (setq jlen (- (length (json-serialize (list :v cand))) 6))
+            (if (> jlen elate--max-value-len)
+                (signal 'elate-unjsonable (list "too large"))
+              (setq jval cand json-ok t)))
+        (error nil)))                   ; fall back to the printed path
+    (when (and got (not json-ok))
+      ;; Printing itself can signal (a print-method error); capture it as
+      ;; an eval error rather than letting a raw RPC error escape.
+      (condition-case perr
+          (setq value (let ((print-length 4096)
+                            (print-level 64))
+                        (prin1-to-string raw)))
+        (error (setq errstr (format "elate: cannot print the value: %s"
+                                    (error-message-string perr))))))
     (let* ((vlen (if value (length value) 0))
            (truncated (> vlen elate--max-value-len)))
-      (list :value (elate--jnull (if truncated
-                                     (substring value 0 elate--max-value-len)
-                                   value))
+      (list :value (cond (json-ok jval)
+                         (truncated (substring value 0 elate--max-value-len))
+                         (t (elate--jnull value)))
+            :value-encoding (if json-ok "json" "printed")
             :truncated (elate--jbool truncated)
-            :value-length vlen
+            :value-length (if json-ok jlen vlen)
             :error (elate--jnull errstr)
             :backtrace (elate--jnull backtrace)
             :frames frames
@@ -1125,36 +1266,85 @@ the buffer has a running process).  A missing buffer reports
                 :live-process (elate--jbool
                                (and proc (process-live-p proc)))))))))
 
-(defun elate--send-to-process (name payload)
-  "Send string PAYLOAD to the live subprocess of buffer NAME; report it.
-NAME defaults to the current buffer.  Errors when the buffer has no
-running process (so it never silently goes nowhere)."
-  (let* ((buf (elate--resolve-buffer name))
-         (proc (get-buffer-process buf)))
-    (unless (and proc (process-live-p proc))
-      (error "elate: buffer %S has no live process" (buffer-name buf)))
+(defun elate--buffer-processes (buf)
+  "Live processes whose `process-buffer' is BUF, in `process-list' order."
+  (let (procs)
+    (dolist (p (process-list) (nreverse procs))
+      (when (and (eq (process-buffer p) buf) (process-live-p p))
+        (push p procs)))))
+
+(defun elate--resolve-target-process (name process)
+  "The process to send input to: (PROC . BUFFER-OR-NIL).
+PROCESS (a process name) wins when given: it is looked up globally, and
+when NAME is also given the process must belong to that buffer (catches
+targeting typos).  Without PROCESS, buffer NAME (default: current) must
+have exactly ONE live process -- zero or several is an error naming the
+candidates, never a silent pick."
+  (if process
+      (let ((proc (get-process process))
+            (buf (and name (elate--resolve-buffer name))))
+        (unless (and proc (process-live-p proc))
+          (error "elate: no live process named %S (live: %s)" process
+                 (mapconcat #'process-name
+                            (seq-filter #'process-live-p (process-list))
+                            ", ")))
+        (when (and buf (not (eq (process-buffer proc) buf)))
+          (error "elate: process %S belongs to buffer %S, not %S"
+                 process
+                 (and (process-buffer proc) (buffer-name (process-buffer proc)))
+                 (buffer-name buf)))
+        (cons proc (process-buffer proc)))
+    (let* ((buf (elate--resolve-buffer name))
+           (procs (elate--buffer-processes buf)))
+      (cond
+       ((null procs)
+        (error "elate: buffer %S has no live process" (buffer-name buf)))
+       ((cdr procs)
+        (error (concat "elate: buffer %S has %d live processes (%s); "
+                       "pick one explicitly with the process argument "
+                       "(--process). NOTE: none of them may be the write "
+                       "path the package actually uses -- a package can "
+                       "write to a raw fd or its own channel; if input "
+                       "seems to vanish, call its send function via eval")
+               (buffer-name buf) (length procs)
+               (mapconcat #'process-name procs ", ")))
+       (t (cons (car procs) buf))))))
+
+(defun elate--send-to-process (name payload &optional process)
+  "Send string PAYLOAD to the subprocess of buffer NAME; report it.
+NAME defaults to the current buffer; PROCESS (a process name) targets a
+process explicitly instead (see `elate--resolve-target-process' for the
+selection rule).  Errors rather than silently picking among several
+candidates or writing to nothing."
+  (pcase-let* ((`(,proc . ,buf) (elate--resolve-target-process name process)))
     (process-send-string proc payload)
     (list :process (process-name proc)
-          :buffer (buffer-name buf)
+          :buffer (if buf (buffer-name buf) :null)
+          :command (let ((cmd (process-command proc)))
+                     (if (consp cmd) (mapconcat #'identity cmd " ") :null))
           :bytes (string-bytes payload))))
 
-(defun elate--rpc-send-process (&optional name text-b64 as-kbd)
+(defun elate--rpc-send-process (&optional name text-b64 as-kbd process)
   "Send input to the subprocess of buffer NAME (default: current).
 TEXT-B64 is base64 UTF-8.  With AS-KBD non-nil it is an Emacs kbd
 string, so \"C-c\" sends ^C (SIGINT to a shell's foreground job),
-\"RET\" sends a newline, etc.  This is the comint/REPL/terminal
-companion to keys: it talks to the process, not the command loop."
+\"RET\" sends a newline, etc.  PROCESS names a process to target
+explicitly (needed when the buffer has several).  This is the
+comint/REPL/terminal companion to keys: it talks to the process, not
+the command loop."
   (let ((payload (if text-b64 (elate--decode-string text-b64) "")))
     (when as-kbd
       (setq payload (concat (kbd payload))))
-    (elate--send-to-process name payload)))
+    (elate--send-to-process name payload process)))
 
-(defun elate--rpc-send-process-file (path &optional name)
+(defun elate--rpc-send-process-file (path &optional name process)
   "Send the contents of PATH to the subprocess of buffer NAME.
 For payloads too large for the argv limit -- PATH is read inside Emacs
-rather than carried through emacsclient's command line."
+rather than carried through emacsclient's command line.  PROCESS as in
+`elate--rpc-send-process'."
   (elate--send-to-process
-   name (with-temp-buffer (insert-file-contents path) (buffer-string))))
+   name (with-temp-buffer (insert-file-contents path) (buffer-string))
+   process))
 
 ;;;; describe
 

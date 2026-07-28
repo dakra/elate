@@ -85,6 +85,7 @@ def create_dirs(session_dir: Path) -> dict[str, Path]:
         "init": session_dir / "init",
         "server": session_dir / "server",
         "log": session_dir / "log",
+        "scratch": session_dir / "scratch",
     }
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
@@ -310,7 +311,7 @@ def build_sandbox(
 # override them (that would break $HOME isolation / home_seed).
 RESERVED_ENV = frozenset(
     {"HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
-     "XDG_CACHE_HOME"})
+     "XDG_CACHE_HOME", "ELATE_SCRATCH", "ELATE_SESSION"})
 
 # A POSIX environment-variable name. Enforced because the tty boot builds a
 # shell `env NAME=value ...` prefix: an unconstrained NAME (e.g. containing
@@ -339,12 +340,16 @@ def validate_env(env: dict[str, str]) -> None:
 
 
 def environment(session_dir: Path,
-                extra: dict[str, str] | None = None) -> dict[str, str]:
+                extra: dict[str, str] | None = None,
+                name: str | None = None) -> dict[str, str]:
     """Environment overrides isolating the session from the real $HOME.
 
     EXTRA carries user-supplied vars (session "env"); they are added but
     can never override the isolation vars above (validated loudly upstream,
-    and defended here).
+    and defended here). $ELATE_SCRATCH points eval'd code at the session's
+    private scratch directory, and $ELATE_SESSION (when NAME is given)
+    carries the session's own name -- so in-session code has a canonical
+    collision-free place for artifacts without being told one.
     """
     home = session_dir / "home"
     env = {
@@ -353,7 +358,10 @@ def environment(session_dir: Path,
         "XDG_DATA_HOME": str(home / ".local/share"),
         "XDG_STATE_HOME": str(home / ".local/state"),
         "XDG_CACHE_HOME": str(home / ".cache"),
+        "ELATE_SCRATCH": str(session_dir / "scratch"),
     }
+    if name:
+        env["ELATE_SESSION"] = name
     for k, v in (extra or {}).items():
         env.setdefault(k, v)  # isolation vars win
     return env

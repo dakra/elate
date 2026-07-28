@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fnmatch
 import json
 import os
 import re
@@ -130,6 +131,15 @@ def build_parser() -> argparse.ArgumentParser:
                      help="force machine-readable JSON output")
     out.add_argument("--human", action="store_true",
                      help="force the human-readable table, even when piped")
+    p.add_argument("--field", metavar="NAME",
+                   help="print just this one field of the result, bare (no "
+                        "JSON envelope): strings unquoted, booleans "
+                        "true/false, null, objects/arrays as compact JSON -- "
+                        "so shell can test it with no parser: "
+                        "[ \"$(elate --field name info X)\" = X ]. On "
+                        "failure nothing goes to stdout (error on stderr, "
+                        "usual exit code); an unknown field is a usage "
+                        "error (exit 2) naming the available ones")
     p.add_argument("-s", "--session", metavar="NAME", help="session to operate on")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -180,11 +190,31 @@ def build_parser() -> argparse.ArgumentParser:
                          "and the subprocesses it spawns (repeatable); cannot "
                          "override the sandbox's HOME/XDG_* isolation vars")
     sp.add_argument("--size", type=_parse_size, default=(120, 36), metavar="COLSxROWS")
+    sp.add_argument("--owner", metavar="NAME",
+                    help="tag the session with an owner (e.g. an agent id); "
+                         "list/stop/purge can then select by --owner, so "
+                         "concurrent agents manage only their own sessions")
+    sp.add_argument("--ttl", metavar="DUR", type=_parse_duration,
+                    help="idle time-to-live (e.g. 30m, 2h; bare number = "
+                         "seconds, minimum 30s): once the session has seen "
+                         "no commands for this long it is stopped AND purged "
+                         "by an opportunistic sweep any later elate command "
+                         "runs -- so sessions leaked by a crashed agent "
+                         "clean themselves up instead of accumulating")
 
-    sp = sub.add_parser("stop", help="stop a session (or --all)")
+    sp = sub.add_parser("stop", help="stop a session (or --all / a filter)")
     sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
     sp.add_argument("--all", action="store_true", dest="all_sessions",
                     help="stop every running session (instead of a name)")
+    sp.add_argument("--glob", metavar="PATTERN", dest="name_glob",
+                    help="stop running sessions whose name matches this "
+                         "glob (e.g. 'rx-*') -- a bulk selector like --all")
+    sp.add_argument("--name-prefix", metavar="PREFIX",
+                    help="stop running sessions whose name starts with "
+                         "PREFIX -- a bulk selector like --all")
+    sp.add_argument("--owner", metavar="NAME",
+                    help="stop running sessions started with --owner NAME; "
+                         "combines with --glob/--name-prefix")
 
     sp = sub.add_parser(
         "interrupt",
@@ -208,6 +238,8 @@ def build_parser() -> argparse.ArgumentParser:
                     default="all",
                     help="filter by liveness: running, stopped (stopped/dead/"
                          "corrupt), or all (default)")
+    sp.add_argument("--owner", metavar="NAME",
+                    help="only sessions started with --owner NAME")
     sp.add_argument("--older-than", metavar="DUR", type=_parse_duration,
                     help="only show sessions inert at least this long "
                          "(e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- "
@@ -239,6 +271,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--name-prefix", metavar="PREFIX",
                     help="purge sessions whose name starts with PREFIX (e.g. "
                          "'run-') -- a bulk selector like --all")
+    sp.add_argument("--owner", metavar="NAME",
+                    help="purge sessions started with --owner NAME -- a bulk "
+                         "selector like --all; combines with the other "
+                         "filters")
 
     sp = sub.add_parser(
         "prune",
@@ -259,9 +295,30 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--name-prefix", metavar="PREFIX",
                     help="prune sessions whose name starts with PREFIX "
                          "(e.g. 'run-') -- a bulk selector like --all")
+    sp.add_argument("--owner", metavar="NAME",
+                    help="prune sessions started with --owner NAME -- a "
+                         "bulk selector like --all")
 
     sp = sub.add_parser("info", help="show session details")
     sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
+
+    sp = sub.add_parser(
+        "path",
+        help="print a session's private scratch directory (or another "
+             "sandbox path)",
+        description="Print one on-disk path of the session, the scratch "
+                    "directory by default: a per-session private directory "
+                    "for setup files and artifacts, safe from concurrent "
+                    "agents (in-session code sees it as $ELATE_SCRATCH). "
+                    "Prints the bare path, so it substitutes cleanly: "
+                    "cp setup.el \"$(elate -s NAME path)\"/. Works for "
+                    "stopped sessions too.")
+    sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
+    sp.add_argument("--kind", choices=["scratch", "dir", "home", "log"],
+                    default="scratch",
+                    help="which path: scratch (default; created on demand), "
+                         "dir (the sandbox root), home (the fake $HOME), "
+                         "log (Emacs stderr/GUI logs)")
 
     sp = sub.add_parser(
         "keys", help="send keys (Emacs kbd notation)",
@@ -313,7 +370,11 @@ def build_parser() -> argparse.ArgumentParser:
                     "for driving shells/REPLs/terminals. Unlike keys/type "
                     "(which talk to Emacs), this talks to the subprocess: "
                     "send ^C to interrupt a job, seed shell history, feed a "
-                    "REPL. Errors if the buffer has no live process.")
+                    "REPL. Targeting rule: the buffer must have exactly one "
+                    "live process -- none or several is an error naming the "
+                    "candidates (never a silent pick); disambiguate with "
+                    "--process. The result echoes the process's name and "
+                    "command line so a wrong target is visible.")
     grp = sp.add_mutually_exclusive_group(required=True)
     grp.add_argument("text", nargs="?", help="literal text to send")
     grp.add_argument("--char", metavar="KBD",
@@ -323,7 +384,13 @@ def build_parser() -> argparse.ArgumentParser:
                      help="send the contents of PATH (read inside Emacs; for "
                           "payloads past the argv size limit)")
     sp.add_argument("--buffer", metavar="NAME",
-                    help="buffer whose process to target (default: current)")
+                    help="buffer whose process to target (default: current); "
+                         "must have exactly one live process unless "
+                         "--process picks one")
+    sp.add_argument("--process", metavar="NAME",
+                    help="target this process by name (`get-process`), for "
+                         "buffers with several processes; with --buffer the "
+                         "process must belong to that buffer")
 
     sp = sub.add_parser("mouse", help="synthesize a mouse interaction "
                                       "(semantic; works for tty and gui)")
@@ -427,6 +494,23 @@ def build_parser() -> argparse.ArgumentParser:
                          "a thread backtrace of the wedged Emacs (macOS "
                          "`sample`; Linux eu-stack/gdb) and attaches it to "
                          "the error; 'none' (default) does not")
+    sp.add_argument("--json-result", action="store_true",
+                    help="serialize the elisp value to real JSON inside the "
+                         "session, so `value` is a queryable object "
+                         "(jq .value.mode), not a printed sexp string. "
+                         "Plists/alists of atoms map cleanly (nil -> null, "
+                         "t -> true, symbols -> names); a value with no "
+                         "faithful JSON shape (buffers, markers, circular "
+                         "structures) falls back to the printed string -- "
+                         "the result's value-encoding says which came back "
+                         "('json' or 'printed'), check it")
+    sp.add_argument("--raw", action="store_true", dest="raw_value",
+                    help="print just the value, no JSON envelope -- shell "
+                         "tests it directly: [ \"$(elate -s N eval --raw "
+                         "'major-mode')\" = fundamental-mode ]. On an elisp "
+                         "error nothing goes to stdout (error on stderr, "
+                         "exit 1). Shorthand for the global --field value; "
+                         "combine with --json-result for the bare JSON value")
 
     sp = sub.add_parser(
         "trace",
@@ -622,12 +706,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("wait", help="wait for a condition (exit 3 on timeout)")
     sp.add_argument("condition",
-                    choices=["idle", "text", "prompt", "stable", "dead"])
+                    choices=["idle", "text", "prompt", "stable", "until",
+                             "dead"])
     sp.add_argument("args", nargs="*",
                     help="idle: [MIN_IDLE_SECS]; text: REGEXP (Python regex "
-                         "syntax, not elisp); prompt/stable/dead: none")
-    sp.add_argument("--buffer", help="buffer to search (wait text) or watch "
-                                     "(wait stable); may not exist yet")
+                         "syntax, not elisp); until: an elisp predicate "
+                         "form, polled until non-nil (an elisp error fails "
+                         "the wait -- wrap in ignore-errors if an error "
+                         "means \"not yet\"); prompt/stable/dead: none")
+    sp.add_argument("--buffer", help="buffer to search (wait text), watch "
+                                     "(wait stable; may not exist yet), or "
+                                     "evaluate the predicate in (wait until)")
     sp.add_argument("--quiet-ms", type=int, default=300, metavar="MS",
                     help="wait stable: settle threshold -- the buffer must be "
                          "unchanged for this many ms (default 300)")
@@ -900,6 +989,8 @@ def cmd_start(args: argparse.Namespace) -> Result:
         ui=args.ui,
         headless=args.headless,
         replace=args.replace,
+        owner=args.owner,
+        ttl=args.ttl,
     )
     info = S.session_info(sess.name)
     human = (
@@ -925,16 +1016,29 @@ def cmd_start(args: argparse.Namespace) -> Result:
 
 
 def cmd_stop(args: argparse.Namespace) -> Result:
-    if args.all_sessions:
+    filtered = (args.name_glob is not None or args.name_prefix is not None
+                or args.owner is not None)
+    if args.all_sessions or filtered:
         if args.name or args.session:
-            raise ElateError("give a session name or --all, not both")
-        running = [s["name"] for s in S.list_sessions()
-                   if s["status"] == "running"]
-        for n in running:
+            raise ElateError(
+                "give a session name or a bulk selector "
+                "(--all/--glob/--name-prefix/--owner), not both")
+        running = [s for s in S.list_sessions() if s["status"] == "running"]
+        if args.name_glob is not None:
+            running = [s for s in running
+                       if fnmatch.fnmatch(s["name"], args.name_glob)]
+        if args.name_prefix is not None:
+            running = [s for s in running
+                       if s["name"].startswith(args.name_prefix)]
+        if args.owner is not None:
+            running = [s for s in running if s.get("owner") == args.owner]
+        names = [s["name"] for s in running]
+        for n in names:
             S.stop_session(n)
-        human = (f"stopped {len(running)} session(s): {', '.join(running)}"
-                 if running else "no running sessions to stop")
-        return {"stopped": running}, human, 0
+        what = "" if args.all_sessions and not filtered else "matching "
+        human = (f"stopped {len(names)} {what}session(s): {', '.join(names)}"
+                 if names else f"no running {what}sessions to stop")
+        return {"stopped": names}, human, 0
     name = _name_arg(args)
     result = S.stop_session(name)
     if result.get("stopped"):
@@ -954,7 +1058,8 @@ def cmd_purge(args: argparse.Namespace) -> Result:
     result = S.purge_sessions(args.names, all_sessions=args.all_sessions,
                               stopped_older_than=args.stopped_older_than,
                               name_glob=args.name_glob,
-                              name_prefix=args.name_prefix)
+                              name_prefix=args.name_prefix,
+                              owner=args.owner)
     purged = result["purged"]
     skipped = result["skipped_running"]
     recent = result.get("skipped_recent") or []
@@ -984,6 +1089,8 @@ def cmd_list(args: argparse.Namespace) -> Result:
         sessions = [s for s in sessions if s["status"] == "running"]
     elif args.status == "stopped":  # everything inert: stopped/dead/corrupt
         sessions = [s for s in sessions if s["status"] != "running"]
+    if args.owner is not None:
+        sessions = [s for s in sessions if s.get("owner") == args.owner]
     older_than = getattr(args, "older_than", None)
     if older_than is not None:
         # Running sessions have idle_for=None -> excluded, so this lists
@@ -995,10 +1102,17 @@ def cmd_list(args: argparse.Namespace) -> Result:
         what = (f"no session named {name!r}" if name else
                 f"no sessions inert for {_fmt_duration(older_than)}"
                 if older_than is not None else
+                f"no sessions owned by {args.owner!r}"
+                if args.owner is not None else
                 "no sessions" if args.status == "all" else
                 f"no {args.status} sessions")
         return {"sessions": sessions}, what, 0
-    lines = [f"{'NAME':<20} {'UI':<4} {'STATUS':<11} {'EMACS':<10} AGE"]
+    # The OWNER column appears only when some session carries an owner
+    # tag, so single-agent listings keep the compact four-column table.
+    owned = any(s.get("owner") for s in sessions)
+    header = f"{'NAME':<20} {'UI':<4} {'STATUS':<11} {'EMACS':<10} "
+    header += f"{'OWNER':<12} AGE" if owned else "AGE"
+    lines = [header]
     for s in sessions:
         if s.get("uptime") is not None:
             age = f"up {_fmt_duration(s['uptime'])}"
@@ -1006,6 +1120,8 @@ def cmd_list(args: argparse.Namespace) -> Result:
             age = f"idle {_fmt_duration(s['idle_for'])}"
         else:
             age = "-"
+        if s.get("expires_in") is not None:
+            age += f" (ttl: {_fmt_duration(s['expires_in'])} left)"
         # A dead session renders its fatal signal inline ("dead (SIGABRT)");
         # the JSON keeps the stable status + a separate signal field.
         status = s["status"]
@@ -1013,10 +1129,11 @@ def cmd_list(args: argparse.Namespace) -> Result:
             status = f"{status} ({s['signal']})"
         elif s.get("orphans"):
             status = f"{status} +{s['orphans']} orphan(s)"
-        lines.append(
-            f"{s['name']:<20} {s.get('ui') or '-':<4} {status:<11} "
-            f"{s.get('emacs_version') or '-':<10} {age}"
-        )
+        line = (f"{s['name']:<20} {s.get('ui') or '-':<4} {status:<11} "
+                f"{s.get('emacs_version') or '-':<10} ")
+        if owned:
+            line += f"{s.get('owner') or '-':<12} "
+        lines.append(line + age)
     inert = sum(1 for s in sessions if s["status"] != "running")
     if inert >= 5:
         lines.append(f"\n{inert} inert session(s) -- reclaim their sandboxes "
@@ -1028,6 +1145,20 @@ def cmd_info(args: argparse.Namespace) -> Result:
     info = S.session_info(_name_arg(args))
     human = "\n".join(f"{k}: {v}" for k, v in info.items())
     return info, human, 0
+
+
+def cmd_path(args: argparse.Namespace) -> Result:
+    sess = S.load_session(_name_arg(args))
+    if args.kind == "scratch":
+        path = sess.scratch_dir()
+    elif args.kind == "dir":
+        path = sess.dir
+    elif args.kind == "home":
+        path = sess.dir / "home"
+    else:  # log
+        path = sess.dir / "log"
+    data = {"name": sess.name, "kind": args.kind, "path": str(path)}
+    return data, str(path), 0
 
 
 def cmd_keys(args: argparse.Namespace) -> Result:
@@ -1067,17 +1198,20 @@ def cmd_type(args: argparse.Namespace) -> Result:
 def cmd_send_process(args: argparse.Namespace) -> Result:
     sess = _require_session(args)
     if args.file is not None:
-        data = sess.semantic().rpc("send-process-file", args.file, args.buffer)
+        data = sess.semantic().rpc("send-process-file", args.file, args.buffer,
+                                   args.process)
         what = f"file {args.file!r}"
         kind = "file"
     else:
         payload = args.char if args.char is not None else args.text
         as_kbd = args.char is not None
         b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
-        data = sess.semantic().rpc("send-process", args.buffer, b64, as_kbd)
+        data = sess.semantic().rpc("send-process", args.buffer, b64, as_kbd,
+                                   args.process)
         what = f"{args.char!r} (kbd)" if as_kbd else f"{len(payload)} chars"
         kind = "char" if as_kbd else "text"
-    sess.log("send-process", buffer=args.buffer, kind=kind)
+    sess.log("send-process", buffer=args.buffer, process=args.process,
+             kind=kind)
     human = (f"sent {what} to {data.get('process')} "
              f"({data.get('bytes')} bytes) in {data.get('buffer')}")
     return data, human, 0
@@ -1151,7 +1285,8 @@ def cmd_eval(args: argparse.Namespace) -> Result:
     try:
         data = sess.semantic().eval_form(args.form, timeout=args.timeout,
                                           backtrace=args.backtrace,
-                                          buffer=args.buffer)
+                                          buffer=args.buffer,
+                                          json_result=args.json_result)
     except EvalTimeout as exc:
         busy = sess.is_busy()
         sess.log("eval-timeout", form=args.form)
@@ -1201,7 +1336,10 @@ def cmd_eval(args: argparse.Namespace) -> Result:
         # Exit 1 below; make the JSON "ok" flag agree with the exit code.
         data = {**data, "ok": False}
     else:
-        parts.append(str(data.get("value")))
+        if data.get("value-encoding") == "json":
+            parts.append(json.dumps(data.get("value"), ensure_ascii=False))
+        else:
+            parts.append(str(data.get("value")))
         if data.get("truncated"):
             parts.append(
                 f"(value truncated to {len(data.get('value') or '')} chars; "
@@ -1806,6 +1944,13 @@ def cmd_wait(args: argparse.Namespace) -> Result:
                              quiet_ms=args.quiet_ms, timeout=args.timeout)
         return (data, f"stable: {data['buffer']} unchanged for "
                       f"{data['quiet_ms']}ms ({data['ticks_seen']} edits seen)", 0)
+    if args.condition == "until":
+        if len(args.args) != 1:
+            raise ElateError("wait until needs exactly one elisp predicate "
+                             "form (quote it as a single argument)")
+        data = S.wait_until(sess, args.args[0], buffer=args.buffer,
+                            timeout=args.timeout)
+        return data, f"until: predicate returned {data.get('value')}", 0
     # prompt
     data = S.wait_prompt(sess, timeout=args.timeout)
     return data, f"prompt: {data.get('prompt')!r} (contents: {data.get('contents')!r})", 0
@@ -2021,9 +2166,11 @@ def cmd_run(args: argparse.Namespace) -> Result:
         target = S.load_session(args.session)
     total = len(script.get("steps") or [])
     fmt = args.format
-    # Per-step streaming lines only make sense for the human summary; JSON
-    # and the junit/tap documents are printed whole at the end.
-    stream = fmt == "human" or (fmt is None and not args.json)
+    # Per-step streaming lines only make sense for the human summary; JSON,
+    # the junit/tap documents, and --field's single bare value are printed
+    # whole at the end (streamed lines would pollute a $(...) capture).
+    stream = (fmt == "human" or (fmt is None and not args.json)) \
+        and not getattr(args, "field_mode", False)
     on_step = None
     if stream:
         def on_step(rec: dict[str, Any]) -> None:
@@ -2331,7 +2478,8 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
     }
 
     fmt = args.format
-    stream = fmt == "human" or (fmt is None and not args.json)
+    stream = (fmt == "human" or (fmt is None and not args.json)) \
+        and not getattr(args, "field_mode", False)
     on_step = None
     if stream:
         def on_step(rec: dict[str, Any]) -> None:
@@ -2425,6 +2573,7 @@ _COMMANDS = {
     "purge": cmd_purge,
     "prune": cmd_purge,  # alias
     "info": cmd_info,
+    "path": cmd_path,
     "logs": cmd_logs,
     "stderr": cmd_logs,  # alias
     "keys": cmd_keys,
@@ -2458,13 +2607,53 @@ _COMMANDS = {
 }
 
 
+def _field_text(result: dict[str, Any], field: str) -> str:
+    """One result field rendered bare for direct shell consumption.
+
+    Strings print unquoted, booleans as true/false, None as null,
+    numbers plainly, and anything structured as compact JSON -- so
+    `[ "$(elate --field name info X)" = X ]` needs no parser at all.
+    """
+    if field not in result:
+        have = ", ".join(sorted(result))
+        raise UsageError(
+            f"--field {field!r}: the result has no such field (it has: "
+            f"{have})")
+    v = result[field]
+    if isinstance(v, str):
+        return v
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if v is None:
+        return "null"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return json.dumps(v, ensure_ascii=False)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     # Resolve the output mode once: explicit --json/--human win; otherwise
     # emit JSON when stdout is not a TTY (an agent or a pipe) and the human
     # table on a real terminal. Assigning back to args.json keeps every
     # downstream check (including run/matrix progress streaming) correct.
+    # --field NAME (and eval --raw = --field value) prints one bare result
+    # field for direct shell consumption; it owns the output, so an
+    # explicit --json/--human alongside is a contradiction, not a merge.
+    field = args.field or ("value" if getattr(args, "raw_value", False) else None)
+    if field is not None and (args.json or args.human):
+        print("elate: --field/--raw already choose the output; "
+              "drop --json/--human", file=sys.stderr)
+        return 2
     args.json = args.json or (not args.human and not sys.stdout.isatty())
+    if field is not None:
+        # Failures must keep stdout empty -- an error blob inside $(...)
+        # would be compared as a value -- so force the human/stderr error
+        # path; field_mode also suppresses run/matrix progress streaming.
+        args.json = False
+    args.field_mode = field is not None
     if args.command == "mcp":
         # Serve MCP over stdio. Imported lazily so plain CLI use never
         # pays for (or requires) the mcp package import machinery, and
@@ -2485,6 +2674,16 @@ def main(argv: list[str] | None = None) -> int:
         except ElateError as exc:
             print(f"elate: {exc}", file=sys.stderr)
             return 1
+    # Opportunistic TTL sweep (throttled; only sessions started with --ttl):
+    # any elate invocation reaps sessions leaked by a crashed agent. The
+    # session this command targets is exempt -- it must not vanish between
+    # two of its owner's own calls.
+    reaped = S.maybe_reap_expired(
+        exclude=args.session or getattr(args, "name", None))
+    if reaped:
+        names = ", ".join(r["name"] for r in reaped)
+        print(f"elate: reaped {len(reaped)} session(s) idle past their "
+              f"--ttl: {names}", file=sys.stderr)
     try:
         result, human, code = _COMMANDS[args.command](args)
     except WaitTimeout as exc:
@@ -2534,12 +2733,29 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"elate: {exc}", file=sys.stderr)
         return 1
+    except UsageError as exc:
+        print(f"elate: {exc}", file=sys.stderr)
+        return 2
     except ElateError as exc:
         if args.json:
             print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         else:
             print(f"elate: {exc}", file=sys.stderr)
         return 1
+    if field is not None:
+        # A non-zero code (e.g. an elisp eval error) prints nothing to
+        # stdout: `[ "$(elate … --raw)" = x ]` must compare against
+        # emptiness, not an error rendering.
+        if code != 0:
+            print(f"elate: {human}" if human else "elate: failed",
+                  file=sys.stderr)
+            return code
+        try:
+            print(_field_text(result, field))
+        except UsageError as exc:
+            print(f"elate: {exc}", file=sys.stderr)
+            return 2
+        return code
     # A command-local --format (run) overrides the global --json/--human:
     # 'json' forces JSON, 'human'/'junit'/'tap' force the text in `human`.
     fmt = getattr(args, "format", None)

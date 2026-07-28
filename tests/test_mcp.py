@@ -38,6 +38,7 @@ NAME = f"m{os.getpid()}"
 
 EXPECTED_TOOLS = {
     "elate_start", "elate_stop", "elate_interrupt", "elate_list", "elate_info",
+    "elate_path",
     "elate_keys", "elate_type", "elate_send_process", "elate_mouse",
     "elate_focus", "elate_send_events",
     "elate_eval", "elate_state", "elate_screenshot",
@@ -291,6 +292,21 @@ def test_eval_roundtrip(elate_home: str, mcp_session: dict[str, Any]) -> None:
     out = one_call(elate_home, "elate_eval", {"session": NAME, "form": "(+ 1 2)"})
     assert out["ok"] is True
     assert out["value"] == "3"
+
+def test_eval_json_result(elate_home: str, mcp_session: dict[str, Any]) -> None:
+    out = one_call(elate_home, "elate_eval",
+                   {"session": NAME, "form": "(list :mode 'emacs :ro t)",
+                    "json_result": True})
+    assert out["ok"] is True
+    assert out["value"] == {"mode": "emacs", "ro": True}
+    assert out["value-encoding"] == "json"
+    # No faithful JSON shape -> flagged printed fallback.
+    out = one_call(elate_home, "elate_eval",
+                   {"session": NAME, "form": "(current-buffer)",
+                    "json_result": True})
+    assert out["value-encoding"] == "printed"
+    assert isinstance(out["value"], str)
+
 
 def test_eval_elisp_error_embeds_state(elate_home: str,
                                        mcp_session: dict[str, Any]) -> None:

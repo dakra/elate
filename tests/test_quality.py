@@ -1109,6 +1109,45 @@ def test_send_process_drives_subprocess(sess: S.Session) -> None:
         ' (ignore-errors (kill-buffer "*shell*")))')
 
 
+def test_send_process_multi_process_guard(sess: S.Session) -> None:
+    # Two live processes on one buffer: sending by buffer alone must error
+    # naming both (never a silent pick); the process argument disambiguates.
+    assert sess.semantic().eval_form(
+        '(with-current-buffer (get-buffer-create "*eltest-multi*")'
+        ' (make-process :name "eltest-a" :buffer (current-buffer)'
+        '               :command (list "cat"))'
+        ' (make-process :name "eltest-b" :buffer (current-buffer)'
+        '               :command (list "cat"))'
+        ' t)')["error"] is None
+    try:
+        with pytest.raises(RpcError, match="2 live processes.*eltest-[ab].*eltest-[ab]"):
+            sess.semantic().rpc("send-process", "*eltest-multi*",
+                                _b64("x\n"), False)
+        data = sess.semantic().rpc("send-process", "*eltest-multi*",
+                                   _b64("x\n"), False, "eltest-b")
+        assert data["process"] == "eltest-b"
+        assert data["buffer"] == "*eltest-multi*"
+        assert data["command"] == "cat"
+        # A process name alone works, without a buffer.
+        data = sess.semantic().rpc("send-process", None,
+                                   _b64("y\n"), False, "eltest-a")
+        assert data["process"] == "eltest-a"
+        # Wrong buffer for the named process is caught, not honored.
+        with pytest.raises(RpcError, match="belongs to buffer"):
+            sess.semantic().rpc("send-process", "*scratch*",
+                                _b64("z\n"), False, "eltest-a")
+        # An unknown process name errors and lists what is live.
+        with pytest.raises(RpcError, match="no live process named"):
+            sess.semantic().rpc("send-process", None,
+                                _b64("z\n"), False, "eltest-nope")
+    finally:
+        sess.semantic().eval_form(
+            '(progn (ignore-errors (delete-process "eltest-a"))'
+            ' (ignore-errors (delete-process "eltest-b"))'
+            ' (let ((kill-buffer-query-functions nil))'
+            '  (ignore-errors (kill-buffer "*eltest-multi*"))))')
+
+
 # -- wait stable (buffer-output settled) -------------------------------------
 
 def test_wait_stable_settles_after_async_output(sess: S.Session) -> None:
@@ -1137,6 +1176,134 @@ def test_wait_stable_buffer_appears_later(sess: S.Session) -> None:
     data = S.wait_stable(sess, buffer="ellater", quiet_ms=200, timeout=8.0)
     assert data["buffer"] == "ellater"
     sess.semantic().eval_form('(kill-buffer "ellater")')
+
+
+# -- eval --json-result (real JSON values, not printed sexps) ----------------
+
+def _jeval(sess: S.Session, form: str) -> dict:
+    return sess.semantic().eval_form(form, json_result=True)
+
+
+def test_json_result_maps_plists_and_atoms(sess: S.Session) -> None:
+    data = _jeval(sess, "(list :mode 'emacs :ro t :point 316 :name nil)")
+    assert data["value-encoding"] == "json"
+    assert data["value"] == {"mode": "emacs", "ro": True,
+                             "point": 316, "name": None}
+    # Atoms at top level: t/nil/number/string/symbol.
+    assert _jeval(sess, "t")["value"] is True
+    assert _jeval(sess, "nil")["value"] is None          # nil -> null, by rule
+    assert _jeval(sess, "42")["value"] == 42
+    assert _jeval(sess, "1.5")["value"] == 1.5
+    assert _jeval(sess, '"hi"')["value"] == "hi"
+    assert _jeval(sess, "'foo-bar")["value"] == "foo-bar"  # symbol -> name
+    assert _jeval(sess, ":kw")["value"] == ":kw"  # keyword VALUE keeps colon
+
+
+def test_json_result_maps_lists_alists_vectors_hashes(sess: S.Session) -> None:
+    assert _jeval(sess, "(list 1 2 3)")["value"] == [1, 2, 3]
+    assert _jeval(sess, "[1 \"a\" nil]")["value"] == [1, "a", None]
+    assert _jeval(sess, "'((a . 1) (\"b\" . \"x\"))")["value"] == \
+        {"a": 1, "b": "x"}
+    data = _jeval(sess, '(let ((h (make-hash-table :test #\'equal)))'
+                        ' (puthash "k" 7 h) h)')
+    assert data["value"] == {"k": 7}
+    # Nesting converts recursively.
+    assert _jeval(sess, "(list :xs (list 1 2) :meta '((deep . [t])))")[
+        "value"] == {"xs": [1, 2], "meta": {"deep": [True]}}
+    # A list of plists is a list of RECORDS -> an array of objects, never
+    # mapcan'd into one object that drops all but the first record.
+    assert _jeval(sess, "(list (list :name \"x\" :size 1)"
+                        " (list :name \"y\" :size 2))")["value"] == \
+        [{"name": "x", "size": 1}, {"name": "y", "size": 2}]
+
+
+def test_json_result_falls_back_to_printed_and_says_so(sess: S.Session) -> None:
+    # A buffer object has no faithful JSON shape.
+    data = _jeval(sess, "(current-buffer)")
+    assert data["value-encoding"] == "printed"
+    assert isinstance(data["value"], str) and "#<buffer" in data["value"]
+    # A circular list fails proper-list-p ("improper list"), cleanly, not
+    # an endless walk; a circular vector nest trips the depth guard.
+    data = _jeval(sess, "(let ((l (list 1 2))) (setcdr (cdr l) l) l)")
+    assert data["value-encoding"] == "printed"
+    assert isinstance(data["value"], str)
+    data = _jeval(sess, "(let ((v (vector 1 nil))) (aset v 1 v) v)")
+    assert data["value-encoding"] == "printed"
+    # A non-finite float cannot be JSON.
+    assert _jeval(sess, "(/ 1.0 0)")["value-encoding"] == "printed"
+    # A keyword-car alist is neither plist nor alist -> printed, whole.
+    assert _jeval(sess, "'((:a . 1))")["value-encoding"] == "printed"
+    # Cross-type keys normalizing to the same name (symbol a / string "a")
+    # would silently drop an entry -> printed, whole.
+    data = _jeval(sess, "(let ((h (make-hash-table :test #'equal)))"
+                        " (puthash 'a 1 h) (puthash \"a\" 2 h) h)")
+    assert data["value-encoding"] == "printed"
+    # Without the flag, everything stays the printed string it always was.
+    data = sess.semantic().eval_form("(list :a 1)")
+    assert data["value-encoding"] == "printed"
+    assert data["value"] == "(:a 1)"
+
+
+def test_json_result_error_reply_unchanged(sess: S.Session) -> None:
+    data = _jeval(sess, "(error \"boom\")")
+    assert data["error"] and data["value"] is None
+
+
+# -- wait until (arbitrary elisp predicate) ----------------------------------
+
+def test_wait_until_predicate_turns_true(sess: S.Session) -> None:
+    sess.semantic().eval_form(
+        '(progn (setq eluntil-flag nil)'
+        ' (run-at-time 0.4 nil (lambda () (setq eluntil-flag (quote ready))))'
+        ' t)')
+    data = S.wait_until(sess, "eluntil-flag", timeout=5.0)
+    assert data["value"] == "ready"
+    assert data["form"] == "eluntil-flag"
+
+
+def test_wait_until_times_out_with_state(sess: S.Session) -> None:
+    with pytest.raises(WaitTimeout) as exc_info:
+        S.wait_until(sess, "nil", timeout=1.0)
+    assert "non-nil" in str(exc_info.value)
+    assert exc_info.value.state
+
+
+def test_wait_until_predicate_error_fails_fast(sess: S.Session) -> None:
+    # A broken predicate (void-function) must fail immediately, not be
+    # polled past until the deadline hides the typo.
+    start = time.monotonic()
+    with pytest.raises(ElateError, match="ignore-errors"):
+        S.wait_until(sess, "(eluntil-no-such-fn)", timeout=8.0)
+    assert time.monotonic() - start < 4.0
+
+
+def test_wait_until_slow_predicate_gets_the_remaining_budget(
+        sess: S.Session) -> None:
+    # A predicate that legitimately takes seconds must succeed within the
+    # outer --timeout (a fixed short per-probe eval timeout would abort it
+    # every poll and make the wait unwinnable).
+    data = S.wait_until(sess, "(progn (sleep-for 4) 'done)", timeout=15.0)
+    assert data["value"] == "done"
+
+
+def test_wait_until_predicate_outrunning_budget_times_out(
+        sess: S.Session) -> None:
+    # ...and one that outruns the whole budget is a normal WaitTimeout,
+    # not a bogus "predicate errored / wrap in ignore-errors" failure.
+    with pytest.raises(WaitTimeout):
+        S.wait_until(sess, "(progn (sleep-for 30) t)", timeout=2.0)
+
+
+def test_wait_until_evaluates_in_buffer(sess: S.Session) -> None:
+    sess.semantic().eval_form(
+        '(with-current-buffer (get-buffer-create "eluntil-buf")'
+        ' (insert "marker-42") t)')
+    try:
+        data = S.wait_until(sess, '(string-match-p "marker-42" (buffer-string))',
+                            buffer="eluntil-buf", timeout=5.0)
+        assert data["value"] != "nil"
+    finally:
+        sess.semantic().eval_form('(ignore-errors (kill-buffer "eluntil-buf"))')
 
 
 def test_wait_stable_times_out_on_continuous_change(sess: S.Session) -> None:

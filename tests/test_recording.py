@@ -88,6 +88,7 @@ PASS_SCRIPT = {
         {"type": "typed!"},
         {"wait": "text", "pattern": "typ.d!", "buffer": "*scratch*",
          "timeout": 10},
+        {"wait": "until", "pred": '(get-buffer "*scratch*")', "timeout": 10},
         {"assert": {"buffer_contains": "hi", "buffer": "*scratch*"}},
         {"assert": {"buffer_matches": "^typ.d!$", "buffer": "*scratch*"}},
         {"assert": {"state": {"buffer": "*scratch*"}}},
@@ -124,6 +125,10 @@ def test_validate_script_errors() -> None:
         ({"steps": [{"keys": "a", "delivery": "psychic"}]}, "delivery"),
         ({"steps": [{"wait": "text"}]}, "pattern"),
         ({"steps": [{"wait": "forever"}]}, "wait"),
+        ({"steps": [{"wait": "until"}]}, "pred"),
+        ({"steps": [{"wait": "until", "pred": 7}]}, "pred"),
+        ({"steps": [{"wait": "until", "pred": "t", "pattern": "x"}]},
+         "not apply"),
         ({"steps": [{"eval": "1", "timeout": -3}]}, "timeout"),
         ({"steps": [{"eval": "1", "timeout": 9999}]}, "timeout"),
         ({"steps": [{"lint": []}]}, "non-empty"),
@@ -325,6 +330,8 @@ def test_sandbox_validate_env_rejects_unsafe_keys() -> None:
             sandbox.validate_env(bad)
     with pytest.raises(ElateError, match="isolation"):
         sandbox.validate_env({"HOME": "/evil"})                  # reserved
+    with pytest.raises(ElateError, match="isolation"):
+        sandbox.validate_env({"ELATE_SCRATCH": "/elsewhere"})    # reserved
 
 
 def test_state_match_operators() -> None:
@@ -564,6 +571,14 @@ def test_event_step_wait_shapes() -> None:
     assert SC._event_step({"event": "wait", "condition": "prompt",
                            "buffer": "*scratch*", "timeout": 10.0}) == {
         "wait": "prompt"}
+    # until: CLI shape (pred in args[0]) and MCP/script shape (pred field).
+    assert SC._event_step({"event": "wait", "condition": "until",
+                           "args": ["(featurep 'x)"], "timeout": 10.0}) == {
+        "wait": "until", "pred": "(featurep 'x)"}
+    assert SC._event_step({"event": "wait", "condition": "until",
+                           "pred": "t", "buffer": "b", "timeout": 10.0,
+                           "via": "mcp"}) == {
+        "wait": "until", "pred": "t", "buffer": "b"}
 
 
 # -- elate run ----------------------------------------------------------------
@@ -578,7 +593,7 @@ def test_run_script_passes_and_tears_down(
     assert out["ok"] is True and out["success"] is True
     assert out["fresh_session"] is True and out["kept"] is False
     assert out["emacs_version"]
-    assert out["passed"] == 10 and out["failed"] == 0
+    assert out["passed"] == 11 and out["failed"] == 0
     # The pure-comment step is now a "comment" annotation, not a skipped
     # step; only the explicit "skip": true step counts as skipped.
     assert out["skipped"] == 1 and out["comment"] == 1 and out["not_run"] == 0
@@ -591,6 +606,20 @@ def test_run_script_passes_and_tears_down(
     # A successful run purges its throwaway sandbox by default (no pile-up).
     assert out["purged"] is True
     assert not os.path.isdir(out["session_dir"])
+
+
+def test_run_with_field_prints_only_the_field(
+        elate_home: str, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    # --field must suppress per-step progress streaming: the bare value is
+    # the WHOLE stdout, so $(elate --field success run x.json) is clean.
+    path = write_script(tmp_path, {
+        "session": {"config": "bare", "size": "80x24"},
+        "steps": [{"eval": "(+ 1 2)"}],
+    })
+    code = cli.main(["--field", "success", "run", path])
+    assert code == 0
+    assert capsys.readouterr().out == "true\n"
 
 
 def test_run_keep_names_from_scenario(

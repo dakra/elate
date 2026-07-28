@@ -54,6 +54,12 @@ Rules that prevent the most common mistakes:
   `start --home-seed DIR` — it copies a fixture tree into the fake `$HOME`
   *before* Emacs launches, keeping isolation (don't point `HOME` at a real
   dir).
+- Every session has a **private scratch directory** for your setup files
+  and artifacts: `elate -s NAME path` prints it (bare path — substitutes
+  into shell commands), and in-Emacs code sees it as `$ELATE_SCRATCH`
+  (`(getenv "ELATE_SCRATCH")`). Use it instead of a shared temp dir —
+  concurrent agents sharing one scratchpad overwrite each other's files;
+  the scratch dir is purged with the sandbox.
 - Startup forms run **before `emacs-startup-hook`** (set vars an auto-launch
   hook reads): inline `--eval FORM`, or — to reuse the same setup across
   sessions instead of re-pasting it — `--eval-file PATH` (a forms file, no
@@ -79,6 +85,7 @@ Never sleep-and-poll. Never assume an effect happened — observe it.
    uvx elate -s s wait idle                  # command loop went quiet
    uvx elate -s s wait text 'Compiled OK' --buffer '*compilation*' --timeout 30
    uvx elate -s s wait prompt                # a minibuffer prompt opened
+   uvx elate -s s wait until '(eq major-mode (quote my-mode))' --timeout 5
    ```
    `wait text` takes a **Python** regexp (not elisp syntax!) and happily
    polls a buffer that does not exist yet.
@@ -88,6 +95,12 @@ Never sleep-and-poll. Never assume an effect happened — observe it.
    question. `wait idle` is *command-loop* idle (its `idle` number is just
    seconds since the last activity — a big value is healthy, not a hang) and
    says nothing about whether output finished.
+   For any condition that is neither text nor quiescence (a mode change, a
+   marker position, process state), `wait until '<pred>'` polls an elisp
+   predicate until non-nil and returns its value — never write an eval-poll
+   loop. An elisp *error* from the predicate fails the wait immediately (so
+   a typo can't hide until the deadline); wrap the form in `ignore-errors`
+   if an error just means "not yet". `--buffer B` evaluates it in a buffer.
 3. **Observe**: `state` is the one-call scene snapshot (buffer, mode, point,
    window layout, minibuffer prompt + completions, echo area, active popup
    kinds, *Messages* tail). When confused, run `state` first — it almost
@@ -147,6 +160,22 @@ open for you to inspect (`state` shows prompt + candidates) and answer.
   program running inside a terminal buffer, send its bytes there directly,
   e.g. `send-process --buffer '*ghostel*' --char 'C-c'` then
   `send-process --buffer '*ghostel*' 'git status\n'`.
+  Targeting rule: the buffer must have exactly **one** live process — none
+  or several is an error naming the candidates, never a silent pick; pick
+  one with `--process NAME` (by process name, buffer optional). The result
+  echoes the chosen process's name and command line — check it when input
+  seems to vanish: a package can also write through its **own** channel (a
+  raw fd its Emacs process object doesn't front), in which case no process
+  is the write path and you call the package's send function via `eval`
+  instead.
+- The sandboxed frame **never has real window-system focus** while an agent
+  drives it, so code gated on focus (paste-on-focus, focus-dimming, a
+  click-to-refocus mode) sees an unfocused frame and behaves differently.
+  Don't fight it with window managers: inject focus with `focus in` /
+  `send-events 'focus-in' …` (ordered with clicks/keys), and add
+  `--set-focus-state` when the code reads `(frame-focus-state)` — that
+  C-owned state cannot be moved from elisp, so the flag shims it. Worked
+  example: the focus-vs-click recipe in RECIPES.md.
 - If a semantic `keys` call times out, the sequence probably left Emacs
   reading input: retry with `--events`, or recover with `interrupt`.
 - After an eval/keys timeout where Emacs stays busy (`info` shows
@@ -177,6 +206,10 @@ uvx elate -s s eval '(my-fn 42)' --timeout 5
 - Predicates often return a truthy *value*, not `t`: `(process-live-p p)`
   yields the status tail `(run open listen connect stop)`, not `t`. Wrap
   with `(and … t)` (or `(if … t nil)`) when you want a clean boolean back.
+- The default `value` is a **printed sexp string**. For structured probes
+  add `--json-result` (real JSON in `value`) or `--raw` (bare value, no
+  envelope) — see "JSON output and exit codes" below; never regex a
+  printed plist.
 - If a still-busy timeout needs *where* it is stuck, add `--on-timeout
   sample`: it attaches a thread backtrace of the wedged Emacs (macOS
   `sample`; Linux eu-stack/gdb) to the timeout error as `sample`.
@@ -215,6 +248,24 @@ uvx elate -s s popups                        # transient/which-key/corfu/childfr
   unattended/CI Mac, keep a real GUI login awake and unlocked (auto-login +
   disable screen-lock + `caffeinate -dimsu`); a backgrounded `launchd` runner
   has no GUI session and always captures black.
+
+## Trace internal functions — don't hand-roll advice spies
+
+To see which internal functions ran, in what order, with what args (what
+bytes hit the PTY? why did the hook fire twice?), use the built-in tracer
+instead of writing `advice-add` wrappers that record calls:
+
+```sh
+uvx elate -s s trace on my-pkg--send my-pkg--filter   # start recording
+uvx elate -s s keys 'x'                               # drive the session
+uvx elate -s s trace read                             # calls+args+returns, in order; clears
+uvx elate -s s trace off                              # untrace all
+```
+
+Each call records nesting, arguments, and return value (`trace-function`
+under the hood). `read` clears the log, so each read sees only new calls
+(`--keep` to accumulate). Trace a handful of named functions, not a whole
+package — tracing is per-function.
 
 ## Tests, lint, profile, bench — fresh sessions only
 
@@ -288,7 +339,37 @@ Parse the JSON — don't scrape the human table (`eval --json` gives `value`,
 `value-length`, `truncated`, `error`, `backtrace`, `messages`). Errors embed a
 state snapshot so you see *why*. Exit codes: **0** success, **1** error (elisp
 errors, test failures, lint findings), **2** CLI usage error, **3** `wait`
-timeout. Branch on them in shell loops.
+timeout. Branch on them in shell loops — `elate -s s eval '(my-check)' &&
+next-step` needs no output parsing at all.
+
+**Don't double-parse eval results.** By default eval's `value` is the
+*printed sexp as a string* — JSON tooling can't take it apart, and regex/
+string surgery on it is a bug farm. Instead:
+
+```sh
+# Real JSON inside the envelope: jq works on the value itself.
+uvx elate --json -s s eval --json-result \
+  '(list :mode major-mode :ro buffer-read-only :point (point))'
+# → "value": {"mode":"lisp-mode","ro":false,"point":316}, "value-encoding":"json"
+
+# No envelope at all: the bare value, straight into shell tests.
+[ "$(uvx elate -s s eval --raw 'major-mode')" = lisp-mode ]
+uvx elate -s s eval --raw --json-result '(list :a 1)'   # bare {"a":1}
+
+# Any command: print one envelope field bare (global flag).
+uvx elate --field name -s s info
+```
+
+`--json-result` converts in-session: `nil` → `null` (by rule — elisp can't
+tell nil/false/empty-list apart), `t` → `true`, symbols → their names,
+keyword plists/alists/hash-tables → objects, other lists and vectors →
+arrays. A value with no faithful JSON shape (buffers, markers, circular
+structures) falls back to the printed string — **check `value-encoding`**
+(`"json"` vs `"printed"`), never guess. With `--raw`/`--field`, a failed
+command prints *nothing* to stdout (error on stderr, normal exit code), so
+`$(…)` substitutions compare against emptiness, not an error blob. And
+prefer the structured commands (`state`, `faces-at`, `info`) over eval
+probes — they already return real JSON.
 
 ## GUI sessions (when TTY isn't enough)
 
@@ -312,7 +393,7 @@ images** instead of PNG files to read. If `elate_*` MCP tools are already
 available in your session (someone registered the server — the plugin is
 CLI-first and does not register it for you), use them directly — do **not**
 register a duplicate; otherwise register it with
-`claude mcp add elate -- uvx elate mcp`. The 30 `elate_*` tools cover the core surface (`attach`, `resize`,
+`claude mcp add elate -- uvx elate mcp`. The 31 `elate_*` tools cover the core surface (`attach`, `resize`,
 `prune`, `stderr`, `export-script`, `snap`, `matrix`, and `install` stay CLI-only); `prune`
 aliases `purge` and `stderr` aliases `logs`. Sessions are shared
 between both (same names, same sandboxes), so you can mix.
@@ -338,3 +419,18 @@ long parallel run, GC only the stale ones with `elate
 purge --all --stopped-older-than 1h`, and preview which they are with
 `elate list --older-than 1h`. Sandboxes live under `~/.cache/elate/sessions/<name>`
 (`$ELATE_HOME` overrides the base).
+
+**Several agents on one machine:** tag your sessions at start and manage
+only your own —
+
+```sh
+uvx elate start --name rx-a --owner agent3 --ttl 30m
+uvx elate list --owner agent3         # just mine
+uvx elate stop --owner agent3         # stop all of mine (also: --glob/--name-prefix)
+uvx elate purge --owner agent3        # delete my stopped sandboxes
+```
+
+`--ttl DUR` is the crash insurance: a session idle (no commands) past its
+TTL is stopped *and* purged by an opportunistic sweep that any later elate
+command runs — so sessions leaked by a crashed agent reap themselves. Only
+TTL'd sessions are ever swept; the session a command targets is exempt.

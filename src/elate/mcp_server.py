@@ -142,6 +142,10 @@ def _fail(exc: Exception, sess: S.Session | None = None) -> str:
 
 
 def _load(session: str, require_alive: bool = True) -> S.Session:
+    # Opportunistic TTL sweep (throttled, never raises; only sessions
+    # started with a ttl). The targeted session is exempt so it cannot
+    # vanish between two of its own tool calls.
+    S.maybe_reap_expired(exclude=session)
     sess = S.load_session(session)
     if require_alive:
         sess.require_alive()
@@ -227,6 +231,16 @@ def elate_start(
         "If a session of this name is already running, stop and recreate it "
         "(dead/stopped sessions of that name are always replaced). Without "
         "this, starting over a live session is an error."))] = False,
+    owner: Annotated[str | None, Field(description=(
+        "Tag the session with an owner (e.g. an agent id). elate_list and "
+        "elate_purge can then select by owner, so concurrent agents manage "
+        "only their own sessions."))] = None,
+    ttl: Annotated[float | None, Field(ge=30, description=(
+        "Idle time-to-live in seconds (minimum 30): once the session has "
+        "seen no commands for this long, an opportunistic sweep run by any "
+        "later elate command stops AND purges it -- so sessions leaked by "
+        "a crashed agent clean themselves up. Omit for no deadline."))]
+        = None,
 ) -> str:
     """Start a new sandboxed Emacs session (TTY or GUI).
 
@@ -262,6 +276,8 @@ def elate_start(
             ui=ui,
             headless=headless,
             replace=replace,
+            owner=owner,
+            ttl=ttl,
         )
         sess.log("mcp-start", name=name, via="mcp")
         info = S.session_info(sess.name)
@@ -348,6 +364,10 @@ def elate_purge(
     name_prefix: Annotated[str | None, Field(description=(
         "Purge sessions whose name starts with this prefix (e.g. 'run-') -- "
         "a bulk selector. Cannot combine with explicit names."))] = None,
+    owner: Annotated[str | None, Field(description=(
+        "Purge sessions started with this owner tag -- a bulk selector; "
+        "combines with the other filters. Cannot combine with explicit "
+        "names."))] = None,
 ) -> str:
     """Delete the sandboxes (transcripts included) of stopped/dead sessions.
 
@@ -362,13 +382,15 @@ def elate_purge(
     """
     try:
         names = names or []
-        if not names and not all_sessions and not name_glob and not name_prefix:
+        if (not names and not all_sessions and not name_glob
+                and not name_prefix and not owner):
             raise ElateError(
-                "elate_purge needs names, all_sessions=true, name_glob, or "
-                "name_prefix")
+                "elate_purge needs names, all_sessions=true, name_glob, "
+                "name_prefix, or owner")
         return _ok(S.purge_sessions(names, all_sessions=all_sessions,
                                     stopped_older_than=stopped_older_than,
-                                    name_glob=name_glob, name_prefix=name_prefix))
+                                    name_glob=name_glob, name_prefix=name_prefix,
+                                    owner=owner))
     except Exception as exc:
         return _fail(exc)
 
@@ -403,6 +425,43 @@ def elate_info(
     """
     try:
         return _ok(S.session_info(session))
+    except Exception as exc:
+        return _fail(exc)
+
+
+# Not _READONLY: kind='scratch' creates the directory on first use.
+@server.tool(annotations=ToolAnnotations(readOnlyHint=False,
+                                         destructiveHint=False,
+                                         idempotentHint=True,
+                                         openWorldHint=False))
+@_threaded
+def elate_path(
+    session: Annotated[str, Field(description="Session name.")],
+    kind: Annotated[Literal["scratch", "dir", "home", "log"],
+                    Field(description=(
+        "Which path: 'scratch' (default) the session's private scratch "
+        "directory, created on demand -- the collision-free home for "
+        "setup files and artifacts when several agents run concurrently "
+        "(in-session elisp sees it as $ELATE_SCRATCH); 'dir' the sandbox "
+        "root; 'home' the sandbox's fake $HOME; 'log' the Emacs "
+        "stderr/GUI log directory."))] = "scratch",
+) -> str:
+    """One on-disk path of the session, the private scratch dir by default.
+
+    Write per-session setup files and artifacts under the scratch path
+    instead of a shared temp directory -- concurrent sessions never
+    collide there, and the files are purged with the sandbox. Works for
+    stopped sessions too.
+    """
+    try:
+        sess = S.load_session(session)
+        if kind == "scratch":
+            path = sess.scratch_dir()
+        elif kind == "dir":
+            path = sess.dir
+        else:
+            path = sess.dir / kind
+        return _ok({"name": sess.name, "kind": kind, "path": str(path)})
     except Exception as exc:
         return _fail(exc)
 
@@ -509,7 +568,9 @@ def elate_send_process(
     session: Annotated[str, Field(description="Session name.")],
     buffer: Annotated[str | None, Field(description=(
         "Buffer whose subprocess to target. Default: the current (selected "
-        "window's) buffer. Errors if the buffer has no live process."))] = None,
+        "window's) buffer. The buffer must have exactly ONE live process -- "
+        "none or several is an error naming the candidates (never a silent "
+        "pick); disambiguate with process."))] = None,
     text: Annotated[str | None, Field(description=(
         "Literal text to send to the process (e.g. a shell command plus a "
         "trailing newline). Give exactly one of text/char/file."))] = None,
@@ -520,6 +581,10 @@ def elate_send_process(
     file: Annotated[str | None, Field(description=(
         "Path whose contents to send (read inside Emacs, so it is not bound "
         "by the argv size limit -- use for large payloads)."))] = None,
+    process: Annotated[str | None, Field(description=(
+        "Target this process by name (get-process), for buffers with "
+        "several processes; with buffer, the process must belong to that "
+        "buffer."))] = None,
 ) -> str:
     """Send raw input to a buffer's subprocess (comint/REPL/shell/terminal).
 
@@ -527,7 +592,11 @@ def elate_send_process(
     bypassing the command loop. Unlike elate_keys/elate_type -- which drive
     Emacs -- this drives the *subprocess*: interrupt a job with char='C-c',
     feed a REPL, or seed shell input. Errors when the buffer has no live
-    process. Returns the process name, buffer, and bytes sent.
+    process, and when it has several (name one via process). Returns the
+    process name, its command line, buffer, and bytes sent -- check the
+    echoed process/command when input seems to vanish: a package can also
+    write through its own channel (a raw fd), in which case call its send
+    function via elate_eval instead.
     """
     sess = None
     try:
@@ -538,14 +607,16 @@ def elate_send_process(
         sess = _load(session)
         chan = sess.semantic()
         if file is not None:
-            data = chan.rpc("send-process-file", file, buffer)
+            data = chan.rpc("send-process-file", file, buffer, process)
             kind = "file"
         else:
             payload = char if char is not None else text
             b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
-            data = chan.rpc("send-process", buffer, b64, char is not None)
+            data = chan.rpc("send-process", buffer, b64, char is not None,
+                            process)
             kind = "char" if char is not None else "text"
-        sess.log("send-process", buffer=buffer, kind=kind, via="mcp")
+        sess.log("send-process", buffer=buffer, process=process, kind=kind,
+                 via="mcp")
         return _ok(data)
     except Exception as exc:
         return _fail(exc, sess)
@@ -742,16 +813,25 @@ def elate_eval(
         "backtrace of the wedged Emacs (macOS `sample`; Linux eu-stack/gdb) "
         "and attaches it to the error as 'sample'; 'none' (default) does "
         "not."))] = "none",
+    json_result: Annotated[bool, Field(description=(
+        "Serialize the elisp value to real JSON inside the session, so "
+        "'value' is a queryable object rather than a printed sexp string. "
+        "Plists/alists of atoms map cleanly (nil -> null, t -> true, "
+        "symbols -> their names); a value with no faithful JSON shape "
+        "(buffers, markers, circular structures) falls back to the printed "
+        "string -- 'value-encoding' says which came back ('json' or "
+        "'printed'), check it."))] = False,
 ) -> str:
     """Evaluate elisp in the session; the precision instrument.
 
-    Returns the printed value, the *Messages* delta it produced, and on
-    failure "error" + a full "backtrace" plus a state snapshot (with
-    backtrace=true, also structured "frames"). Values longer than 64 KiB
-    come back with truncated=true and the full value-length -- narrow your
-    form instead of re-fetching. The form runs in the live interactive
-    Emacs (not batch), so UI side effects are real. If a form crashes the
-    session, the response carries session_died=true plus the signal and
+    Returns the printed value (or, with json_result=true, the value as
+    real JSON), the *Messages* delta it produced, and on failure "error"
+    + a full "backtrace" plus a state snapshot (with backtrace=true, also
+    structured "frames"). Values longer than 64 KiB come back with
+    truncated=true and the full value-length -- narrow your form instead
+    of re-fetching. The form runs in the live interactive Emacs (not
+    batch), so UI side effects are real. If a form crashes the session,
+    the response carries session_died=true plus the signal and
     crash_report path instead of an opaque transport error.
     """
     sess = None
@@ -759,7 +839,8 @@ def elate_eval(
         sess = _load(session)
         sess.log("eval", form=form, timeout=timeout, buffer=buffer, via="mcp")
         data = sess.semantic().eval_form(form, timeout=timeout,
-                                         backtrace=backtrace, buffer=buffer)
+                                         backtrace=backtrace, buffer=buffer,
+                                         json_result=json_result)
         sess.log("eval-result", **data)
         if data.get("error"):
             payload: dict[str, Any] = {"ok": False, **data}
@@ -1495,7 +1576,8 @@ def elate_echo(
 @_threaded
 def elate_wait(
     session: Annotated[str, Field(description="Session name.")],
-    condition: Annotated[Literal["idle", "text", "prompt", "stable", "dead"],
+    condition: Annotated[Literal["idle", "text", "prompt", "stable", "until",
+                                 "dead"],
                          Field(description=(
         "'stable': BUFFER's text stopped changing for quiet_ms ms -- the "
         "right wait for subprocess/REPL output (comint, compilation, "
@@ -1505,16 +1587,25 @@ def elate_wait(
         "says nothing about whether buffer OUTPUT finished). 'text': a "
         "pattern appeared in a buffer -- use to await known output. "
         "'prompt': a minibuffer prompt became active -- use after keys "
-        "that should ask a question. 'dead': the session's Emacs exited -- "
-        "returns died=true with the signal and crash_report; use to confirm "
-        "an expected crash."))],
+        "that should ask a question. 'until': the elisp predicate in "
+        "'pred' returned non-nil -- the generalization for conditions "
+        "that are neither text nor quiescence (a mode change, a marker "
+        "position, process state); no eval-poll loops needed. 'dead': the "
+        "session's Emacs exited -- returns died=true with the signal and "
+        "crash_report; use to confirm an expected crash."))],
     pattern: Annotated[str | None, Field(description=(
         "For condition='text': a PYTHON regular expression (not elisp "
         "syntax) matched against the buffer text."))] = None,
+    pred: Annotated[str | None, Field(description=(
+        "For condition='until': an elisp predicate form, re-evaluated "
+        "every poll until it returns non-nil (its printed value is "
+        "returned). An elisp error fails the wait immediately -- wrap the "
+        "form in ignore-errors if an error just means \"not yet\"."))] = None,
     buffer: Annotated[str | None, Field(description=(
         "For condition='text' (buffer to search) or 'stable' (buffer to "
         "watch); default: current. May not exist yet -- it is polled until "
-        "the deadline."))] = None,
+        "the deadline. For 'until': the buffer the predicate evaluates "
+        "in (must exist)."))] = None,
     timeout: Annotated[float, Field(gt=0, le=120, description=(
         "Overall deadline in seconds (0 < timeout <= 120). Prefer several "
         "short waits over one long one."))] = 10.0,
@@ -1538,9 +1629,9 @@ def elate_wait(
         sess = _load(session, require_alive=(condition != "dead"))
         # min_idle/quiet_ms must be logged or the transcript->script
         # exporter would silently lose them from replayed waits.
-        sess.log("wait", condition=condition, pattern=pattern, buffer=buffer,
-                 min_idle=min_idle, quiet_ms=quiet_ms, timeout=timeout,
-                 via="mcp")
+        sess.log("wait", condition=condition, pattern=pattern, pred=pred,
+                 buffer=buffer, min_idle=min_idle, quiet_ms=quiet_ms,
+                 timeout=timeout, via="mcp")
         if condition == "dead":
             data = S.wait_dead(sess, timeout=timeout)
         elif condition == "idle":
@@ -1552,6 +1643,11 @@ def elate_wait(
         elif condition == "stable":
             data = S.wait_stable(sess, buffer=buffer, quiet_ms=quiet_ms,
                                  timeout=timeout)
+        elif condition == "until":
+            if not pred:
+                raise ElateError("condition='until' needs a pred (an elisp "
+                                 "predicate form)")
+            data = S.wait_until(sess, pred, buffer=buffer, timeout=timeout)
         else:
             data = S.wait_prompt(sess, timeout=timeout)
         return _ok(data)

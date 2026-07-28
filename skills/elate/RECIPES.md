@@ -188,6 +188,23 @@ uvx elate -s sh wait stable --buffer '*shell*' --quiet-ms 300 # fresh prompt set
 # ... next independent check ...
 ```
 
+**When input seems to vanish: verify the write path.** `send-process`
+errors if the buffer has zero or several live processes (pick one with
+`--process NAME`), and its result echoes the chosen process's name and
+command line — read them. If they look right but nothing happens, the
+package probably writes through its own channel (a raw fd its visible
+process object doesn't front — some terminal emulators do this): no
+process is the write path, so call the package's own send function via
+`eval`. Confirm with the tracer, which also answers "what bytes reached
+the PTY, in what order?" without hand-written advice spies:
+
+```sh
+uvx elate -s sh trace on my-term--send-string my-term--filter
+uvx elate -s sh keys 'l s RET'                        # drive it
+uvx elate -s sh trace read                            # calls+args, in order
+uvx elate -s sh trace off
+```
+
 ## Reproduce a focus-vs-click ordering bug
 
 Window systems deliver a focus change and a click as separate, ordered

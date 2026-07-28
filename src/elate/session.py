@@ -59,6 +59,8 @@ class Session:
     loads: list[str] = field(default_factory=list)
     evals: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)  # extra process env vars
+    owner: str | None = None  # who started it (an agent tag; filters stop/purge/list)
+    ttl: float | None = None  # opt-in idle TTL (secs); expired sessions get reaped
     headless: bool = False  # gui sessions: running under our own Xvfb
     display: str | None = None  # gui sessions: X11 DISPLAY (Linux)
     xvfb_pid: int | None = None  # gui sessions: Xvfb we own (Linux headless)
@@ -81,6 +83,28 @@ class Session:
     @property
     def messages_cursor_path(self) -> Path:
         return self.dir / "messages.cursor"
+
+    def touch_activity(self) -> None:
+        """Bump the transcript mtime -- the idle baseline the --ttl reaper
+        reads -- without writing a log record. Long-running waiters call
+        this each poll so a session mid-wait never looks idle to a
+        concurrent process's sweep."""
+        try:
+            (self.dir / "log" / "transcript.jsonl").touch()
+        except OSError:
+            pass
+
+    def scratch_dir(self) -> Path:
+        """The session's private scratch directory, created on first use.
+
+        The canonical collision-free home for an agent's setup files and
+        artifacts (concurrent agents sharing one system scratchpad
+        overwrite each other). The Emacs process sees it as
+        $ELATE_SCRATCH. Created lazily so sandboxes from older elate
+        versions gain one too."""
+        scratch = self.dir / "scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        return scratch
 
     @property
     def init_error_path(self) -> Path:
@@ -257,6 +281,17 @@ def _stopped_since(sess: Session) -> float:
         return sess.created_at
 
 
+def _last_activity(sess: Session) -> float:
+    """Best-effort unix time of the session's last command activity.
+
+    Every command logs to the transcript, so its mtime is the idle
+    baseline the --ttl deadline counts from."""
+    try:
+        return (sess.dir / "log" / "transcript.jsonl").stat().st_mtime
+    except OSError:
+        return sess.created_at
+
+
 def _comm_hint(sess: Session) -> str | None:
     """Process-name hint for crash-report globbing (advisory)."""
     if sess.emacs_identity and "|" in sess.emacs_identity:
@@ -371,6 +406,13 @@ def list_sessions() -> list[dict[str, Any]]:
             "idle_for": None if alive else round(now - _stopped_since(sess), 1),
             "session_dir": sess.session_dir,
         }
+        if sess.owner:
+            record["owner"] = sess.owner
+        if sess.ttl:
+            record["ttl"] = sess.ttl
+            if alive:
+                record["expires_in"] = round(
+                    max(0.0, sess.ttl - (now - _last_activity(sess))), 1)
         if status == "dead":
             # Cheap signal only (the session's own log); the full crash-report
             # lookup stays in session_info to keep `list` light.
@@ -443,7 +485,13 @@ def start_session(
     ui: str = "tty",
     headless: bool = False,
     replace: bool = False,
+    owner: str | None = None,
+    ttl: float | None = None,
 ) -> Session:
+    if ttl is not None and ttl < 30:
+        raise ElateError(
+            f"implausible --ttl {ttl:g}s (minimum 30s): the TTL is an idle "
+            "deadline after which the session is stopped AND purged")
     if name is None:
         name = _free_name()
     if not _NAME_RE.match(name):
@@ -537,6 +585,8 @@ def start_session(
         evals=list(evals),
         env=dict(env or {}),
         headless=headless,
+        owner=owner,
+        ttl=ttl,
     )
     sess.save()
     sess.log("start", emacs=emacs_path, args=emacs_args, config=config,
@@ -556,7 +606,7 @@ def start_session(
 
 
 def _boot_tty(sess: Session, emacs_args: list[str], tmux_conf: Path) -> None:
-    env = sandbox.environment(sess.dir, sess.env)
+    env = sandbox.environment(sess.dir, sess.env, name=sess.name)
     # Quote BOTH sides: keys are validated to POSIX names upstream, but
     # quoting here is defense-in-depth so nothing can inject into the shell
     # command tmux runs even if a bad key ever slips past validation.
@@ -608,7 +658,8 @@ def _boot_gui(sess: Session, emacs_args: list[str]) -> None:
             sess.xvfb_identity = gui.proc_identity(sess.xvfb_pid)
             sess.save()
         proc = gui.spawn_emacs(
-            sess.emacs, emacs_args, sandbox.environment(sess.dir, sess.env),
+            sess.emacs, emacs_args,
+            sandbox.environment(sess.dir, sess.env, name=sess.name),
             sess.gui_log_path, display=sess.display,
         )
         sess.emacs_pid = proc.pid
@@ -791,7 +842,8 @@ def purge_sessions(names: Sequence[str] | None = None,
                    all_sessions: bool = False,
                    stopped_older_than: float | None = None,
                    name_glob: str | None = None,
-                   name_prefix: str | None = None) -> dict[str, Any]:
+                   name_prefix: str | None = None,
+                   owner: str | None = None) -> dict[str, Any]:
     """Delete the sandbox directories of sessions that are not running.
 
     ``stopped_older_than`` (seconds) restricts the sweep to sessions that
@@ -819,15 +871,17 @@ def purge_sessions(names: Sequence[str] | None = None,
     concurrent ``start`` of a name just classified as not-running can
     race the removal (same disposition as the record-start TOCTOU).
     """
-    filtered = name_glob is not None or name_prefix is not None
+    filtered = (name_glob is not None or name_prefix is not None
+                or owner is not None)
     if not names and not all_sessions and not filtered:
         raise ElateError(
-            "purge needs explicit session names, --all, --glob, or "
-            "--name-prefix (purge --all removes every stopped/dead sandbox)")
+            "purge needs explicit session names, --all, --glob, "
+            "--name-prefix, or --owner (purge --all removes every "
+            "stopped/dead sandbox)")
     if names and filtered:
         raise ElateError(
-            "purge: --glob/--name-prefix select by pattern and cannot be "
-            "combined with explicit session names")
+            "purge: --glob/--name-prefix/--owner select by pattern and "
+            "cannot be combined with explicit session names")
     root = sessions_root()
     listing = {s["name"]: s for s in list_sessions()}
     if names:
@@ -854,6 +908,10 @@ def purge_sessions(names: Sequence[str] | None = None,
         if name_prefix is not None:
             targets = [t for t in targets
                        if t["name"].startswith(name_prefix)]
+        if owner is not None:
+            # A corrupt registry has no owner field to compare; leave it
+            # to the un-filtered selectors rather than guess.
+            targets = [t for t in targets if t.get("owner") == owner]
     purged: list[dict[str, Any]] = []
     skipped: list[str] = []
     too_young: list[str] = []
@@ -912,6 +970,83 @@ def purge_sessions(names: Sequence[str] | None = None,
             "skipped_recent": too_young, "freed_bytes": freed}
 
 
+# ---------------------------------------------------------------------------
+# TTL reaping
+
+# Minimum seconds between opportunistic sweeps: every CLI invocation and MCP
+# tool call offers to sweep, so without a throttle a busy multi-agent run
+# would pay a full registry scan per command.
+REAP_THROTTLE = 60.0
+
+
+def reap_expired(exclude: str | None = None) -> list[dict[str, Any]]:
+    """Stop and purge every session whose opt-in --ttl has expired.
+
+    A session with a TTL is reaped once idle longer than that TTL --
+    running sessions by their last command activity (transcript mtime),
+    inert ones by the time they went inert -- so sessions leaked by a
+    crashed agent disappear instead of accumulating. Sessions without a
+    TTL are never touched. EXCLUDE names the session the current command
+    targets: it must not vanish between two of its owner's own calls.
+    Best-effort: a session that cannot be reaped is skipped, never fatal.
+    """
+    reaped: list[dict[str, Any]] = []
+    now = time.time()
+    for entry in list_sessions():
+        name = entry["name"]
+        if name == exclude or entry["status"] == "corrupt":
+            continue
+        try:
+            sess = load_session(name)
+        except ElateError:
+            continue
+        if not sess.ttl:
+            continue
+        idle = now - (_last_activity(sess) if entry["status"] == "running"
+                      else _stopped_since(sess))
+        if idle < sess.ttl:
+            continue
+        if entry["status"] == "running":
+            # The transcript is written at command *start*, so a long
+            # in-flight eval leaves the mtime stale while Emacs works.
+            # A busy Emacs is not idle -- skip it (and skip when liveness
+            # cannot be probed at all: reaping needs positive evidence).
+            try:
+                if sess.is_busy():
+                    continue
+            except ElateError:
+                continue
+        try:
+            stop_session(name, via="ttl")
+            purge_sessions([name])
+        except ElateError:
+            continue
+        reaped.append({"name": name, "ttl": sess.ttl, "idle": round(idle, 1),
+                       "owner": sess.owner})
+    return reaped
+
+
+def maybe_reap_expired(exclude: str | None = None) -> list[dict[str, Any]]:
+    """Throttled :func:`reap_expired`, cheap enough to run on every command.
+
+    At most one sweep per :data:`REAP_THROTTLE` seconds (tracked in a
+    marker file under the sessions root), so opportunistic reaping adds
+    no measurable cost to a busy run. Never raises."""
+    root = sessions_root()
+    marker = root / ".last-reap"
+    try:
+        if time.time() - marker.stat().st_mtime < REAP_THROTTLE:
+            return []
+    except OSError:
+        pass
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        return reap_expired(exclude=exclude)
+    except Exception:
+        return []
+
+
 def session_info(name: str) -> dict[str, Any]:
     sess = load_session(name)
     alive = sess.is_alive()
@@ -930,6 +1065,9 @@ def session_info(name: str) -> dict[str, Any]:
         "uptime": round(time.time() - sess.created_at, 1) if alive else None,
         "size": [sess.cols, sess.rows],
         "session_dir": sess.session_dir,
+        "scratch_dir": str(sess.dir / "scratch"),
+        "owner": sess.owner,
+        "ttl": sess.ttl,
         "tmux_socket": sess.tmux_socket or None,
         "socket_path": str(sess.socket_path),
         "init_error": sess.init_error(),
@@ -1317,6 +1455,9 @@ def _wait_loop(sess: Session, timeout: float, what: str, probe) -> dict[str, Any
     deadline = time.monotonic() + timeout
     last_err: str | None = None
     while time.monotonic() < deadline:
+        # A session mid-wait is active, not idle: keep the --ttl baseline
+        # fresh so a concurrent process's sweep cannot reap it mid-command.
+        sess.touch_activity()
         try:
             result = probe()
         except (EvalTimeout, TransportError, RpcError) as exc:
@@ -1407,6 +1548,7 @@ def wait_stable(
     live_process = False
     last_err: str | None = None
     while time.monotonic() < deadline:
+        sess.touch_activity()  # mid-wait is active, not --ttl idle
         now = time.monotonic()
         try:
             data: dict[str, Any] | None = sess.semantic().rpc(
@@ -1453,6 +1595,52 @@ def wait_prompt(sess: Session, timeout: float = 10.0) -> dict[str, Any]:
         return None
 
     return _wait_loop(sess, timeout, "an active minibuffer prompt", probe)
+
+
+def wait_until(
+    sess: Session,
+    form: str,
+    buffer: str | None = None,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Wait until elisp FORM evaluates to non-nil; return its printed value.
+
+    The generalization of the fixed waiters: any condition expressible as
+    an elisp predicate (a mode change, a marker position, process state).
+    FORM is re-evaluated every poll, in BUFFER when given (else the
+    selected window's buffer, like eval). An elisp *error* from the
+    predicate fails the wait immediately instead of being polled past --
+    polling through errors would hide a typo (a void-function) until the
+    deadline; a predicate for which an error means "not yet" (say, a
+    buffer that does not exist yet) must absorb it itself:
+    (ignore-errors ...) or (and (get-buffer "X") ...).
+    """
+    deadline = time.monotonic() + timeout
+
+    def probe() -> dict[str, Any] | None:
+        # A legitimately slow predicate gets the remaining wait budget per
+        # probe (a fixed short eval timeout would abort it every poll and
+        # make the wait unwinnable regardless of --timeout).
+        remaining = max(1.0, deadline - time.monotonic())
+        data = sess.semantic().eval_form(form, timeout=max(3.0, remaining),
+                                         buffer=buffer)
+        err = data.get("error")
+        if err:
+            if "elate: eval timed out" in err:
+                # The predicate outran the budget; the outer loop's own
+                # deadline turns this into a normal WaitTimeout. (Advising
+                # ignore-errors here would be unfollowable: it cannot
+                # catch with-timeout's throw.)
+                return None
+            raise ElateError(
+                f"wait until: the predicate errored: {err} -- "
+                "wrap the form in ignore-errors if an error just means "
+                "\"not yet\"")
+        if data.get("value") != "nil":
+            return {"value": data.get("value"), "form": form}
+        return None
+
+    return _wait_loop(sess, timeout, f"non-nil {form}", probe)
 
 
 def wait_dead(sess: Session, timeout: float = 10.0) -> dict[str, Any]:

@@ -194,7 +194,8 @@ class SemanticChannel:
 
     def eval_form(self, source: str, timeout: float = DEFAULT_TIMEOUT,
                   backtrace: bool = False,
-                  buffer: str | None = None) -> dict[str, Any]:
+                  buffer: str | None = None,
+                  json_result: bool = False) -> dict[str, Any]:
         """Evaluate elisp SOURCE (one or more forms) with full error capture.
 
         Returns {"value": str|None, "error": str|None, "backtrace": str|None,
@@ -204,9 +205,12 @@ class SemanticChannel:
         With BACKTRACE, an error reply also carries structured "frames".
         BUFFER selects the buffer the form evaluates in (its name); without
         it the form runs in the selected window's buffer, not an arbitrary
-        RPC-time buffer.
+        RPC-time buffer. With JSON_RESULT, "value" is the real JSON value
+        (parsed, not a printed sexp string) when the elisp value has a
+        faithful JSON shape; "value-encoding" says which form came back
+        ("json" or the "printed" fallback) -- check it, never guess.
         """
         b64 = base64.b64encode(source.encode("utf-8")).decode("ascii")
         inner = max(timeout - 1.0, timeout * 0.8)
         return self.rpc("eval", b64, round(inner, 3), backtrace, buffer,
-                        timeout=timeout)
+                        json_result, timeout=timeout)

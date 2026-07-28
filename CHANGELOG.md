@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.13.0
+
+Friction fixes from driving fleets of concurrent agents: input can no
+longer silently target the wrong process, any elisp predicate is now a
+first-class wait, and sessions carry an owner tag, a private scratch dir,
+and an opt-in idle TTL that reaps what a crashed agent leaks.
+
+- **`send-process` never silently picks a process** (`--process NAME`, MCP
+  `process`): a buffer with zero or several live processes is now a loud
+  error naming the candidates instead of `get-buffer-process`'s silent
+  first pick — the worst agent failure mode is input that looks delivered
+  and goes nowhere. `--process` targets a process by name (with `--buffer`
+  it must belong to that buffer, catching typos), and the result echoes the
+  chosen process's name and command line so a wrong write path is visible.
+  The error and docs both point at the remaining hole: a package that
+  writes through its own raw fd has *no* process as its write path — call
+  its send function via `eval`.
+
+- **`wait until '<elisp-pred>'`** (scenario `{"wait": "until", "pred":
+  ...}`, MCP `elate_wait(condition="until", pred=...)`): the
+  generalization of the fixed waiters — poll any elisp predicate until
+  non-nil (a mode change, a marker position, process state) and return its
+  value, replacing hand-written eval-poll loops. An elisp error from the
+  predicate fails the wait immediately (a typo must not hide until the
+  deadline); wrap the form in `ignore-errors` when an error means "not
+  yet". `--buffer` evaluates the predicate in a named buffer.
+
+- **Per-session private scratch directory** (`elate path`, `elate_path`,
+  `$ELATE_SCRATCH`/`$ELATE_SESSION`): every sandbox now carries a
+  `scratch/` dir — the canonical collision-free home for an agent's setup
+  files and artifacts (concurrent agents sharing one system scratchpad
+  overwrite each other). `elate -s NAME path` prints the bare path
+  (`--kind dir/home/log` for the other sandbox paths; lazily created for
+  sandboxes from older versions), in-Emacs code reads `$ELATE_SCRATCH`,
+  and `info` reports it as `scratch_dir`. The env vars are reserved like
+  the HOME/XDG isolation vars.
+
+- **Owner tags and bulk selectors** (`start --owner`, `list/stop/purge
+  --owner`, `stop --glob/--name-prefix`): tag sessions with the agent that
+  started them and manage only your own. `stop` gains the same bulk
+  selectors `purge` already had; `list` grows an OWNER column (only when
+  some session carries a tag) and an `--owner` filter.
+
+- **Opt-in idle TTL with opportunistic reaping** (`start --ttl DUR`): a
+  session idle past its TTL — no commands, by transcript mtime; inert
+  sessions by their stop time — is stopped *and* purged by a throttled
+  sweep that any later elate command (CLI or MCP) runs, so sessions leaked
+  by a crashed agent clean themselves up. Only TTL'd sessions are ever
+  swept, the session a command targets is exempt, `list` shows the
+  remaining time (`ttl: 12m left`), and reaping is reported on stderr.
+
+- **`eval --json-result` / `--raw` / global `--field` — no more
+  string-surgery on printed sexps** (MCP `elate_eval(json_result=...)`):
+  the envelope was JSON but eval's `value` was a *printed elisp sexp in a
+  string*, so agents bolted `python3 -c` parsers onto nearly every probe.
+  `--json-result` serializes the value to real JSON inside the session:
+  `nil` → `null` (documented rule for elisp's nil/false/empty-list
+  ambiguity), `t` → `true`, symbols → names, keyword plists / alists /
+  hash tables → objects, other lists and vectors → arrays; a value with
+  no faithful JSON shape (buffers, markers, circular structures,
+  non-finite floats) falls back to the printed string, flagged by the new
+  `value-encoding` field (`"json"`/`"printed"`) — a lossy partial
+  conversion is never produced. `eval --raw` prints just the value with
+  no envelope, and the global `--field NAME` prints any one result field
+  bare (strings unquoted, booleans `true`/`false`, structures as compact
+  JSON; unknown field = exit 2 naming the available ones) — with either,
+  a failed command prints nothing to stdout, so `$(…)` shell tests
+  compare against emptiness, not an error blob. A typical probe drops
+  from three process invocations (elate → python → test) to one. (The
+  other half of the request already existed: `eval` exits 1 on elisp
+  error and `wait` exits 3 on timeout, and JSON output is single-line —
+  now promoted in the docs.)
+
+- **Docs**: `trace on/read/off` (shipped in 0.6, invisible in the skill)
+  is now in SKILL.md and RECIPES.md as the replacement for hand-rolled
+  advice spies; the focus-injection story (`focus`, `send-events`,
+  `--set-focus-state`) is promoted into the key-delivery section.
+
 ## 0.12.0
 
 One scenario file, one command, out pops the grid: named **variants** make

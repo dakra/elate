@@ -13,6 +13,7 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 - `--version` -- show program's version number and exit
 - `--json` -- force machine-readable JSON output
 - `--human` -- force the human-readable table, even when piped
+- `--field NAME` -- print just this one field of the result, bare (no JSON envelope): strings unquoted, booleans true/false, null, objects/arrays as compact JSON -- so shell can test it with no parser: [ "$(elate --field name info X)" = X ]. On failure nothing goes to stdout (error on stderr, usual exit code); an unknown field is a usage error (exit 2) naming the available ones
 - `-s, --session NAME` -- session to operate on
 - mutually exclusive: `--json | --human`
 
@@ -25,6 +26,7 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 - [`elate purge`](#elate-purge)
 - [`elate prune`](#elate-prune)
 - [`elate info`](#elate-info)
+- [`elate path`](#elate-path)
 - [`elate keys`](#elate-keys)
 - [`elate type`](#elate-type)
 - [`elate send-process`](#elate-send-process)
@@ -76,13 +78,18 @@ start a new sandboxed session
 - `--home-seed DIR` -- copy this fixture tree into the sandbox's fake $HOME before launch (rc files in place before any subprocess spawns; keeps sandbox isolation)
 - `--env KEY=VALUE` (repeatable) -- set an environment variable for the Emacs process and the subprocesses it spawns (repeatable); cannot override the sandbox's HOME/XDG_* isolation vars
 - `--size COLSxROWS` (default: 120x36)
+- `--owner NAME` -- tag the session with an owner (e.g. an agent id); list/stop/purge can then select by --owner, so concurrent agents manage only their own sessions
+- `--ttl DUR` -- idle time-to-live (e.g. 30m, 2h; bare number = seconds, minimum 30s): once the session has seen no commands for this long it is stopped AND purged by an opportunistic sweep any later elate command runs -- so sessions leaked by a crashed agent clean themselves up instead of accumulating
 
 ## elate stop
 
-stop a session (or --all)
+stop a session (or --all / a filter)
 
 - `[name]` -- session name (or use -s NAME)
 - `--all` -- stop every running session (instead of a name)
+- `--glob PATTERN` -- stop running sessions whose name matches this glob (e.g. 'rx-*') -- a bulk selector like --all
+- `--name-prefix PREFIX` -- stop running sessions whose name starts with PREFIX -- a bulk selector like --all
+- `--owner NAME` -- stop running sessions started with --owner NAME; combines with --glob/--name-prefix
 
 ## elate interrupt
 
@@ -99,6 +106,7 @@ list known sessions
 
 - `[name]` -- only this session (or use -s NAME)
 - `--status {running,stopped,all}` (default: all) -- filter by liveness: running, stopped (stopped/dead/corrupt), or all (default)
+- `--owner NAME` -- only sessions started with --owner NAME
 - `--older-than DUR` -- only show sessions inert at least this long (e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- running sessions are excluded; pairs with `purge --stopped-older-than`
 
 ## elate purge
@@ -112,6 +120,7 @@ Delete the sandbox directories (transcripts included) of sessions that are no lo
 - `--stopped-older-than DUR` -- only purge sessions inert at least this long (e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- keeps just-stopped sandboxes during heavy runs
 - `--glob PATTERN` -- purge sessions whose name matches this glob (e.g. 'run-*') -- a bulk selector like --all; running matches are skipped
 - `--name-prefix PREFIX` -- purge sessions whose name starts with PREFIX (e.g. 'run-') -- a bulk selector like --all
+- `--owner NAME` -- purge sessions started with --owner NAME -- a bulk selector like --all; combines with the other filters
 
 ## elate prune
 
@@ -124,12 +133,22 @@ Alias for `purge`: delete the sandbox directories of sessions that are no longer
 - `--stopped-older-than DUR` -- only prune sessions inert at least this long (e.g. 30s, 15m, 2h, 1d; bare number = seconds)
 - `--glob PATTERN` -- prune sessions whose name matches this glob (e.g. 'run-*') -- a bulk selector like --all
 - `--name-prefix PREFIX` -- prune sessions whose name starts with PREFIX (e.g. 'run-') -- a bulk selector like --all
+- `--owner NAME` -- prune sessions started with --owner NAME -- a bulk selector like --all
 
 ## elate info
 
 show session details
 
 - `[name]` -- session name (or use -s NAME)
+
+## elate path
+
+print a session's private scratch directory (or another sandbox path)
+
+Print one on-disk path of the session, the scratch directory by default: a per-session private directory for setup files and artifacts, safe from concurrent agents (in-session code sees it as $ELATE_SCRATCH). Prints the bare path, so it substitutes cleanly: cp setup.el "$(elate -s NAME path)"/. Works for stopped sessions too.
+
+- `[name]` -- session name (or use -s NAME)
+- `--kind {scratch,dir,home,log}` (default: scratch) -- which path: scratch (default; created on demand), dir (the sandbox root), home (the fake $HOME), log (Emacs stderr/GUI logs)
 
 ## elate keys
 
@@ -157,12 +176,13 @@ Type literal text as if at the keyboard. TTY: raw terminal bytes via tmux. GUI: 
 
 send raw input to a buffer's subprocess (comint/REPL/shell)
 
-Write bytes straight to the process behind a buffer (`process-send-string`), bypassing the command loop -- for driving shells/REPLs/terminals. Unlike keys/type (which talk to Emacs), this talks to the subprocess: send ^C to interrupt a job, seed shell history, feed a REPL. Errors if the buffer has no live process.
+Write bytes straight to the process behind a buffer (`process-send-string`), bypassing the command loop -- for driving shells/REPLs/terminals. Unlike keys/type (which talk to Emacs), this talks to the subprocess: send ^C to interrupt a job, seed shell history, feed a REPL. Targeting rule: the buffer must have exactly one live process -- none or several is an error naming the candidates (never a silent pick); disambiguate with --process. The result echoes the process's name and command line so a wrong target is visible.
 
 - `[text]` -- literal text to send
 - `--char KBD` -- send an Emacs kbd string, e.g. 'C-c' (^C / SIGINT), 'RET' (newline), 'TAB'
 - `--file PATH` -- send the contents of PATH (read inside Emacs; for payloads past the argv size limit)
-- `--buffer NAME` -- buffer whose process to target (default: current)
+- `--buffer NAME` -- buffer whose process to target (default: current); must have exactly one live process unless --process picks one
+- `--process NAME` -- target this process by name (`get-process`), for buffers with several processes; with --buffer the process must belong to that buffer
 - mutually exclusive: `TEXT | --char | --file`
 
 ## elate mouse
@@ -228,6 +248,8 @@ evaluate an elisp form
 - `--timeout SECS` (default: 15)
 - `--backtrace` -- on error, also return structured backtrace frames (each frame's function + printed args), not just the rendered backtrace string
 - `--on-timeout {none,sample}` (default: none) -- on timeout with Emacs still busy: 'sample' captures a thread backtrace of the wedged Emacs (macOS `sample`; Linux eu-stack/gdb) and attaches it to the error; 'none' (default) does not
+- `--json-result` -- serialize the elisp value to real JSON inside the session, so `value` is a queryable object (jq .value.mode), not a printed sexp string. Plists/alists of atoms map cleanly (nil -> null, t -> true, symbols -> names); a value with no faithful JSON shape (buffers, markers, circular structures) falls back to the printed string -- the result's value-encoding says which came back ('json' or 'printed'), check it
+- `--raw` -- print just the value, no JSON envelope -- shell tests it directly: [ "$(elate -s N eval --raw 'major-mode')" = fundamental-mode ]. On an elisp error nothing goes to stdout (error on stderr, exit 1). Shorthand for the global --field value; combine with --json-result for the bare JSON value
 
 ## elate trace
 
@@ -366,9 +388,9 @@ Show the tail of the Emacs process log -- module panics, GC/native-comp warnings
 
 wait for a condition (exit 3 on timeout)
 
-- `{idle,text,prompt,stable,dead}`
-- `[args]` (repeatable) -- idle: [MIN_IDLE_SECS]; text: REGEXP (Python regex syntax, not elisp); prompt/stable/dead: none
-- `--buffer BUFFER` -- buffer to search (wait text) or watch (wait stable); may not exist yet
+- `{idle,text,prompt,stable,until,dead}`
+- `[args]` (repeatable) -- idle: [MIN_IDLE_SECS]; text: REGEXP (Python regex syntax, not elisp); until: an elisp predicate form, polled until non-nil (an elisp error fails the wait -- wrap in ignore-errors if an error means "not yet"); prompt/stable/dead: none
+- `--buffer BUFFER` -- buffer to search (wait text), watch (wait stable; may not exist yet), or evaluate the predicate in (wait until)
 - `--quiet-ms MS` (default: 300) -- wait stable: settle threshold -- the buffer must be unchanged for this many ms (default 300)
 - `--timeout SECS` (default: 10)
 

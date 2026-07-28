@@ -122,6 +122,14 @@ elate info demo
 elate -s demo eval '(+ 1 2)'
 elate -s demo eval '(my-pkg-frobnicate 42)' --timeout 5
 
+# Structured probes without string surgery: --json-result serializes the
+# value to real JSON in-session (value-encoding says "json" or the
+# "printed" fallback); --raw prints just the value; --field (global) one
+# envelope field — all shell-composable, exit codes carry the error status
+elate --json -s demo eval --json-result '(list :mode major-mode :point (point))'
+[ "$(elate -s demo eval --raw 'major-mode')" = lisp-mode ] && echo yes
+elate --field name -s demo info
+
 # Semantic keys (execute-kbd-macro inside Emacs)
 elate -s demo keys 'M-x my-pkg-mode RET'
 # Queued semantic delivery — for sequences that leave a prompt open
@@ -147,12 +155,24 @@ elate -s demo wait idle
 elate -s demo wait stable --buffer '*shell*' --quiet-ms 300   # subprocess output settled
 elate -s demo wait text 'Compilation finished' --buffer '*compilation*' --timeout 30
 elate -s demo wait prompt
+elate -s demo wait until '(eq major-mode (quote my-mode))'    # any elisp predicate
+
+# Per-session private scratch dir (in-Emacs code sees it as $ELATE_SCRATCH)
+cp setup.el "$(elate -s demo path)"/
 
 elate stop demo
 
 # Stopped sandboxes stay behind for their transcripts; delete them when
 # done (purge never touches a running session)
 elate purge demo          # or: elate purge --all
+
+# Several agents on one machine: tag sessions and manage only your own.
+# --ttl is crash insurance -- a session idle past it is stopped AND purged
+# by an opportunistic sweep any later elate command runs.
+elate start --name rx-a --owner agent3 --ttl 30m
+elate list --owner agent3
+elate stop --owner agent3          # bulk stop (also: --glob / --name-prefix)
+elate purge --owner agent3
 ```
 
 Notes:
@@ -164,12 +184,24 @@ Notes:
   output (comint, compilation, vterm), where `wait idle` (command-loop
   idle) only tells you the editor is waiting for input, not that output
   stopped.
+- `wait until '<pred>'` polls an elisp predicate until it returns non-nil —
+  the generalization for conditions that are neither text nor quiescence
+  (mode changes, marker positions, process state). An elisp error from the
+  predicate fails the wait immediately; wrap the form in `ignore-errors`
+  when an error just means "not yet".
 - A `messages` delta can start mid-line when Emacs coalesces a repeated
   message (`[2 times]`) at the cursor position.
 - Raw `keys` rejects combinations a terminal cannot encode (e.g. `C-%`) —
   use semantic delivery for those.
 - Eval results are capped at 64 KiB of printed output; longer values come
   back with `truncated: true` and the full `value-length`.
+- `eval --json-result` conversion rules: `nil` → `null` (elisp cannot
+  distinguish nil/false/empty list; the rule is documented rather than
+  guessed), `t` → `true`, symbols → their names, keyword plists / alists /
+  string-or-symbol-keyed hash tables → objects, other lists and vectors →
+  arrays. Values with no faithful JSON shape (buffers, markers, windows,
+  circular structures, non-finite floats) fall back to the printed string,
+  flagged by `value-encoding: "printed"` — check the flag, never guess.
 
 ## Interactive ERT runs
 
@@ -1030,14 +1062,14 @@ responses embed a compact state snapshot so the model sees why):
 
 | tool | purpose |
 |---|---|
-| `elate_start` / `elate_stop` / `elate_list` / `elate_info` / `elate_purge` | session lifecycle (`ui`: `tty` or `gui`; `headless` for Xvfb on Linux; `config` includes `clean-install`; `elate_start` also `eval_files`/`profiles`/`home_seed`; `elate_purge` deletes stopped/dead sandboxes, `stopped_older_than` GCs only stale ones) |
+| `elate_start` / `elate_stop` / `elate_list` / `elate_info` / `elate_path` / `elate_purge` | session lifecycle (`ui`: `tty` or `gui`; `headless` for Xvfb on Linux; `config` includes `clean-install`; `elate_start` also `eval_files`/`profiles`/`home_seed`/`owner`/`ttl`; `elate_path` returns the per-session private scratch dir; `elate_purge` deletes stopped/dead sandboxes, `stopped_older_than` GCs only stale ones, `owner` selects one agent's) |
 | `elate_keys` | kbd-notation keys; `delivery`: `semantic` (through the command loop — obeys keymaps; a bell aborts and names the culprit), `events` (holds prompts open; bell-tolerant), or `raw` (TTY only; works even when Emacs is wedged) |
 | `elate_type` | literal text: raw terminal bytes (TTY) or queued events (GUI) |
-| `elate_send_process` | send raw input to a buffer's subprocess (comint/REPL/shell/terminal): `char` (e.g. `C-c` → ^C/SIGINT), `text`, or `file` — drives the *process*, not Emacs |
+| `elate_send_process` | send raw input to a buffer's subprocess (comint/REPL/shell/terminal): `char` (e.g. `C-c` → ^C/SIGINT), `text`, or `file` — drives the *process*, not Emacs; a buffer with several live processes is an error naming them (pick one with `process`), and the result echoes the target's name + command line |
 | `elate_mouse` | semantic mouse for both UIs: click/double/drag/wheel at a buffer position, line/column, or the mode line; fires real bindings (buttons, follow-link, mwheel) |
 | `elate_focus` | inject a `focus-in`/`focus-out` event: runs `handle-focus-in`/`-out` through `special-event-map` (fires `after-focus-change-function`, sets `last-focus-update`); `set_focus_state` also shims `(frame-focus-state)` |
 | `elate_send_events` | inject an ordered stream of focus/mouse/key tokens that drains through the command loop in order (a focus event's hooks run before a following click); focus events auto-split into drained batches, so any ordering — including a mouse-down before a focus-in — is faithful |
-| `elate_eval` | elisp eval with value, *Messages* delta, error + backtrace |
+| `elate_eval` | elisp eval with value, *Messages* delta, error + backtrace; `json_result` returns the value as real JSON instead of a printed sexp (fallback flagged by `value-encoding`) |
 | `elate_test` | interactive ERT run: selector support, per-test status/duration/messages/condition/backtrace; failures are data (`ok` stays true — check `unexpected`) |
 | `elate_lint` | byte-compile + checkdoc by file path: `{file, tool, line, col, severity, message}` items; **executes the file's compile-time code in the session** (see Lint warning above) |
 | `elate_profile` | native profiler: one-shot `run` (start → eval → stop → report) or manual `start`/`stop`/`report`; structured top-function list + depth-limited calltree (cpu samples / mem bytes) |
@@ -1047,7 +1079,7 @@ responses embed a compact state snapshot so the model sees why):
 | `elate_buffer` / `elate_messages` / `elate_echo` | targeted reads (`elate_messages` is cursor-based: only news since the last call); `elate_buffer` takes `props` for face/text-property runs + overlays |
 | `elate_popups` | capture visible popups as text: which-key, transient, hydra, corfu/company, completion-preview, child frames |
 | `elate_faces_at` | faces, overlays, and every text property (with **values**) at a buffer position — by `line`+`col` or `pos`, and `run` adjacent cells in one call; assert a package's own text properties without repeated `get-text-property` evals |
-| `elate_wait` | wait for `stable` (buffer output settled for `quiet_ms` — comint/REPL/terminal) / `idle` (command-loop) / `text` (Python regexp) / `prompt` |
+| `elate_wait` | wait for `stable` (buffer output settled for `quiet_ms` — comint/REPL/terminal) / `idle` (command-loop) / `text` (Python regexp) / `prompt` / `until` (an elisp predicate polled until non-nil) / `dead` |
 | `elate_describe` | structured docs + binding resolution for a key/function/variable/mode |
 | `elate_run_script` | execute a whole scenario script (by path) in one call: fresh session, steps, assertions, teardown; script failures are data (`ok` stays true — check `success`); `keep_on_failure` keeps the session for inspection |
 | `elate_record` | start/stop/status of an asciicast v2 recording of a TTY session (snap series stays CLI-only) |
