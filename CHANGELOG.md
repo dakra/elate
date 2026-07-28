@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.14.0 (unreleased)
+## 0.14.0
 
 The update story: installed skill copies and the CLI can no longer drift
 apart silently — staleness is detected in both directions, one command
