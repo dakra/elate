@@ -40,8 +40,12 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   — check it, and `eval` a command directly when it must run regardless of
   bindings. A sequence that opens a minibuffer
   prompt and leaves it open needs `keys … --events` (queued); unwedging a
-  stuck Emacs (`info` shows `busy: true`) needs `interrupt` (raw C-g on TTY,
-  a C-g-like SIGINT on GUI; `--signal usr2` for a debugger backtrace).
+  stuck Emacs (`info` shows `busy: true`) needs `interrupt` (raw C-g on TTY;
+  on GUI it breaks Emacs into the Lisp debugger and unwinds it back to top
+  level — `--signal usr2` to stay in the debugger and read `debug show`).
+  A session parked in the Lisp debugger (`in_debugger` in `info`,
+  `in-debugger` in `state`/the idle probe) answers the channel but eats
+  every key: `debug abort` unwinds it.
 - Drive a **subprocess** (shell/REPL/terminal) with `send-process`: it writes
   straight to the buffer's process (`send-process --char C-c` interrupts,
   `send-process 'cmd\n'` feeds input) — `keys`/`type` drive Emacs, this drives
@@ -59,7 +63,9 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   `eval --json-result` (real JSON in `value`; fallback flagged by
   `value-encoding`), `eval --raw` (bare value, no envelope, stdout empty on
   error), or the global `--field NAME` (one envelope field bare) — never
-  regex a printed plist.
+  regex a printed plist. Quote-heavy source (`#'fn`, `'sym`) that shell
+  single-quoting would mangle: `eval --file forms.el` (or `--file -` for
+  stdin) runs it verbatim.
 - Crashes/hangs: a form that crashes Emacs comes back as `session_died`
   with the fatal `signal` + OS `crash_report` path (also via `wait dead` /
   `info` / `list`, which renders `dead (SIGABRT)`); `eval --on-timeout

@@ -22,6 +22,7 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 - [`elate start`](#elate-start)
 - [`elate stop`](#elate-stop)
 - [`elate interrupt`](#elate-interrupt)
+- [`elate debug`](#elate-debug)
 - [`elate list`](#elate-list)
 - [`elate purge`](#elate-purge)
 - [`elate prune`](#elate-prune)
@@ -73,6 +74,7 @@ start a new sandboxed session
 - `--config {minimal,bare,init-file,clean-install}` (default: minimal) -- sandbox config mode (default: minimal; clean-install installs the --load package(s) for real via package-install-file)
 - `--init-file PATH` -- user init file (implies --config init-file)
 - `--load PATH` (repeatable) -- elisp file or directory to put on load-path (repeatable); with --config clean-install: the package to install (.el file, tar, or directory)
+- `--require FEATURE` (repeatable) -- feature to (require 'FEATURE) at startup, after --load has wired load-path (repeatable); the shorthand for the usual follow-up --eval "(require 'FEATURE)"
 - `--eval FORM` (repeatable) -- elisp form to evaluate at startup, before emacs-startup-hook (repeatable)
 - `--eval-file PATH` (repeatable) -- elisp file to load at startup, before emacs-startup-hook (repeatable); like a reusable --eval, with no load-path side effects
 - `--profile NAME` (repeatable) -- named startup snippet from $XDG_CONFIG_HOME/elate/profiles/NAME.el (or a path to a .el file); loaded like --eval-file (repeatable)
@@ -96,10 +98,20 @@ stop a session (or --all / a filter)
 
 unblock a wedged session (raw C-g / signal) without stopping it
 
-Poke a busy-but-alive session without killing it. TTY: send raw C-g over tmux (works even when the semantic channel is blocked). GUI (no raw channel): signal Emacs -- --signal int (default) is a C-g-like quit that unwinds a stuck synchronous call; --signal usr2 drops into the Lisp debugger so a follow-up observation shows where it was stuck.
+Poke a busy-but-alive session without killing it. TTY: send raw C-g over tmux (works even when the semantic channel is blocked). GUI (no raw channel): signal Emacs -- --signal auto (default) breaks the running code into the Lisp debugger with SIGUSR2, then unwinds it back to top level once the semantic channel answers (the C-g-like recovery; result carries recovered/depth_after). --signal usr2 only enters the debugger, so `debug show` can reveal where it was stuck. --signal int sends SIGINT, which TERMINATES a GUI-only Emacs (no tty frame = quit request, not C-g) -- a deliberate shutdown, never a recovery.
 
 - `[name]` -- session name (or use -s NAME)
-- `--signal {int,usr2}` (default: int) -- GUI only: int (C-g-like quit, default) or usr2 (enter the Lisp debugger); ignored for TTY
+- `--signal {auto,usr2,int}` (default: auto) -- GUI only: auto (SIGUSR2 + unwind to top level, default), usr2 (enter the Lisp debugger and stay), or int (SIGINT: terminates a GUI-only Emacs); ignored for TTY
+
+## elate debug
+
+inspect or unwind the Lisp debugger / a recursive edit
+
+When code under test signals an error and *Backtrace* pops up, the session sits in a recursive edit: it looks idle, but every key and eval lands inside the debugger (`wait idle` refuses to succeed there and points here; `state` reports recursion-depth / in-debugger). 'show' returns the backtrace text and depth without touching anything; 'abort' throws back to top level -- ending the debugger and restoring the window layout it saved on entry -- with the session and its state intact. This complements `interrupt`, which is for a busy Emacs that is NOT answering the semantic channel.
+
+- `[{show,abort}]` (default: show) -- show (default): backtrace + depth; abort: throw to top level (a no-op at recursion depth 0)
+- `[name]` -- session name (or use -s NAME; requires an explicit action first)
+- `--timeout SECS` (default: 15)
 
 ## elate list
 
@@ -244,7 +256,8 @@ Drop into the session's tmux client so a human can drive Emacs directly, then de
 
 evaluate an elisp form
 
-- `form`
+- `[form]` -- elisp source: one or more forms, evaluated as (progn ...); omit when using --file
+- `--file PATH` -- read the elisp source from PATH instead of the FORM argument ('-' reads stdin). Sidesteps shell quoting entirely, so forms containing ' or #' run verbatim -- use this to test snippets exactly as written. One or more forms, evaluated as (progn ...) like the positional FORM
 - `--buffer NAME` -- evaluate in this buffer (default: the selected window's buffer, so current-buffer/point/line see what is on screen, not an arbitrary buffer)
 - `--timeout SECS` (default: 15)
 - `--backtrace` -- on error, also return structured backtrace frames (each frame's function + printed args), not just the rendered backtrace string
@@ -256,7 +269,7 @@ evaluate an elisp form
 
 trace elisp functions (log calls/args/returns), then read the accumulated log
 
-Wrap trace-function around one or more functions so each call records its args and return value. 'on FUNC...' starts tracing; drive the session (keys/eval/...); 'read' returns and clears the log so each read sees only new calls; 'off [FUNC...]' untraces the named functions (or all). Drives Emacs internals you cannot see on screen -- why an advice fires twice, what args a hook receives.
+Wrap trace-function-background around one or more functions so each call records its args and return value. Tracing is invisible: the *trace-output* buffer is never displayed, so the window layout under test stays untouched. 'on FUNC...' starts tracing; drive the session (keys/eval/...); 'read' returns and clears the log so each read sees only new calls; 'off [FUNC...]' untraces the named functions (or all). Drives Emacs internals you cannot see on screen -- why an advice fires twice, what args a hook receives.
 
 - `{on,off,read}`
 - `[FUNC]` (repeatable) -- function name(s): required for 'on', optional for 'off' (default: untrace all), unused for 'read'
@@ -347,6 +360,8 @@ current echo area / minibuffer line
 
 one-call scene snapshot (layout, prompt, point, modes, messages tail)
 
+Full-snapshot shape: current-buffer facts (buffer, file, point, line, column, major-mode, minor-modes, region, narrowed, modified), echo, minibuffer (prompt/input/completions or null), input-pending, last-command, idle (secs or null), recursion-depth + in-debugger (non-zero/true = a recursive edit or the Lisp debugger is eating input -- see `debug`), popups, messages-tail, and 'windows': the window-tree as nested objects, NOT a flat list -- an inner node is {split: 'vertical'|'horizontal', children: [...]}, a leaf is one window {buffer, selected, width, height, line, column, start-line, end-line, mode-line, text, ...}; recurse until nodes have no 'children'.
+
 - `--since TOKEN` -- return only what changed since the TOKEN from a prior state call (new/killed/modified buffers, point/selection movement, new *Messages* lines, minibuffer change) -- much cheaper than a full snapshot, and 'changed':false means your last action did nothing observable. Every state result carries a fresh 'token'; an unknown/stale one degrades to a full snapshot.
 
 ## elate describe
@@ -388,6 +403,8 @@ Show the tail of the Emacs process log -- module panics, GC/native-comp warnings
 ## elate wait
 
 wait for a condition (exit 3 on timeout)
+
+Block until a condition holds. `wait idle` fails immediately (rather than timing out) when Emacs is parked in the Lisp debugger's recursive edit -- that session will never be idle; recover with `debug abort`.
 
 - `{idle,text,prompt,stable,until,dead}`
 - `[args]` (repeatable) -- idle: [MIN_IDLE_SECS]; text: REGEXP (Python regex syntax, not elisp); until: an elisp predicate form, polled until non-nil (an elisp error fails the wait -- wrap in ignore-errors if an error means "not yet"); prompt/stable/dead: none

@@ -152,7 +152,8 @@ _SNAPSHOT_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _SNAPSHOT_OF = ("screen", "faces", "state")
 _SNAPSHOT_KEYS = {"name", "of", "buffer", "from", "to", "ansi"}
 
-_SESSION_KEYS = {"ui", "size", "config", "init_file", "load", "eval",
+_SESSION_KEYS = {"ui", "size", "config", "init_file", "load", "require",
+                 "eval",
                  "eval_file", "profile", "home_seed", "env",
                  "emacs", "headless", "allow_init_error"}
 
@@ -532,7 +533,7 @@ def _validate_session_config(cfg: Any) -> None:
         raise ElateError(
             f'session "init_file" conflicts with config '
             f"{cfg.get('config')!r}; drop one of the two")
-    for key in ("load", "eval", "eval_file", "profile"):
+    for key in ("load", "require", "eval", "eval_file", "profile"):
         val = cfg.get(key)
         if val is not None and not (
                 isinstance(val, list) and all(isinstance(x, str) for x in val)):
@@ -1120,6 +1121,7 @@ def _start_for(script: dict[str, Any], base: Path,
         config=cfg.get("config", "minimal"),
         init_file=_resolve(cfg.get("init_file"), base),
         loads=[_resolve(p, base) for p in cfg.get("load") or []],
+        requires=list(cfg.get("require") or []),
         evals=list(cfg.get("eval") or []),
         eval_files=[_resolve(p, base) for p in cfg.get("eval_file") or []],
         profiles=list(cfg.get("profile") or []),
@@ -1793,6 +1795,8 @@ def _session_config(sess: S.Session, clean: bool = False) -> dict[str, Any]:
     loads = [x for x in sess.loads if not (clean and _is_transient(x))]
     if loads:
         cfg["load"] = loads
+    if sess.requires:
+        cfg["require"] = list(sess.requires)
     evals = [x for x in sess.evals if not (clean and _is_transient(x))]
     if evals:
         cfg["eval"] = evals

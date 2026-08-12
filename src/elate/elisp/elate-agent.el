@@ -687,21 +687,26 @@ only while the selected buffer is unchanged (a switch shows as
 Both forms carry a fresh :token and a :mode (\"full\" or \"delta\").  An
 undecodable token, or one minted by a since-restarted Emacs, degrades to
 a full snapshot tagged with :since-status (\"unknown\"/\"stale-session\")
-plus a fresh token, so the caller is never left without usable state."
+plus a fresh token, so the caller is never left without usable state.
+Both forms always carry :recursion-depth and :in-debugger (see
+`elate--debug-state') -- a session parked in the Lisp debugger must be
+visible in every snapshot, delta or not."
   (let* ((snap (elate--state-snapshot))
          (token (elate--mint-token snap)))
-    (if (not since)
-        (append (elate--state-full) (list :mode "full" :token token))
-      (let ((base (elate--decode-token since)))
-        (cond
-         ((null base)
-          (append (elate--state-full)
-                  (list :mode "full" :since-status "unknown" :token token)))
-         ((not (equal (gethash "ep" base) (emacs-pid)))
-          (append (elate--state-full)
-                  (list :mode "full" :since-status "stale-session" :token token)))
-         (t (append (elate--state-delta base snap)
-                    (list :mode "delta" :token token))))))))
+    (append
+     (elate--debug-state)
+     (if (not since)
+         (append (elate--state-full) (list :mode "full" :token token))
+       (let ((base (elate--decode-token since)))
+         (cond
+          ((null base)
+           (append (elate--state-full)
+                   (list :mode "full" :since-status "unknown" :token token)))
+          ((not (equal (gethash "ep" base) (emacs-pid)))
+           (append (elate--state-full)
+                   (list :mode "full" :since-status "stale-session" :token token)))
+          (t (append (elate--state-delta base snap)
+                     (list :mode "delta" :token token)))))))))
 
 (defun elate--state-full ()
   "One-call snapshot of the full interactive scene.
@@ -1236,16 +1241,74 @@ visible text through the (slow) emacsclient print path."
   (list :echo (elate--jnull (current-message))
         :minibuffer (elate--minibuffer-info)))
 
+(defun elate--debug-state ()
+  "Recursive-edit / Lisp-debugger visibility fields.
+The semantic channel keeps answering while Emacs sits in the debugger's
+recursive edit (server process filters still run there), so probes must
+carry these fields explicitly or an outside driver concludes \"idle\"
+while everything it sends is landing in a stuck recursive edit.
+:recursion-depth is the raw `recursion-depth' (minibuffers count -- an
+active minibuffer is legitimate waiting, compare `minibuffer-depth');
+:in-debugger is t while a `debugger-mode' *Backtrace* buffer is up
+inside a recursive edit."
+  (let* ((depth (recursion-depth))
+         (bt (get-buffer "*Backtrace*"))
+         (in-debugger (and bt (> depth 0)
+                           (with-current-buffer bt
+                             (derived-mode-p 'debugger-mode))
+                           t)))
+    (list :recursion-depth depth
+          :in-debugger (elate--jbool in-debugger))))
+
+(defun elate--rpc-debug (&optional action)
+  "Inspect or unwind the Lisp debugger / a recursive edit.
+ACTION \"show\" (default): the *Backtrace* buffer's text (:null when
+there is none) plus the `elate--debug-state' fields.  ACTION \"abort\":
+throw to top level -- scheduled on a 0s timer rather than thrown
+directly, because this RPC executes inside the server's process filter
+and a direct throw would unwind the filter before the reply is written;
+the timer fires from the (recursive) command loop right after the reply
+goes out.  Exiting the debugger this way also restores the window
+configuration it saved on entry.  At recursion depth 0 nothing is
+scheduled (:scheduled :false) -- there is nothing to unwind, and a stray
+throw would clobber unrelated state (kbd macro, prefix arg, staged
+minibuffer).  Poll `state' afterwards to confirm the depth reached 0."
+  (pcase (or action "show")
+    ("show"
+     (let ((bt (get-buffer "*Backtrace*")))
+       (append (elate--debug-state)
+               (list :backtrace
+                     (if (buffer-live-p bt)
+                         (with-current-buffer bt
+                           (elate--clip-string
+                            (buffer-substring-no-properties (point-min)
+                                                            (point-max))
+                            elate--max-value-len))
+                       :null)))))
+    ("abort"
+     ;; At depth 0 there is nothing to unwind, and a stray top-level throw
+     ;; is not free: it would abort an in-progress kbd macro, drop a
+     ;; prefix arg, or close a deliberately staged minibuffer prompt.
+     (if (> (recursion-depth) 0)
+         (progn (run-at-time 0 nil #'top-level)
+                (append (elate--debug-state) (list :scheduled t)))
+       (append (elate--debug-state) (list :scheduled :false))))
+    (other (error "elate: unknown debug action %S (use show/abort)" other))))
+
 (defun elate--rpc-idle ()
   "Idle/busy probe.
 :idle is seconds since the last command-loop activity (a large value is
-healthy -- Emacs is waiting for input, not wedged).  For \"did the buffer
+healthy -- Emacs is waiting for input, not wedged).  Also carries the
+`elate--debug-state' fields: an Emacs parked in the Lisp debugger looks
+perfectly idle by every other measure here.  For \"did the buffer
 output settle?\" use the `buffer-tick' probe / `wait stable' instead."
   (let ((idle (current-idle-time)))
-    (list :idle (if idle (float-time idle) :null)
-          :input-pending (elate--jbool (input-pending-p))
-          :unread (length unread-command-events)
-          :minibuffer-active (elate--jbool (active-minibuffer-window)))))
+    (append
+     (list :idle (if idle (float-time idle) :null)
+           :input-pending (elate--jbool (input-pending-p))
+           :unread (length unread-command-events)
+           :minibuffer-active (elate--jbool (active-minibuffer-window)))
+     (elate--debug-state))))
 
 (defun elate--rpc-buffer-tick (&optional name)
   "Modification tick of buffer NAME (default: current), for output-settled waits.
@@ -2411,9 +2474,12 @@ reply travels the same ~50 KB/s emacsclient print path as eval.")
 (defun elate--rpc-trace (action &optional names keep)
   "Drive function tracing.  ACTION is \"on\", \"off\", or \"read\".
 NAMES is a whitespace-separated string of function names.  \"on\" traces
-each via `trace-function' (already-traced is a no-op re-arm, reported
-under :already, never an error); all names are resolved before any is
-traced, so a bad name leaves nothing half-traced.  \"off\" untraces the
+each via `trace-function-background' -- never `trace-function', which
+displays `*trace-output*' and thereby rewrites the window layout that
+window-sensitive code under test (popups, dnd, terminals) depends on
+\(already-traced is a no-op re-arm, reported under :already, never an
+error); all names are resolved before any is traced, so a bad name
+leaves nothing half-traced.  \"off\" untraces the
 named functions, or ALL of them when NAMES is empty.  \"read\" returns
 the accumulated `*trace-output*' text and, unless KEEP, clears it so each
 read sees only new calls."
@@ -2429,7 +2495,7 @@ read sees only new calls."
            (let ((sym (car ss)) (name (car ns)))
              (if (and (fboundp 'trace-is-traced) (trace-is-traced sym))
                  (push name already)
-               (trace-function sym)
+               (trace-function-background sym)
                (push name traced)))
            (setq ns (cdr ns) ss (cdr ss)))
          (list :traced (vconcat (nreverse traced))

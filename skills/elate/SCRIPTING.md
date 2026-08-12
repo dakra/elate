@@ -71,6 +71,7 @@ from any cwd.
 | `config` | `"minimal"` \| `"bare"` \| `"init-file"` \| `"clean-install"` | `"minimal"` | |
 | `init_file` | string path | — | only with config `minimal`/`init-file` (implies `init-file`); conflicts loudly with `bare`/`clean-install` |
 | `load` | list of strings | — | files/dirs for load-path; with `clean-install`: packages to install |
+| `require` | list of strings | — | features to `(require 'FEATURE)` after `load` wires load-path |
 | `eval` | list of strings | — | startup forms |
 | `eval_file` | list of strings | — | elisp files loaded at startup (like `eval`, no load-path effect) |
 | `profile` | list of strings | — | named snippets from `$XDG_CONFIG_HOME/elate/profiles/NAME.el` (or a `.el` path) |

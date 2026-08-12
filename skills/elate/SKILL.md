@@ -5,7 +5,7 @@
 # skill files change (tests/skill_content_version.txt pins this); `elate
 # start` compares it against installed copies to nudge about staleness.
 name: elate
-version: 0.14.0
+version: 0.15.0
 description: Spawns sandboxed Emacs sessions (terminal or GUI) and drives them
   with keys, mouse, and elisp to test Emacs Lisp interactively - run ERT tests
   in a live session, inspect faces/overlays/popups structurally, lint, profile,
@@ -183,19 +183,32 @@ open for you to inspect (`state` shows prompt + candidates) and answer.
 - If a semantic `keys` call times out, the sequence probably left Emacs
   reading input: retry with `--events`, or recover with `interrupt`.
 - After an eval/keys timeout where Emacs stays busy (`info` shows
-  `busy: true`): `interrupt` unblocks it — raw C-g on TTY, a C-g-like
-  SIGINT on GUI (`--signal usr2` instead drops Emacs into the Lisp debugger
-  so a follow-up `state`/`messages` shows where it was stuck). Stop the
-  session only if it stays wedged after an interrupt.
+  `busy: true`): `interrupt` unblocks it — raw C-g on TTY; on GUI it
+  breaks Emacs into the Lisp debugger with SIGUSR2 and unwinds it back to
+  top level (`--signal usr2` instead stays in the debugger so `debug show`
+  reveals where it was stuck). Never use `--signal int` to recover: SIGINT
+  *terminates* a GUI-only Emacs. Stop the session only if it stays wedged
+  after an interrupt.
+- A session sitting in the Lisp debugger (code under test signalled and
+  `*Backtrace*` popped up) is the opposite failure mode: it answers the
+  channel and looks idle, but every key/eval lands inside the debugger.
+  `info` reports `in_debugger`/`recursion_depth` and `state` reports
+  `in-debugger`/`recursion-depth` (note the spelling difference), `wait
+  idle` fails fast pointing there; `debug show` prints the backtrace,
+  `debug abort` unwinds to top level with the session intact.
 
 ## Eval gotchas
 
 ```sh
 uvx elate -s s eval '(my-fn 42)' --timeout 5
 ```
-- Forms do **not** run in the selected window's buffer (they run in the
-  server's context). Anything buffer-sensitive must wrap itself:
+- Forms run in the **selected window's buffer** by default (so
+  `current-buffer`/point see what's on screen); target another buffer
+  with `--buffer NAME` or wrap the form:
   `eval '(with-current-buffer "*scratch*" (insert "hi"))'`.
+- Shell single-quoting cannot contain `'` — so `#'fn` and `'symbol`
+  break as argv. Don't rewrite the elisp: put the forms in a file and
+  `eval --file forms.el` (or `--file -` for stdin) to run them verbatim.
 - Errors come back structured: `error` + `backtrace` + the *Messages*
   delta; exit code 1.
 - Printed values are truncated at 64 KiB (`truncated: true` +
@@ -397,7 +410,7 @@ images** instead of PNG files to read. If `elate_*` MCP tools are already
 available in your session (someone registered the server — the plugin is
 CLI-first and does not register it for you), use them directly — do **not**
 register a duplicate; otherwise register it with
-`claude mcp add elate -- uvx elate mcp`. The 31 `elate_*` tools cover the core surface (`attach`, `resize`,
+`claude mcp add elate -- uvx elate mcp`. The 32 `elate_*` tools cover the core surface (`attach`, `resize`,
 `prune`, `stderr`, `export-script`, `snap`, `matrix`, `install`, and `update` stay CLI-only); `prune`
 aliases `purge` and `stderr` aliases `logs`. Sessions are shared
 between both (same names, same sandboxes), so you can mix.

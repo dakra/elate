@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import anyio
@@ -37,7 +38,8 @@ pytestmark = pytest.mark.skipif(
 NAME = f"m{os.getpid()}"
 
 EXPECTED_TOOLS = {
-    "elate_start", "elate_stop", "elate_interrupt", "elate_list", "elate_info",
+    "elate_start", "elate_stop", "elate_interrupt", "elate_debug",
+    "elate_list", "elate_info",
     "elate_path",
     "elate_keys", "elate_type", "elate_send_process", "elate_mouse",
     "elate_focus", "elate_send_events",
@@ -292,6 +294,35 @@ def test_eval_roundtrip(elate_home: str, mcp_session: dict[str, Any]) -> None:
     out = one_call(elate_home, "elate_eval", {"session": NAME, "form": "(+ 1 2)"})
     assert out["ok"] is True
     assert out["value"] == "3"
+
+def test_eval_file_param(elate_home: str, mcp_session: dict[str, Any],
+                         tmp_path: Path) -> None:
+    p = tmp_path / "forms.el"
+    p.write_text("(list #'car 'private)\n", encoding="utf-8")
+    out = one_call(elate_home, "elate_eval", {"session": NAME, "file": str(p)})
+    assert out["ok"] is True and out["value"] == "(car private)"
+    # Exactly one of form/file, in both directions.
+    both = one_call(elate_home, "elate_eval",
+                    {"session": NAME, "form": "t", "file": str(p)})
+    assert both["ok"] is False and "exactly one" in both["error"]
+    neither = one_call(elate_home, "elate_eval", {"session": NAME})
+    assert neither["ok"] is False and "exactly one" in neither["error"]
+    missing = one_call(elate_home, "elate_eval",
+                       {"session": NAME, "file": str(tmp_path / "nope.el")})
+    assert missing["ok"] is False and "cannot read" in missing["error"]
+
+
+def test_debug_tool_show_and_noop_abort(elate_home: str,
+                                        mcp_session: dict[str, Any]) -> None:
+    out = one_call(elate_home, "elate_debug", {"session": NAME})
+    assert out["ok"] is True
+    assert out["in-debugger"] is False and out["recursion-depth"] == 0
+    # abort at depth 0 is a recorded no-op, not a stray top-level throw.
+    ab = one_call(elate_home, "elate_debug",
+                  {"session": NAME, "action": "abort"})
+    assert ab["ok"] is True
+    assert ab["scheduled"] is False and ab["depth-after"] == 0
+
 
 def test_eval_json_result(elate_home: str, mcp_session: dict[str, Any]) -> None:
     out = one_call(elate_home, "elate_eval",

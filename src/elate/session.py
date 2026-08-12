@@ -57,6 +57,7 @@ class Session:
     emacs_version: str | None = None
     init_file: str | None = None
     loads: list[str] = field(default_factory=list)
+    requires: list[str] = field(default_factory=list)
     evals: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)  # extra process env vars
     owner: str | None = None  # who started it (an agent tag; filters stop/purge/list)
@@ -475,6 +476,7 @@ def start_session(
     config: str = "minimal",
     init_file: str | None = None,
     loads: Sequence[str] = (),
+    requires: Sequence[str] = (),
     evals: Sequence[str] = (),
     eval_files: Sequence[str] = (),
     profiles: Sequence[str] = (),
@@ -545,6 +547,7 @@ def start_session(
             config=config,
             init_file=init_file,
             loads=loads,
+            requires=requires,
             evals=evals,
             eval_files=eval_files,
             profiles=profiles,
@@ -582,6 +585,7 @@ def start_session(
         status="starting",
         init_file=init_file,
         loads=list(loads),
+        requires=list(requires),
         evals=list(evals),
         env=dict(env or {}),
         headless=headless,
@@ -784,20 +788,31 @@ def stop_session(name: str, via: str | None = None) -> dict[str, Any]:
 
 
 # signal name -> signal, for the GUI interrupt path (TTY uses raw C-g).
-_INTERRUPT_SIGNALS = {"int": signal.SIGINT, "usr2": signal.SIGUSR2}
+# SIGINT is NOT C-g for a GUI-only Emacs: with no frame on the controlling
+# tty, Emacs's interrupt_signal handler calls kill-emacs -- a clean,
+# forensics-free shutdown. The C-g-like recovery is "auto": SIGUSR2 trips
+# the `debug-on-event' default (which interrupts even a tight elisp loop),
+# then a `debug abort' unwinds the debugger back to top level.
+_INTERRUPT_SIGNALS = {"auto": signal.SIGUSR2, "usr2": signal.SIGUSR2,
+                      "int": signal.SIGINT}
 
 
-def interrupt_session(name: str, sig: str = "int",
+def interrupt_session(name: str, sig: str = "auto",
                       via: str | None = None) -> dict[str, Any]:
     """Poke a wedged-but-alive session without killing it.
 
     TTY: send raw C-g over tmux -- works even when the semantic channel
-    is blocked, exactly as `keys C-g --raw` does. GUI: there is no raw
-    channel, so signal the Emacs process instead. SIGINT (`sig="int"`)
-    behaves like C-g -- a quit that unwinds a stuck synchronous call back
-    to top level; SIGUSR2 (`sig="usr2"`) trips Emacs's `debug-on-event`
-    default and drops into the Lisp debugger so a follow-up observation
-    shows *where* it was stuck. `sig` is ignored for TTY sessions.
+    is blocked, exactly as `keys C-g --raw` does; `sig` is ignored. GUI:
+    there is no raw channel, so signal the Emacs process instead.
+    `sig="auto"` (default) is the C-g-like recovery: SIGUSR2 breaks the
+    running code into the Lisp debugger, and as soon as the semantic
+    channel answers again a scheduled `top-level` unwinds the debugger --
+    the reply carries "recovered" and "depth_after" (0 = back at top
+    level). `sig="usr2"` sends only the signal, parking Emacs in the
+    debugger so a follow-up `debug show` reveals *where* it was stuck.
+    `sig="int"` sends SIGINT, which TERMINATES a GUI-only Emacs (no tty
+    frame means Emacs treats it as a quit request, not C-g) -- only useful
+    as a deliberate shutdown.
     """
     sess = load_session(name)
     sess.require_alive()
@@ -815,12 +830,46 @@ def interrupt_session(name: str, sig: str = "int",
                 f"could not signal Emacs pid {sess.emacs_pid} for session "
                 f"{name!r}; it may have just exited")
         how = signum.name  # "SIGINT" / "SIGUSR2"
-    else:
-        sess.raw().send_kbd("C-g")
-        how = "raw-C-g"
-    sess.log("interrupt", ui=sess.ui, signal=how,
+        sess.log("interrupt", ui=sess.ui, signal=how, mode=sig,
+                 **({"via": via} if via else {}))
+        result = {"name": name, "ui": sess.ui, "delivered": how}
+        if sig == "auto":
+            result.update(_recover_from_usr2(sess))
+        return result
+    sess.raw().send_kbd("C-g")
+    sess.log("interrupt", ui=sess.ui, signal="raw-C-g",
              **({"via": via} if via else {}))
-    return {"name": name, "ui": sess.ui, "delivered": how}
+    return {"name": name, "ui": sess.ui, "delivered": "raw-C-g"}
+
+
+def _recover_from_usr2(sess: Session) -> dict[str, Any]:
+    """Finish an `interrupt auto`: unwind the debugger SIGUSR2 opened.
+
+    Waits for the semantic channel to answer (the signal must first break
+    the running code into the debugger's recursive edit, where server
+    filters run again), then schedules the `top-level` throw -- and
+    re-checks: if the wedged form finished on its own between the signal
+    and the first abort, the debugger entry the SIGUSR2 queued can land
+    *after* that abort, so keep aborting until an idle probe confirms
+    the debugger is really gone. Best effort: a session that never
+    answers (or never leaves the debugger) reports recovered=False and
+    is a case for `stop`.
+    """
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not sess.semantic().ping(timeout=1.0):
+            time.sleep(0.2)
+            continue
+        try:
+            debug_session(sess, "abort")
+            probe = sess.semantic().rpc("idle", timeout=1.0)
+        except (EvalTimeout, TransportError, RpcError):
+            break
+        if not probe.get("in-debugger"):
+            return {"recovered": True,
+                    "depth_after": probe.get("recursion-depth")}
+        time.sleep(0.2)
+    return {"recovered": False}
 
 
 def _dir_size(path: Path) -> int:
@@ -1050,13 +1099,28 @@ def maybe_reap_expired(exclude: str | None = None) -> list[dict[str, Any]]:
 def session_info(name: str) -> dict[str, Any]:
     sess = load_session(name)
     alive = sess.is_alive()
-    busy = sess.is_busy() if alive else False
+    busy = False
+    debug_probe: dict[str, Any] = {}
+    if alive:
+        # One idle-probe RPC doubles as the busy check (unanswered = busy)
+        # and surfaces a session parked in the Lisp debugger -- which
+        # answers promptly and would otherwise read as a healthy session.
+        try:
+            probe = sess.semantic().rpc("idle", timeout=1.0)
+            if probe.get("in-debugger") is not None:
+                debug_probe = {
+                    "in_debugger": bool(probe.get("in-debugger")),
+                    "recursion_depth": probe.get("recursion-depth"),
+                }
+        except (EvalTimeout, TransportError, RpcError):
+            busy = True
     status = "running" if alive else ("dead" if sess.status == "running" else sess.status)
     info = {
         "name": sess.name,
         "ui": sess.ui,
         "alive": alive,
         "busy": busy,
+        **debug_probe,
         "status": status,
         "pid": sess.emacs_pid,
         "emacs": sess.emacs,
@@ -1387,6 +1451,42 @@ def trace_functions(
     return sess.semantic().rpc("trace", action, names, keep, timeout=timeout)
 
 
+def debug_session(sess: Session, action: str = "show",
+                  timeout: float = 15.0,
+                  via: str | None = None) -> dict[str, Any]:
+    """Inspect ("show") or unwind ("abort") the Lisp debugger / a recursive edit.
+
+    "show" returns the *Backtrace* text plus recursion-depth/in-debugger.
+    "abort" has the agent schedule a `top-level` throw (it cannot throw
+    directly from the server filter), then confirms: poll the idle probe
+    briefly and report the depth actually reached as "depth-after"
+    (None when Emacs stopped answering before confirmation).
+    """
+    if action not in ("show", "abort"):
+        raise UsageError(f"unknown debug action {action!r}; use show/abort")
+    sess.log("debug", action=action, **({"via": via} if via else {}))
+    data = sess.semantic().rpc("debug", action, timeout=timeout)
+    if action == "abort" and not data.get("scheduled"):
+        # Nothing was thrown (depth 0); the current depth is already final.
+        data["depth-after"] = data.get("recursion-depth")
+        sess.log("debug-result", **data)
+    elif action == "abort":
+        depth_after = None
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                depth_after = sess.semantic().rpc(
+                    "idle", timeout=1.0).get("recursion-depth")
+            except (EvalTimeout, TransportError, RpcError):
+                break
+            if depth_after == 0:
+                break
+            time.sleep(0.1)
+        data["depth-after"] = depth_after
+        sess.log("debug-result", **data)
+    return data
+
+
 # ---------------------------------------------------------------------------
 # Waiters
 
@@ -1477,9 +1577,22 @@ def _wait_loop(sess: Session, timeout: float, what: str, probe) -> dict[str, Any
 
 def wait_idle(sess: Session, min_idle: float = 0.2, timeout: float = 10.0) -> dict[str, Any]:
     """Wait until Emacs answers promptly, has no pending input, and has
-    been idle for at least MIN_IDLE seconds."""
+    been idle for at least MIN_IDLE seconds.
+
+    An Emacs parked in the Lisp debugger answers the semantic channel and
+    reads as idle by every timing measure, yet everything sent to it lands
+    in a stuck recursive edit -- so that case fails immediately (no
+    timeout burned) with the recovery command in the message.
+    """
     def probe() -> dict[str, Any] | None:
         data = sess.semantic().rpc("idle", timeout=2.0)
+        if data.get("in-debugger"):
+            raise ElateError(
+                "Emacs is sitting in the Lisp debugger (recursive edit "
+                f"depth {data.get('recursion-depth')}) -- not idle, and it "
+                "will never become idle by waiting. Inspect it with "
+                f"`elate -s {sess.name} debug show` (MCP: elate_debug); "
+                f"unwind it with `elate -s {sess.name} debug abort`")
         idle = data.get("idle")
         if (
             not data.get("input-pending")

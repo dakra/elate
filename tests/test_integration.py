@@ -865,6 +865,24 @@ def test_eval_backtrace_frames(sess: S.Session) -> None:
     assert data.get("backtrace")
 
 
+def test_eval_file_runs_quote_heavy_source_verbatim(
+        sess: S.Session, capsys: pytest.CaptureFixture[str]) -> None:
+    # Source full of shell-hostile quoting (#'fn, 'sym, embedded ') runs
+    # exactly as written when passed via --file; multiple forms behave
+    # like the positional argument's (progn ...).
+    src = ("(defvar elate-ef-probe (list #'car 'private \"it's\"))\n"
+           "(length elate-ef-probe)\n")
+    with tempfile.NamedTemporaryFile("w", suffix=".el", delete=False) as fh:
+        fh.write(src)
+        path = fh.name
+    try:
+        assert cli.main(["--json", "-s", sess.name, "eval", "--file", path]) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["ok"] is True and out["value"] == "3"
+    finally:
+        os.unlink(path)
+
+
 def test_eval_no_frames_without_flag(sess: S.Session) -> None:
     assert sess.semantic().eval_form("(elate-no-such-fn 42)").get("frames") is None
     assert sess.semantic().eval_form("(+ 1 2)", backtrace=True).get("frames") is None
@@ -873,9 +891,16 @@ def test_eval_no_frames_without_flag(sess: S.Session) -> None:
 def test_trace_on_eval_read_cycle(sess: S.Session) -> None:
     sem = sess.semantic()
     sem.eval_form("(defun elate-tr-sq (x) (* x x))")
+    layout_before = sem.eval_form("(length (window-list))")["value"]
     on = S.trace_functions(sess, "on", ["elate-tr-sq"])
     assert on["traced"] == ["elate-tr-sq"]
     sem.eval_form("(elate-tr-sq 7)")
+    # Tracing is background-only: *trace-output* must never be displayed,
+    # or it would rewrite the window layout out from under the code under
+    # test (popups, dnd, terminals).
+    assert sem.eval_form("(length (window-list))")["value"] == layout_before
+    assert sem.eval_form(
+        "(not (get-buffer-window trace-buffer))")["value"] == "t"
     r = S.trace_functions(sess, "read")
     assert "elate-tr-sq" in r["output"] and "49" in r["output"]
     assert r["cleared"] is True
@@ -883,6 +908,88 @@ def test_trace_on_eval_read_cycle(sess: S.Session) -> None:
     assert S.trace_functions(sess, "read")["output"] == ""
     off = S.trace_functions(sess, "off")
     assert off["all"] is True
+
+
+def test_debugger_visibility_wait_idle_and_abort(sess: S.Session) -> None:
+    sem = sess.semantic()
+    sem.eval_form("(setq debug-on-error t)")
+    try:
+        # Error from a timer = an error from the command loop, exactly like
+        # user-driven code signalling: Emacs pops *Backtrace* and parks in
+        # a recursive edit while the semantic channel keeps answering.
+        sem.eval_form("(run-at-time 0 nil (lambda () (car 1)))")
+        deadline = time.monotonic() + 10.0
+        idle = {}
+        while time.monotonic() < deadline:
+            idle = sem.rpc("idle")
+            if idle.get("in-debugger"):
+                break
+            time.sleep(0.1)
+        assert idle.get("in-debugger") is True
+        assert idle.get("recursion-depth") >= 1
+
+        # The stuck state is first-class in both state modes.
+        full = sem.rpc("state")
+        assert full["in-debugger"] is True and full["recursion-depth"] >= 1
+        delta = sem.rpc("state", full["token"])
+        assert delta["mode"] == "delta" and delta["in-debugger"] is True
+        info = S.session_info(sess.name)
+        assert info["in_debugger"] is True and info["recursion_depth"] >= 1
+        assert info["busy"] is False  # answers the channel; stuck, not busy
+
+        # wait idle refuses to call this idle -- immediately, not by timeout.
+        t0 = time.monotonic()
+        with pytest.raises(ElateError, match="debug abort"):
+            S.wait_idle(sess, timeout=30.0)
+        assert time.monotonic() - t0 < 5.0
+
+        shown = S.debug_session(sess, "show")
+        assert shown["in-debugger"] is True
+        assert "car" in (shown.get("backtrace") or "")
+
+        aborted = S.debug_session(sess, "abort")
+        assert aborted["scheduled"] is True
+        assert aborted["depth-after"] == 0
+        # Fully recovered: healthy evals, no debugger, layout restored.
+        assert sem.eval_form("(+ 2 3)")["value"] == "5"
+        after = sem.rpc("idle")
+        assert after.get("in-debugger") is False
+        assert sem.eval_form(
+            "(not (get-buffer-window \"*Backtrace*\"))")["value"] == "t"
+    finally:
+        sem.eval_form("(setq debug-on-error nil)")
+
+
+def test_recover_from_usr2_unwinds_debugger(sess: S.Session) -> None:
+    # The back half of `interrupt --signal auto` (GUI): once SIGUSR2 has
+    # dropped Emacs into the debugger, recovery waits for the semantic
+    # channel and unwinds to top level. Debugger entry is simulated here
+    # (a TTY session's channel behaves identically inside the recursive
+    # edit); the SIGUSR2 delivery itself is the gui.signal_pid path.
+    sem = sess.semantic()
+    sem.eval_form("(setq debug-on-error t)")
+    try:
+        sem.eval_form("(run-at-time 0 nil (lambda () (car 2)))")
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if sem.rpc("idle").get("in-debugger"):
+                break
+            time.sleep(0.1)
+        out = S._recover_from_usr2(sess)
+        assert out == {"recovered": True, "depth_after": 0}
+    finally:
+        sem.eval_form("(setq debug-on-error nil)")
+
+
+def test_debug_show_outside_debugger(sess: S.Session) -> None:
+    data = S.debug_session(sess, "show")
+    assert data["in-debugger"] is False
+    assert data["recursion-depth"] == 0
+    # abort at depth 0 schedules nothing: a stray top-level throw would
+    # clobber unrelated state (kbd macro, prefix arg, staged minibuffer).
+    aborted = S.debug_session(sess, "abort")
+    assert aborted["scheduled"] is False
+    assert aborted["depth-after"] == 0
 
 
 def test_trace_errors_on_macro_and_undefined(sess: S.Session) -> None:

@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.15.0
+
+Fixes from a live GUI/XDND test session's feedback: observability must
+not perturb what it observes, and a session stuck in the Lisp debugger
+must be visible and recoverable instead of silently eating the test.
+
+- **`trace on` no longer touches the window layout**: functions are
+  traced via `trace-function-background`, so `*trace-output*` is never
+  displayed. Popping it split the frame and could redirect
+  window-sensitive behavior under test (popups, dnd, terminals) at the
+  instrumented moment.
+
+- **`eval --file PATH` / `eval --file -`** (and MCP `elate_eval`'s
+  `file` param): evaluate a file of forms — or stdin — in a *running*
+  session, verbatim. Ends the shell-quoting surgery (`#'fn`, `'sym`,
+  embedded `'`) that argv single-quoting forced on quote-heavy
+  snippets; multiple forms behave like the positional argument's
+  `(progn ...)`.
+
+- **The Lisp debugger is now first-class state**: `state` (full *and*
+  delta), the idle probe, and `info` report `recursion-depth` and
+  `in-debugger` — a session parked in the debugger answers the semantic
+  channel and previously looked healthy and idle while every key and
+  eval landed inside the recursive edit. `wait idle` now fails
+  immediately there (instead of succeeding or burning its timeout),
+  naming the recovery.
+
+- **New `debug` command** (CLI + MCP `elate_debug`): `debug show`
+  returns the `*Backtrace*` text and depth; `debug abort` throws back
+  to top level — scheduled from the agent so the reply survives — and
+  confirms the depth actually reached. The debugger's saved window
+  configuration is restored on exit; the session and its state survive.
+
+- **`interrupt` no longer kills GUI sessions**: SIGINT terminates a
+  GUI-only Emacs (no tty frame = quit request, not C-g), which made the
+  documented default fatal. The GUI default is now `--signal auto`:
+  SIGUSR2 breaks the running code into the debugger (works even in a
+  tight elisp loop), then unwinds to top level once the channel
+  answers, reporting `recovered`/`depth_after`. `--signal usr2` parks
+  in the debugger for `debug show`; `--signal int` remains as an
+  explicitly-documented shutdown.
+
+- **`start --require FEATURE`** (repeatable; scenario session key
+  `require`, MCP `requires`): `(require 'FEATURE)` after `--load` wires
+  load-path — folds away the ubiquitous follow-up eval.
+
+- Papercuts: `--json`/`--human` alongside `--field`/`--raw` warns and
+  proceeds instead of erroring; `start` no longer reports `orphans`
+  (startup-transient GTK/dbus helpers made it noise — `info`/`list`
+  still track real leaks); the `state` JSON shape — notably that
+  `windows` is a nested split tree, not a flat list — is documented in
+  `state --help` and the skill reference.
+
 ## 0.14.0
 
 The update story: installed skill copies and the CLI can no longer drift

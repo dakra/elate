@@ -2311,3 +2311,30 @@ def test_failed_run_session_named_after_scenario(
         assert running_run_sessions() == []
     finally:
         shutil.rmtree(home, ignore_errors=True)
+
+
+# -- session "require" key: validation + export round-trip -------------------
+
+def test_session_require_key_validation() -> None:
+    ok = {"session": {"require": ["mypkg"]}, "steps": [{"eval": "t"}]}
+    SC.validate_script(ok)
+    with pytest.raises(ElateError, match='"require" must be a list of strings'):
+        SC.validate_script({"session": {"require": "mypkg"},
+                            "steps": [{"eval": "t"}]})
+
+
+def test_export_script_emits_require(tmp_path: Path) -> None:
+    sd = tmp_path / "sess"
+    (sd / "log").mkdir(parents=True)
+    (sd / "log" / "transcript.jsonl").write_text(
+        json.dumps({"ts": "2026-01-01T00:00:00+00:00", "event": "eval",
+                    "form": "(+ 1 2)", "timeout": 15.0, "buffer": None})
+        + "\n", encoding="utf-8")
+    sess = S.Session(name="exp", session_dir=str(sd), emacs="emacs",
+                     emacsclient="emacsclient", config="minimal",
+                     cols=100, rows=30, created_at=0.0,
+                     requires=["mypkg"])
+    script = SC.export_script(sess)
+    assert script["session"]["require"] == ["mypkg"]
+    # The exported script validates, i.e. the key round-trips.
+    SC.validate_script(script)

@@ -198,13 +198,17 @@ def elate_start(
         "config='clean-install' these are the install targets instead "
         "(.el file, package tar, or package directory) and at least one "
         "is required."))] = None,
+    requires: Annotated[list[str] | None, Field(description=(
+        "Features to (require 'FEATURE) at startup, after load_paths has "
+        "wired load-path -- the shorthand for the usual follow-up "
+        "\"(require 'x)\" eval_form."))] = None,
     eval_forms: Annotated[list[str] | None, Field(description=(
         "Elisp forms evaluated at startup, inside the generated init -- so "
         "they run BEFORE emacs-startup-hook fires (set vars a package's "
         "auto-launch hook reads here). Order: init_file -> load_paths -> "
-        "eval_files -> profiles -> eval_forms (so eval_forms can override a "
-        "profile). Errors are caught as init_error instead of killing the "
-        "session."))] = None,
+        "requires -> eval_files -> profiles -> eval_forms (so eval_forms "
+        "can override a profile). Errors are caught as init_error instead "
+        "of killing the session."))] = None,
     eval_files: Annotated[list[str] | None, Field(description=(
         "Elisp files loaded at startup (before emacs-startup-hook), like a "
         "reusable eval_forms with no load-path side effects -- put a shared "
@@ -266,6 +270,7 @@ def elate_start(
             config=config,
             init_file=init_file,
             loads=load_paths or [],
+            requires=requires or [],
             evals=eval_forms or [],
             eval_files=eval_files or [],
             profiles=profiles or [],
@@ -281,6 +286,10 @@ def elate_start(
         )
         sess.log("mcp-start", name=name, via="mcp")
         info = S.session_info(sess.name)
+        # Transient GTK/dbus helpers spawned during GUI startup read as
+        # "orphans" seconds after launch; elate_info/elate_list still
+        # track real leaks later. Mirrors cmd_start.
+        info.pop("orphans", None)
         if sess.ui == "gui":
             wm_warning = S.gui_wm_warning(sess)
             if wm_warning:
@@ -317,12 +326,16 @@ def elate_stop(
 @_threaded
 def elate_interrupt(
     session: Annotated[str, Field(description="Session name to interrupt.")],
-    signal: Annotated[Literal["int", "usr2"], Field(description=(
-        "GUI only: 'int' (default) sends a C-g-like quit that unwinds a "
-        "stuck synchronous call back to top level; 'usr2' drops Emacs into "
-        "the Lisp debugger so a follow-up elate_state shows where it was "
-        "stuck. Ignored for TTY sessions, which always get raw C-g."))]
-        = "int",
+    signal: Annotated[Literal["auto", "usr2", "int"], Field(description=(
+        "GUI only: 'auto' (default) breaks the running code into the Lisp "
+        "debugger with SIGUSR2, then unwinds it back to top level once the "
+        "semantic channel answers -- the C-g-like recovery (result carries "
+        "recovered/depth_after). 'usr2' only enters the debugger, so "
+        "elate_debug can show where it was stuck. 'int' sends SIGINT, "
+        "which TERMINATES a GUI-only Emacs (no tty frame = quit request, "
+        "not C-g) -- a deliberate shutdown, never a recovery. Ignored for "
+        "TTY sessions, which always get raw C-g."))]
+        = "auto",
 ) -> str:
     """Unblock a wedged-but-alive session without killing it.
 
@@ -337,6 +350,42 @@ def elate_interrupt(
         return _ok(S.interrupt_session(session, sig=signal, via="mcp"))
     except Exception as exc:
         return _fail(exc)
+
+
+@server.tool(annotations=ToolAnnotations(readOnlyHint=False,
+                                         destructiveHint=False,
+                                         idempotentHint=True,
+                                         openWorldHint=False))
+@_threaded
+def elate_debug(
+    session: Annotated[str, Field(description="Session name.")],
+    action: Annotated[Literal["show", "abort"], Field(description=(
+        "'show' (default): return the *Backtrace* text plus "
+        "recursion-depth / in-debugger, touching nothing. 'abort': throw "
+        "back to top level, ending the debugger and restoring the window "
+        "layout it saved on entry; the session and its state survive."))]
+        = "show",
+    timeout: Annotated[float, Field(gt=0, le=120, description=(
+        "Seconds before the call is declared blocked (0 < timeout <= "
+        "120)."))] = 15.0,
+) -> str:
+    """Inspect or unwind the Lisp debugger / a recursive edit.
+
+    When code under test signals an error and *Backtrace* pops up, the
+    session sits in a recursive edit: it answers the semantic channel and
+    looks idle, but every key and eval lands inside the debugger
+    (elate_wait condition='idle' refuses to succeed there and points
+    here; elate_state reports recursion-depth / in-debugger). 'abort'
+    reports depth-after: 0 confirms Emacs is back at top level. This
+    complements elate_interrupt, which is for a busy Emacs that is NOT
+    answering the semantic channel.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        return _ok(S.debug_session(sess, action, timeout=timeout, via="mcp"))
+    except Exception as exc:
+        return _fail(exc, sess)
 
 
 @server.tool(annotations=ToolAnnotations(readOnlyHint=False,
@@ -795,8 +844,13 @@ def elate_send_events(
 @_threaded
 def elate_eval(
     session: Annotated[str, Field(description="Session name.")],
-    form: Annotated[str, Field(description=(
-        "Elisp source: one or more forms, evaluated as (progn ...)."))],
+    form: Annotated[str | None, Field(description=(
+        "Elisp source: one or more forms, evaluated as (progn ...). "
+        "Exactly one of form / file must be given."))] = None,
+    file: Annotated[str | None, Field(description=(
+        "Path to a file of elisp source to evaluate instead of 'form' -- "
+        "verbatim, no escaping concerns. One or more forms, evaluated as "
+        "(progn ...) exactly like 'form'."))] = None,
     buffer: Annotated[str | None, Field(description=(
         "Buffer (by name) to evaluate in. Default: the selected window's "
         "buffer, so current-buffer / point / line functions see what is on "
@@ -836,6 +890,19 @@ def elate_eval(
     """
     sess = None
     try:
+        if (form is None) == (file is None):
+            raise ElateError("pass exactly one of 'form' or 'file'")
+        if file is not None:
+            from .cli import _EVAL_SOURCE_CAP
+            try:
+                form = Path(file).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise ElateError(f"cannot read file {file}: {exc}") from exc
+            if len(form.encode("utf-8")) > _EVAL_SOURCE_CAP:
+                raise ElateError(
+                    f"file {file}: source exceeds the eval channel's "
+                    f"{_EVAL_SOURCE_CAP // 1024} KiB cap (it travels over "
+                    "argv); eval a (load \"...\") form instead")
         sess = _load(session)
         sess.log("eval", form=form, timeout=timeout, buffer=buffer, via="mcp")
         data = sess.semantic().eval_form(form, timeout=timeout,
@@ -1130,11 +1197,13 @@ def elate_trace(
 ) -> str:
     """Trace elisp functions: log each call's args and return value.
 
-    'on' wraps trace-function around the named functions; drive the
-    session, then 'read' returns the *trace-output* log (and clears it
-    unless keep=true, so each read sees only new calls). 'off' untraces
-    the named functions or all of them. Surfaces internals you cannot see
-    on screen -- why an advice fires twice, what args a hook receives.
+    'on' wraps trace-function-background around the named functions;
+    drive the session, then 'read' returns the *trace-output* log (and
+    clears it unless keep=true, so each read sees only new calls). The
+    log buffer is never displayed, so tracing does not disturb the
+    window layout under test. 'off' untraces the named functions or all
+    of them. Surfaces internals you cannot see on screen -- why an
+    advice fires twice, what args a hook receives.
     Tracing a macro or an undefined function is an error; already-traced
     functions are reported under 'already', not re-armed.
     """
@@ -1325,10 +1394,13 @@ def elate_state(
     'vertical' = stacked top-to-bottom, 'horizontal' = side by side);
     echo-area contents; the active minibuffer (prompt, current input,
     completion candidates when a completion session is active, depth);
-    input-pending/unread flags; last-command; "popups" (the kinds of
-    popup currently visible -- which-key/transient/child frames/...;
-    non-empty means elate_popups has something to show you); and the
-    last ~10 lines of *Messages* as messages-tail. Call this after every
+    input-pending/unread flags; last-command; recursion-depth and
+    in-debugger (true = the Lisp debugger is eating all input -- unwind
+    with elate_debug); "popups" (the kinds of popup currently visible --
+    which-key/transient/child frames/...; non-empty means elate_popups
+    has something to show you); and the last ~10 lines of *Messages* as
+    messages-tail. "windows" is a nested tree, not a flat list: recurse
+    until nodes have no 'children'. Call this after every
     action whose effect you need to see. Visible text is capped per
     window; use elate_buffer for full buffer contents.
     """
@@ -1584,7 +1656,9 @@ def elate_wait(
         "terminal, async LSP); this is usually what you want, not 'idle'. "
         "'idle': Emacs command loop has been idle >= min_idle s with no "
         "pending input -- use after keys/eval to let UI effects settle (it "
-        "says nothing about whether buffer OUTPUT finished). 'text': a "
+        "says nothing about whether buffer OUTPUT finished; fails "
+        "immediately, not by timeout, when Emacs is parked in the Lisp "
+        "debugger -- recover with elate_debug action='abort'). 'text': a "
         "pattern appeared in a buffer -- use to await known output. "
         "'prompt': a minibuffer prompt became active -- use after keys "
         "that should ask a question. 'until': the elisp predicate in "

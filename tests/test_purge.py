@@ -73,6 +73,16 @@ def test_cli_field_prints_one_bare_value(
     assert cap.out == "" and "ghost" in cap.err
 
 
+def test_field_with_json_flag_warns_but_proceeds(
+        elate_home: Path, capsys: pytest.CaptureFixture[str]):
+    # Redundant --json/--human next to --field/--raw is a warning, not a
+    # failure: the field still owns stdout, so pipelines keep working.
+    assert cli.main(["--json", "--field", "sessions", "list"]) == 0
+    cap = capsys.readouterr()
+    assert cap.out == "[]\n"
+    assert "ignoring --json/--human" in cap.err
+
+
 def test_field_text_rendering():
     from elate.cli import _field_text
     r = {"s": "emacs", "t": True, "f": False, "n": None, "i": 3, "x": 1.5,

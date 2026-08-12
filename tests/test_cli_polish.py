@@ -449,3 +449,71 @@ def test_reap_group_kills_filtered_members(
 def test_reap_group_and_count_group_tolerate_no_pgid() -> None:
     assert gui.reap_group(None, 0.0) == []
     assert gui.count_group(None, 0.0) == 0
+
+
+# -- eval --file / stdin ------------------------------------------------------
+
+def _eval_args(**kw) -> object:
+    import argparse
+    base = {"form": None, "source_file": None}
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_eval_source_positional_form() -> None:
+    assert cli._eval_source(_eval_args(form="(+ 1 2)")) == "(+ 1 2)"
+
+
+def test_eval_source_from_file(tmp_path: Path) -> None:
+    # The whole point of --file: quote-heavy source travels verbatim,
+    # with no shell-quoting surgery.
+    src = "(list #'car 'private \"it's\")\n(+ 1 2)\n"
+    p = tmp_path / "forms.el"
+    p.write_text(src, encoding="utf-8")
+    assert cli._eval_source(_eval_args(source_file=str(p))) == src
+
+
+def test_eval_source_from_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+    monkeypatch.setattr(sys, "stdin", io.StringIO("#'identity"))
+    assert cli._eval_source(_eval_args(source_file="-")) == "#'identity"
+
+
+def test_eval_source_form_and_file_conflict(tmp_path: Path) -> None:
+    from elate.errors import UsageError
+    with pytest.raises(UsageError, match="not both"):
+        cli._eval_source(_eval_args(form="(+ 1 2)", source_file="x.el"))
+
+
+def test_eval_source_neither_errors() -> None:
+    from elate.errors import UsageError
+    with pytest.raises(UsageError, match="FORM argument or --file"):
+        cli._eval_source(_eval_args())
+
+
+def test_eval_source_missing_file_errors() -> None:
+    from elate.errors import ElateError
+    with pytest.raises(ElateError, match="cannot read --file"):
+        cli._eval_source(_eval_args(source_file="/nonexistent/forms.el"))
+
+
+def test_eval_source_cap(tmp_path: Path,
+                         monkeypatch: pytest.MonkeyPatch) -> None:
+    p = tmp_path / "big.el"
+    p.write_text("x" * 100, encoding="utf-8")
+    monkeypatch.setattr(cli, "_EVAL_SOURCE_CAP", 10)
+    from elate.errors import ElateError
+    with pytest.raises(ElateError, match="KiB cap"):
+        cli._eval_source(_eval_args(source_file=str(p)))
+
+
+# -- interrupt: GUI default must be the non-fatal recovery -------------------
+
+def test_interrupt_default_signal_is_auto_usr2() -> None:
+    # SIGINT terminates a GUI-only Emacs (no tty frame = quit request),
+    # so the default interrupt must never be SIGINT.
+    args = cli.build_parser().parse_args(["-s", "x", "interrupt"])
+    assert args.signal == "auto"
+    assert S._INTERRUPT_SIGNALS["auto"] is signal.SIGUSR2
+    assert S._INTERRUPT_SIGNALS["usr2"] is signal.SIGUSR2
+    assert S._INTERRUPT_SIGNALS["int"] is signal.SIGINT

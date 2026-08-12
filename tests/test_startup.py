@@ -95,3 +95,23 @@ def test_home_seed_must_be_a_directory(tmp_path):
     with pytest.raises(ElateError,
                        match="--home-seed must be an existing directory"):
         sandbox.build_sandbox(sd, home_seed=str(f))
+
+
+def test_require_forms_after_load_before_evals(tmp_path):
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    sd = tmp_path / "sess"
+    sandbox.build_sandbox(sd, loads=[str(pkg)], requires=["mypkg"],
+                          evals=["(setq inline-marker t)"])
+    init = _init_el(sd)
+    i_load = init.index("add-to-list 'load-path")
+    i_req = init.index("(require 'mypkg)")
+    i_inline = init.index("(setq inline-marker t)")
+    assert i_load < i_req < i_inline
+    assert "(elate-guard" in init
+
+
+def test_require_rejects_non_symbol_feature(tmp_path):
+    with pytest.raises(ElateError, match="feature name"):
+        sandbox.build_sandbox(tmp_path / "sess",
+                              requires=["(malicious-form)"])

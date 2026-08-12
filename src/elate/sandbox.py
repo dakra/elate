@@ -111,6 +111,21 @@ def _load_forms(loads: Sequence[str]) -> list[str]:
     return forms
 
 
+_FEATURE_RE = re.compile(r"^[A-Za-z0-9+_./-]+$")
+
+
+def _require_forms(requires: Sequence[str]) -> list[str]:
+    """Elisp `(require 'FEATURE)` forms for the --require arguments."""
+    forms: list[str] = []
+    for feature in requires:
+        if not _FEATURE_RE.match(feature):
+            raise ElateError(
+                f"--require expects a feature name (a lisp symbol), "
+                f"got {feature!r}")
+        forms.append(f"(require '{feature})")
+    return forms
+
+
 def _validated_eval_file(entry: str) -> Path:
     """Resolved path of an --eval-file argument; error if it is not a file."""
     path = Path(entry).expanduser()
@@ -190,6 +205,7 @@ def build_sandbox(
     config: str = "minimal",
     init_file: str | None = None,
     loads: Sequence[str] = (),
+    requires: Sequence[str] = (),
     evals: Sequence[str] = (),
     eval_files: Sequence[str] = (),
     profiles: Sequence[str] = (),
@@ -268,6 +284,8 @@ def build_sandbox(
                 args += ["--eval", form]
         for form in _load_forms(loads):
             args += ["--eval", f"(elate-guard {form})"]
+        for form in _require_forms(requires):
+            args += ["--eval", f"(elate-guard {form})"]
         for form in _eval_file_forms(startup_files):
             args += ["--eval", f"(elate-guard {form})"]
         for form in evals:
@@ -298,6 +316,7 @@ def build_sandbox(
         user_lines += _install_forms(loads)
     else:
         user_lines += _load_forms(loads)
+    user_lines += _require_forms(requires)
     user_lines += _eval_file_forms(startup_files)
     user_lines += list(evals)
     if user_lines:

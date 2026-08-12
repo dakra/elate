@@ -169,6 +169,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="elisp file or directory to put on load-path "
                          "(repeatable); with --config clean-install: the "
                          "package to install (.el file, tar, or directory)")
+    sp.add_argument("--require", action="append", default=[],
+                    metavar="FEATURE",
+                    help="feature to (require 'FEATURE) at startup, after "
+                         "--load has wired load-path (repeatable); the "
+                         "shorthand for the usual follow-up "
+                         "--eval \"(require 'FEATURE)\"")
     sp.add_argument("--eval", action="append", default=[], metavar="FORM",
                     help="elisp form to evaluate at startup, before "
                          "emacs-startup-hook (repeatable)")
@@ -223,14 +229,45 @@ def build_parser() -> argparse.ArgumentParser:
         description="Poke a busy-but-alive session without killing it. TTY: "
                     "send raw C-g over tmux (works even when the semantic "
                     "channel is blocked). GUI (no raw channel): signal Emacs "
-                    "-- --signal int (default) is a C-g-like quit that unwinds "
-                    "a stuck synchronous call; --signal usr2 drops into the "
-                    "Lisp debugger so a follow-up observation shows where it "
-                    "was stuck.")
+                    "-- --signal auto (default) breaks the running code into "
+                    "the Lisp debugger with SIGUSR2, then unwinds it back to "
+                    "top level once the semantic channel answers (the "
+                    "C-g-like recovery; result carries recovered/depth_after)"
+                    ". --signal usr2 only enters the debugger, so `debug "
+                    "show` can reveal where it was stuck. --signal int sends "
+                    "SIGINT, which TERMINATES a GUI-only Emacs (no tty frame "
+                    "= quit request, not C-g) -- a deliberate shutdown, "
+                    "never a recovery.")
     sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
-    sp.add_argument("--signal", choices=["int", "usr2"], default="int",
-                    help="GUI only: int (C-g-like quit, default) or usr2 "
-                         "(enter the Lisp debugger); ignored for TTY")
+    sp.add_argument("--signal", choices=["auto", "usr2", "int"],
+                    default="auto",
+                    help="GUI only: auto (SIGUSR2 + unwind to top level, "
+                         "default), usr2 (enter the Lisp debugger and stay), "
+                         "or int (SIGINT: terminates a GUI-only Emacs); "
+                         "ignored for TTY")
+
+    sp = sub.add_parser(
+        "debug",
+        help="inspect or unwind the Lisp debugger / a recursive edit",
+        description="When code under test signals an error and *Backtrace* "
+                    "pops up, the session sits in a recursive edit: it looks "
+                    "idle, but every key and eval lands inside the debugger "
+                    "(`wait idle` refuses to succeed there and points here; "
+                    "`state` reports recursion-depth / in-debugger). 'show' "
+                    "returns the backtrace text and depth without touching "
+                    "anything; 'abort' throws back to top level -- ending "
+                    "the debugger and restoring the window layout it saved "
+                    "on entry -- with the session and its state intact. "
+                    "This complements `interrupt`, which is for a busy Emacs "
+                    "that is NOT answering the semantic channel.")
+    sp.add_argument("action", nargs="?", choices=["show", "abort"],
+                    default="show",
+                    help="show (default): backtrace + depth; abort: throw "
+                         "to top level (a no-op at recursion depth 0)")
+    sp.add_argument("name", nargs="?",
+                    help="session name (or use -s NAME; requires an "
+                         "explicit action first)")
+    sp.add_argument("--timeout", type=float, default=15.0, metavar="SECS")
 
     sp = sub.add_parser("list", help="list known sessions")
     sp.add_argument("name", nargs="?",
@@ -480,7 +517,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "attaching (scripting/tests)")
 
     sp = sub.add_parser("eval", help="evaluate an elisp form")
-    sp.add_argument("form")
+    sp.add_argument("form", nargs="?", default=None,
+                    help="elisp source: one or more forms, evaluated as "
+                         "(progn ...); omit when using --file")
+    sp.add_argument("--file", metavar="PATH", dest="source_file",
+                    help="read the elisp source from PATH instead of the "
+                         "FORM argument ('-' reads stdin). Sidesteps shell "
+                         "quoting entirely, so forms containing ' or #' run "
+                         "verbatim -- use this to test snippets exactly as "
+                         "written. One or more forms, evaluated as "
+                         "(progn ...) like the positional FORM")
     sp.add_argument("--buffer", metavar="NAME",
                     help="evaluate in this buffer (default: the selected "
                          "window's buffer, so current-buffer/point/line see "
@@ -517,9 +563,12 @@ def build_parser() -> argparse.ArgumentParser:
         "trace",
         help="trace elisp functions (log calls/args/returns), then read "
              "the accumulated log",
-        description="Wrap trace-function around one or more functions so "
-                    "each call records its args and return value. 'on "
-                    "FUNC...' starts tracing; drive the session "
+        description="Wrap trace-function-background around one or more "
+                    "functions so each call records its args and return "
+                    "value. Tracing is invisible: the *trace-output* buffer "
+                    "is never displayed, so the window layout under test "
+                    "stays untouched. 'on FUNC...' starts tracing; drive the "
+                    "session "
                     "(keys/eval/...); 'read' returns and clears the log so "
                     "each read sees only new calls; 'off [FUNC...]' "
                     "untraces the named functions (or all). Drives Emacs "
@@ -666,8 +715,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("echo", help="current echo area / minibuffer line")
 
-    sp = sub.add_parser("state", help="one-call scene snapshot (layout, "
-                                      "prompt, point, modes, messages tail)")
+    sp = sub.add_parser(
+        "state",
+        help="one-call scene snapshot (layout, prompt, point, modes, "
+             "messages tail)",
+        description="Full-snapshot shape: current-buffer facts (buffer, "
+                    "file, point, line, column, major-mode, minor-modes, "
+                    "region, narrowed, modified), echo, minibuffer (prompt/"
+                    "input/completions or null), input-pending, "
+                    "last-command, idle (secs or null), recursion-depth + "
+                    "in-debugger (non-zero/true = a recursive edit or the "
+                    "Lisp debugger is eating input -- see `debug`), popups, "
+                    "messages-tail, and 'windows': the window-tree as "
+                    "nested objects, NOT a flat list -- an inner node is "
+                    "{split: 'vertical'|'horizontal', children: [...]}, a "
+                    "leaf is one window {buffer, selected, width, height, "
+                    "line, column, start-line, end-line, mode-line, text, "
+                    "...}; recurse until nodes have no 'children'.")
     sp.add_argument("--since", metavar="TOKEN",
                     help="return only what changed since the TOKEN from a "
                          "prior state call (new/killed/modified buffers, "
@@ -705,7 +769,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-n", "--lines", type=int, default=40, metavar="N",
                     help="number of trailing lines to show (default 40)")
 
-    sp = sub.add_parser("wait", help="wait for a condition (exit 3 on timeout)")
+    sp = sub.add_parser(
+        "wait", help="wait for a condition (exit 3 on timeout)",
+        description="Block until a condition holds. `wait idle` fails "
+                    "immediately (rather than timing out) when Emacs is "
+                    "parked in the Lisp debugger's recursive edit -- that "
+                    "session will never be idle; recover with `debug abort`.")
     sp.add_argument("condition",
                     choices=["idle", "text", "prompt", "stable", "until",
                              "dead"])
@@ -998,6 +1067,7 @@ def cmd_start(args: argparse.Namespace) -> Result:
         config=args.config,
         init_file=args.init_file,
         loads=args.load,
+        requires=args.require,
         evals=args.eval,
         eval_files=args.eval_file,
         profiles=args.profile,
@@ -1012,6 +1082,10 @@ def cmd_start(args: argparse.Namespace) -> Result:
         ttl=args.ttl,
     )
     info = S.session_info(sess.name)
+    # Transient GTK/dbus helpers spawned during GUI startup read as
+    # "orphans" seconds after launch; the count means something for a
+    # long-lived session (`info`/`list`), not here.
+    info.pop("orphans", None)
     human = (
         f"started session {sess.name!r}: Emacs {sess.emacs_version} "
         f"(pid {sess.emacs_pid}), {cols}x{rows} {sess.ui}"
@@ -1073,7 +1147,44 @@ def cmd_stop(args: argparse.Namespace) -> Result:
 def cmd_interrupt(args: argparse.Namespace) -> Result:
     name = _name_arg(args)
     result = S.interrupt_session(name, sig=args.signal)
-    return result, f"interrupted {name!r} via {result['delivered']}", 0
+    human = f"interrupted {name!r} via {result['delivered']}"
+    if result.get("recovered"):
+        after = result.get("depth_after")
+        human += (" and unwound to top level" if after == 0
+                  else f" and left the debugger (recursion depth {after} -- "
+                       "likely an open minibuffer)")
+    elif result.get("recovered") is False:
+        human += (" -- semantic channel still not answering; if it stays "
+                  f"wedged, `elate -s {name} stop`")
+    return result, human, 0
+
+
+def cmd_debug(args: argparse.Namespace) -> Result:
+    sess = _require_session(args)
+    data = S.debug_session(sess, args.action, timeout=args.timeout)
+    depth = data.get("recursion-depth")
+    if args.action == "abort":
+        after = data.get("depth-after")
+        if not data.get("scheduled"):
+            human = "already at top level (recursion depth 0); nothing to abort"
+        elif after == 0:
+            human = f"aborted to top level (was at recursive edit depth {depth})"
+        elif after is None:
+            human = (f"abort scheduled at depth {depth}, but Emacs stopped "
+                     "answering before it could be confirmed -- check "
+                     "`state`")
+        else:
+            human = (f"abort scheduled; recursion depth {depth} -> {after} "
+                     "(not yet at top level -- re-run to unwind further)")
+        return data, human, 0
+    if data.get("in-debugger"):
+        human = (f"in the Lisp debugger (recursive edit depth {depth}):\n"
+                 f"{data.get('backtrace') or '(empty *Backtrace*)'}")
+    elif depth:
+        human = f"in a recursive edit (depth {depth}), no debugger buffer"
+    else:
+        human = "not in the debugger (recursion depth 0)"
+    return data, human, 0
 
 
 def cmd_purge(args: argparse.Namespace) -> Result:
@@ -1301,11 +1412,40 @@ def cmd_resize(args: argparse.Namespace) -> Result:
     return data, human, 0
 
 
+_EVAL_SOURCE_CAP = 512 * 1024  # bytes of elisp source; travels base64 in argv
+
+
+def _eval_source(args: argparse.Namespace) -> str:
+    """Resolve eval's elisp source: the FORM argument, --file PATH, or stdin."""
+    if args.source_file is None:
+        if args.form is None:
+            raise UsageError("eval needs a FORM argument or --file PATH")
+        return args.form
+    if args.form is not None:
+        raise UsageError("eval takes a FORM argument or --file, not both")
+    if args.source_file == "-":
+        source = sys.stdin.read()
+    else:
+        try:
+            source = Path(args.source_file).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ElateError(
+                f"cannot read --file {args.source_file}: {exc}") from exc
+    if len(source.encode("utf-8")) > _EVAL_SOURCE_CAP:
+        raise ElateError(
+            f"--file {args.source_file}: source exceeds the eval channel's "
+            f"{_EVAL_SOURCE_CAP // 1024} KiB cap (it travels over argv); "
+            "eval a (load \"/path/to/file.el\") form instead")
+    return source
+
+
 def cmd_eval(args: argparse.Namespace) -> Result:
     sess = _require_session(args)
-    sess.log("eval", form=args.form, timeout=args.timeout, buffer=args.buffer)
+    form = _eval_source(args)
+    args.form = form  # downstream messages/logging see the real source
+    sess.log("eval", form=form, timeout=args.timeout, buffer=args.buffer)
     try:
-        data = sess.semantic().eval_form(args.form, timeout=args.timeout,
+        data = sess.semantic().eval_form(form, timeout=args.timeout,
                                           backtrace=args.backtrace,
                                           buffer=args.buffer,
                                           json_result=args.json_result)
@@ -1323,10 +1463,11 @@ def cmd_eval(args: argparse.Namespace) -> Result:
                     "bigger --timeout for a legitimately slow form")
         elif busy:
             hint = (" -- Emacs is still busy; unwedge it with "
-                    f"`elate -s {sess.name} interrupt` (signals the GUI "
-                    "Emacs; --signal usr2 for a debugger backtrace), or pass "
-                    "a bigger --timeout for a legitimately slow form; stop "
-                    "the session if it stays wedged")
+                    f"`elate -s {sess.name} interrupt` (breaks the GUI Emacs "
+                    "into the debugger and unwinds it; --signal usr2 to stay "
+                    "in the debugger and read the backtrace with `debug "
+                    "show`), or pass a bigger --timeout for a legitimately "
+                    "slow form; stop the session if it stays wedged")
         else:
             hint = ""
         raise EvalTimeout(f"{exc}{hint}", sample=sample) from exc
@@ -2662,6 +2803,7 @@ _COMMANDS = {
     "start": cmd_start,
     "stop": cmd_stop,
     "interrupt": cmd_interrupt,
+    "debug": cmd_debug,
     "list": cmd_list,
     "purge": cmd_purge,
     "prune": cmd_purge,  # alias
@@ -2738,9 +2880,10 @@ def main(argv: list[str] | None = None) -> int:
     # explicit --json/--human alongside is a contradiction, not a merge.
     field = args.field or ("value" if getattr(args, "raw_value", False) else None)
     if field is not None and (args.json or args.human):
+        # A redundant flag is not worth failing a scripted pipeline over:
+        # warn and let --field/--raw own the output as documented.
         print("elate: --field/--raw already choose the output; "
-              "drop --json/--human", file=sys.stderr)
-        return 2
+              "ignoring --json/--human", file=sys.stderr)
     args.json = args.json or (not args.human and not sys.stdout.isatty())
     if field is not None:
         # Failures must keep stdout empty -- an error blob inside $(...)

@@ -286,7 +286,9 @@ uvx elate -s fuzz info                      # status: dead (SIGSEGV) + crash_rep
 uvx elate -s fuzz eval '(my-module-maybe-loops)' --timeout 5 --on-timeout sample
 #   timeout error with "sample": {tool, backtrace} — the wedged threads
 # then unblock without losing the session:
-uvx elate -s fuzz interrupt        # raw C-g (TTY) / SIGINT (GUI)
+uvx elate -s fuzz interrupt        # raw C-g (TTY) / break into the debugger
+                                   # and unwind (GUI; --signal usr2 to stay
+                                   # in the debugger for `debug show`)
 
 uvx elate stop fuzz
 ```
