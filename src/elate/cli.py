@@ -811,11 +811,15 @@ def build_parser() -> argparse.ArgumentParser:
                     "CI-friendly path); needs python-xlib: pip install "
                     "'elate[dnd]'. A drop the target refuses returns "
                     "status 'rejected' with exit 0 -- assert via --field "
-                    "status. Every result carries 'in-debugger'; a missing "
-                    "XdndFinished with in-debugger true is returned as a "
-                    "normal result (the drop handler errored -- inspect "
-                    "with `debug show`). After a drop, `wait stable "
-                    "--buffer B` is the settle primitive.")
+                    "status. A drop handler that errors is reported, not "
+                    "hidden: Emacs catches handler errors and answers "
+                    "XdndFinished with its success bit clear -- "
+                    "'finished-success': false (error text in `messages`); "
+                    "results also carry 'in-debugger' for handlers that "
+                    "park Emacs in the Lisp debugger (then a missing "
+                    "XdndFinished is returned as a normal result -- "
+                    "inspect with `debug show`). After a drop, `wait "
+                    "stable --buffer B` is the settle primitive.")
     sp.add_argument("action", choices=["drop"])
     sp.add_argument("--uris", required=True, metavar="URI[,URI...]",
                     help="comma-separated URIs to drop (text/uri-list, so "
@@ -1972,6 +1976,9 @@ def cmd_dnd(args: argparse.Namespace) -> Result:
     bits = [data.get("status") or "?"]
     if data.get("dropped"):
         bits.append("finished" if data.get("finished") else "NOT finished")
+    if data.get("finished") and data.get("finished-success") is False:
+        bits.append("handler FAILED: Emacs caught an error in the drop "
+                    "handler -- see `messages`")
     if data.get("in-debugger"):
         bits.append("in-debugger: the drop handler errored -- inspect with "
                     f"`elate -s {sess.name} debug show`, unwind with "

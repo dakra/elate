@@ -1543,12 +1543,15 @@ def elate_dnd(
     X11 GUI sessions only -- start with ui='gui', headless=true on Linux
     (the CI-friendly Xvfb path); needs python-xlib (pip install
     'elate[dnd]'). A drop the target refuses is a normal result with
-    status='rejected', not an error. Every result carries 'in-debugger':
-    a missing XdndFinished together with in-debugger=true means the
-    package's drop handler errored -- that IS the finding; inspect with
-    elate_debug show, unwind with elate_debug abort. After a drop,
-    elate_wait condition='stable' on the target buffer is the settle
-    primitive.
+    status='rejected', not an error. A drop handler that errors is
+    reported, not hidden: Emacs catches handler errors and answers
+    XdndFinished with its success bit clear -- 'finished-success': false
+    (error text in elate_messages); results also carry 'in-debugger' for
+    handlers that park Emacs in the Lisp debugger (then a missing
+    XdndFinished is returned as a normal result -- that IS the finding;
+    inspect with elate_debug show, unwind with elate_debug abort). After
+    a drop, elate_wait condition='stable' on the target buffer is the
+    settle primitive.
     """
     sess = None
     try:

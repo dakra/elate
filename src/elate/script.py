@@ -1387,6 +1387,11 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
                 "the drop handler errored into the Lisp debugger "
                 "(inspect with `debug show`, unwind with `debug abort`)",
                 {"dnd": data})
+        if data.get("finished") and data.get("finished-success") is False:
+            raise _StepFailure(
+                "the drop handler errored (Emacs caught it and answered "
+                "XdndFinished unsuccessfully; error text in *Messages*)",
+                {"dnd": data})
         if (data.get("status") == "rejected" and not step.get("hover")
                 and not step.get("allow_rejected")):
             raise _StepFailure(

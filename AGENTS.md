@@ -65,8 +65,10 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   file:///a,file:///b --buffer B` runs a full XDND exchange from an
   external X client through C dispatch + x-dnd.el (X11 sessions only,
   needs the `elate[dnd]` extra; rejected drops return `status:
-  "rejected"` with exit 0; `in-debugger: true` + `finished: false` means
-  the drop handler errored — `debug show`).
+  "rejected"` with exit 0; a handler that errors yields
+  `finished-success: false` with the error in `messages` — Emacs
+  catches it inside x-dnd — while `in-debugger: true` flags handlers
+  that parked the Lisp debugger instead: `debug show`).
 - Eval forms run in the **selected window's buffer** (or `--buffer NAME`),
   so `current-buffer`/point probes see what is on screen. Output truncates
   at 64 KiB. `wait text` patterns are **Python** regexps, not elisp.

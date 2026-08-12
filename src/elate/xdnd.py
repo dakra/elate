@@ -69,6 +69,8 @@ class DropResult:
     status: str                 # "accepted" | "rejected"
     dropped: bool
     finished: bool
+    finished_success: bool | None   # XdndFinished bit 0 (v5): the target's
+                                    # handler succeeded; False = it errored
     finished_action: str | None
     served_selection: bool
 
@@ -275,7 +277,8 @@ class _XdndSource:
     def leave(self) -> None:
         self._client_message("XdndLeave", [self.src.id])
 
-    def drop(self, deadline: float) -> tuple[bool, str | None]:
+    def drop(self, deadline: float,
+             version: int) -> tuple[bool, bool | None, str | None]:
         # The one and only Drop path; no code path sends Drop after Leave.
         self._client_message("XdndDrop", [self.src.id, 0, self.time])
         try:
@@ -286,7 +289,11 @@ class _XdndSource:
                 "target never sent XdndFinished after the drop -- the "
                 "drop handler may have errored (check `debug show`)",
                 reason="finished-timeout") from None
-        return True, self._atom_name(fin.data[1][2])
+        # Bit 0 of l[1] is defined from XDND v5: did the target's handler
+        # succeed? Emacs catches drop-handler errors and reports them here
+        # (plus *Messages*) rather than letting them reach the debugger.
+        success = bool(fin.data[1][1] & 1) if version >= 5 else None
+        return True, success, self._atom_name(fin.data[1][2])
 
     def close(self) -> None:
         # Destroying the source window disowns XdndSelection server-side
@@ -340,7 +347,7 @@ def xdnd_drop(display: str, target_window: int, x: int, y: int,
         result = DropResult(target_window=target_window,
                             xdnd_version=version, x=x, y=y, status=status,
                             dropped=False, finished=False,
-                            finished_action=None,
+                            finished_success=None, finished_action=None,
                             served_selection=source.served_selection)
         if status == "rejected":
             source.leave()
@@ -350,9 +357,10 @@ def xdnd_drop(display: str, target_window: int, x: int, y: int,
             source.leave()
             result.served_selection = source.served_selection
             return result
-        finished, finished_action = source.drop(deadline)
+        finished, success, finished_action = source.drop(deadline, version)
         result.dropped = True
         result.finished = finished
+        result.finished_success = success
         result.finished_action = finished_action
         result.served_selection = source.served_selection
         return result

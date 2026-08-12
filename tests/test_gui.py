@@ -845,13 +845,17 @@ def test_dnd_drop_two_uris_dispatches_handlers(gui_sess: S.Session) -> None:
                           buffer="drop-target", line=3, col=2)
         assert data["status"] == "accepted"
         assert data["dropped"] is True and data["finished"] is True
+        assert data["finished-success"] is True
         assert data["served-selection"] is True
         assert data["in-debugger"] is False
         drops = _drops(sem)
         assert "file:///tmp/elate-a" in drops
         assert "file:///tmp/elate-b" in drops
         assert drops.index("elate-a") < drops.index("elate-b")  # in order
-        assert "copy" in drops
+        # x-dnd dispatches dnd.el handlers with action `private` regardless
+        # of the proposed XDND action (copy/move live at the protocol
+        # level only).
+        assert "private" in drops
         assert "drop-target" in drops  # dispatched in the target's buffer
     finally:
         sem.eval_form(RESTORE_RECORDER)
@@ -867,7 +871,9 @@ def test_dnd_move_action_reaches_handler(gui_sess: S.Session) -> None:
         data = S.dnd_drop(gui_sess, uris=["file:///tmp/elate-m"],
                           buffer="drop-target", line=2, action="move")
         assert data["status"] == "accepted" and data["finished"] is True
-        assert "move" in _drops(sem)
+        # The move action is protocol-level; the dnd.el handler still
+        # fires (with action `private`, see the two-uris test above).
+        assert "elate-m" in _drops(sem)
     finally:
         sem.eval_form(RESTORE_RECORDER)
         reset_scratch(gui_sess)
@@ -1008,12 +1014,21 @@ def test_dnd_handler_error_surfaces_in_debugger(gui_sess: S.Session) -> None:
     try:
         data = S.dnd_drop(gui_sess, uris=["file:///tmp/elate-e"],
                           buffer="drop-target", line=2, timeout=6.0)
-        # Whether Emacs sent XdndFinished before or after dispatching the
-        # handler is version-dependent; the invariant is that the result
-        # itself says the handler is parked in the debugger.
-        assert data["in-debugger"] is True
-        aborted = S.debug_session(gui_sess, "abort")
-        assert aborted["depth-after"] == 0
+        # Emacs catches drop-handler errors inside x-dnd (they never reach
+        # the debugger, even with debug-on-error) and reports the failure
+        # in XdndFinished's success bit; the error text goes to *Messages*.
+        # The in-debugger field stays load-bearing for handlers that park
+        # a recursive edit some other way; here it must simply be sane.
+        assert data["finished"] is True
+        assert data["finished-success"] is False
+        msgs = sem.eval_form(
+            '(with-current-buffer (messages-buffer)'
+            ' (buffer-substring-no-properties (point-min) (point-max)))'
+        )["value"]
+        assert "elate dnd handler boom" in msgs
+        if data["in-debugger"]:  # some port/version routed it here instead
+            aborted = S.debug_session(gui_sess, "abort")
+            assert aborted["depth-after"] == 0
     finally:
         sem.eval_form("(progn (setq debug-on-error nil)"
                       " (setq dnd-protocol-alist elate-test-saved-dnd-err))")

@@ -19,11 +19,14 @@ instead of via hand-rolled X clients.
   tested and previously each author re-implemented by hand (~180 lines
   of protocol code in the field). Targets mirror `mouse` (buffer/line/
   col, or root-absolute pixels); `--hover` asserts drag feedback without
-  dropping; a refused drop is data (`status: "rejected"`, exit 0), and
-  every result carries `in-debugger` — a missing `XdndFinished` with
-  `in-debugger: true` is returned as a normal result naming the real
-  finding: the package's drop handler errored. X11 GUI sessions only
-  (`--ui gui --headless` on Linux is the CI path).
+  dropping; a refused drop is data (`status: "rejected"`, exit 0). A
+  drop handler that errors is reported, not hidden: Emacs catches
+  handler errors and clears XdndFinished's success bit
+  (`finished-success: false`, error text in `messages`), and results
+  carry `in-debugger` for handlers that park the Lisp debugger instead
+  (a missing `XdndFinished` then comes back as a normal result naming
+  that finding). X11 GUI sessions only (`--ui gui --headless` on Linux
+  is the CI path).
 
 - **`pointer warp|query`** (CLI + MCP `elate_pointer`): move and read
   the REAL window-system pointer. `mouse` synthesizes events through the

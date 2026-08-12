@@ -419,11 +419,13 @@ target it). `dnd drop` runs a full XDND exchange from an external X
 client — the drop travels Emacs's C event dispatch and x-dnd.el exactly
 like a user drag; X11 sessions only (`--ui gui --headless` on Linux),
 needs `pip install 'elate[dnd]'`. A refused drop returns
-`status: "rejected"` with exit 0; every result carries `in-debugger` —
-true with `finished: false` means the package's drop handler errored
-(inspect with `debug show`). `--hover` asserts drag feedback without
-dropping. After a drop, `wait stable --buffer B` is the settle
-primitive.
+`status: "rejected"` with exit 0. A drop handler that errors is
+reported, not hidden: Emacs catches it and clears XdndFinished's
+success bit — `finished-success: false`, error text in `messages`;
+results also carry `in-debugger` for handlers that park the Lisp
+debugger instead (inspect with `debug show`). `--hover` asserts drag
+feedback without dropping. After a drop, `wait stable --buffer B` is
+the settle primitive.
 
 ## When the MCP server fits better
 
