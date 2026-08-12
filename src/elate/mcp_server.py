@@ -32,7 +32,6 @@ from .errors import (
     ElateError,
     EvalTimeout,
     RpcError,
-    ScreenshotError,
     SessionNotFound,
     TransportError,
     WaitTimeout,
@@ -125,8 +124,9 @@ def _fail(exc: Exception, sess: S.Session | None = None) -> str:
         payload["backtrace"] = exc.backtrace
     if isinstance(exc, EvalTimeout) and getattr(exc, "sample", None):
         payload["sample"] = exc.sample
-    if isinstance(exc, ScreenshotError):
-        payload["reason"] = exc.reason
+    reason = getattr(exc, "reason", None)
+    if reason is not None:  # ScreenshotError, XdndError: machine-readable
+        payload["reason"] = reason
     # State dumps are {"state": ..., "screen_tail": ...}; spread them so
     # "state" in the error payload is the actual snapshot (not state.state).
     if isinstance(exc, WaitTimeout):
@@ -1204,6 +1204,11 @@ def elate_trace(
     window layout under test. 'off' untraces the named functions or all
     of them. Surfaces internals you cannot see on screen -- why an
     advice fires twice, what args a hook receives.
+    'read' results carry, besides the raw 'output' text, structured
+    per-call records: 'records' is a list of {fn, depth, args:
+    [printed...], ret, error} in call-completion order (a nested call
+    precedes its caller; depth 1 = outermost) -- assert on records, not
+    on regexed text.
     Tracing a macro or an undefined function is an error; already-traced
     functions are reported under 'already', not re-armed.
     """
@@ -1410,6 +1415,147 @@ def elate_state(
         data = sess.semantic().rpc("state", since)
         sess.log("state", buffer=data.get("buffer"), via="mcp",
                  since=bool(since), mode=data.get("mode"))
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_READONLY)
+@_threaded
+def elate_window_info(
+    session: Annotated[str, Field(description="Session name.")],
+    timeout: Annotated[float, Field(gt=0, le=120, description=(
+        "Seconds before the call is declared blocked (0 < timeout <= "
+        "120)."))] = 15.0,
+) -> str:
+    """Window-system ids and pixel geometry per frame, as real JSON.
+
+    Per frame (selected first): name, selected, graphic, window-system
+    ('x'/'ns'/'pgtk'/... or null), units ('pixels' on GUI frames,
+    'chars' on TTY), outer-window-id and window-id as INTEGERS (null off
+    X11 -- unlike frame-parameter, which prints X11 ids as decimal
+    strings), outer-edges and native-edges as [left, top, right,
+    bottom], char-width/char-height (the cell size for line/col-to-pixel
+    math), and windows: [{buffer, selected, edges, body-edges}] with
+    root-absolute pixel edges on GUI frames. Complements elate_state,
+    which has buffer content and character-cell layout but no
+    window-system numbers. The numbers an external X11 client (drops,
+    warps, screenshots) needs.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        data = S.window_info(sess, timeout=timeout, via="mcp")
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_pointer(
+    session: Annotated[str, Field(description="Session name.")],
+    action: Annotated[Literal["warp", "query"], Field(description=(
+        "'warp': move the pointer to x/y (root-absolute pixels) or to a "
+        "buffer location, then report where it landed. 'query': report "
+        "the current position without moving anything."))],
+    x: Annotated[int | None, Field(description=(
+        "Warp: root-absolute pixel x (pairs with y; excludes buffer "
+        "targeting)."))] = None,
+    y: Annotated[int | None, Field(description=(
+        "Warp: root-absolute pixel y (pairs with x)."))] = None,
+    buffer: Annotated[str | None, Field(description=(
+        "Warp: buffer whose window to target (default: selected window; "
+        "searched across all frames)."))] = None,
+    pos: Annotated[int | None, Field(ge=1, description=(
+        "Warp: absolute buffer position."))] = None,
+    line: Annotated[int | None, Field(ge=1, description=(
+        "Warp: buffer line (1-based)."))] = None,
+    col: Annotated[int | None, Field(ge=0, description=(
+        "Warp: column on the line (0-based)."))] = None,
+    timeout: Annotated[float, Field(gt=0, le=120, description=(
+        "Seconds before the call is declared blocked (0 < timeout <= "
+        "120)."))] = 15.0,
+) -> str:
+    """Move (warp) or read (query) the REAL window-system pointer.
+
+    GUI sessions only. Unlike elate_mouse, which synthesizes events
+    through the command loop, this drives the actual pointer -- the
+    thing code dispatched below the command loop reads (drag-and-drop
+    ClientMessages in particular: XdndDrop carries no coordinates, Emacs
+    uses the live pointer position at drop time). For clicking, dragging
+    or scrolling through key/mouse bindings use elate_mouse instead.
+    Buffer-location warps land mid-glyph. Both actions return {x, y,
+    frame, buffer, pos, line, col, area}, root-absolute, with nulls when
+    the pointer is not over one of the session's frames.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        data = S.pointer_action(sess, action, x=x, y=y, buffer=buffer,
+                                pos=pos, line=line, col=col,
+                                timeout=timeout, via="mcp")
+        return _ok(data)
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_dnd(
+    session: Annotated[str, Field(description="Session name.")],
+    uris: Annotated[list[str], Field(min_length=1, description=(
+        "URIs to drop as text/uri-list. Local files as file:// URIs "
+        "(absolute paths)."))],
+    buffer: Annotated[str | None, Field(description=(
+        "Buffer whose window to drop on (default: selected window)."))]
+        = None,
+    pos: Annotated[int | None, Field(ge=1, description=(
+        "Absolute buffer position to drop at."))] = None,
+    line: Annotated[int | None, Field(ge=1, description=(
+        "Buffer line to drop at (1-based)."))] = None,
+    col: Annotated[int | None, Field(ge=0, description=(
+        "Column on the line (0-based)."))] = None,
+    x: Annotated[int | None, Field(description=(
+        "Root-absolute pixel x (pairs with y; excludes buffer "
+        "targeting)."))] = None,
+    y: Annotated[int | None, Field(description=(
+        "Root-absolute pixel y (pairs with x)."))] = None,
+    action: Annotated[Literal["copy", "move"], Field(description=(
+        "XDND action to propose."))] = "copy",
+    hover: Annotated[bool, Field(description=(
+        "Enter + Position only, no drop -- assert drag feedback; dwells "
+        "hover_ms, then sends XdndLeave (a follow-up real drop is "
+        "fine)."))] = False,
+    hover_ms: Annotated[int, Field(ge=0, le=10000, description=(
+        "Hover dwell in milliseconds before XdndLeave."))] = 500,
+    timeout: Annotated[float, Field(gt=0, le=120, description=(
+        "Seconds for the whole exchange (0 < timeout <= 120)."))] = 15.0,
+) -> str:
+    """Synthesize a REAL XDND drag-and-drop onto the session's frame.
+
+    An external X client speaks the full XDND protocol (Enter/Position/
+    Status/Drop, selection conversion, Finished), so the drop exercises
+    Emacs's C-level event dispatch, special-event-map, and x-dnd.el --
+    the layers elate_mouse's command-loop synthesis bypasses. The
+    pointer is warped to the target first (XdndDrop carries no
+    coordinates; Emacs reads the live pointer position at drop time).
+    X11 GUI sessions only -- start with ui='gui', headless=true on Linux
+    (the CI-friendly Xvfb path); needs python-xlib (pip install
+    'elate[dnd]'). A drop the target refuses is a normal result with
+    status='rejected', not an error. Every result carries 'in-debugger':
+    a missing XdndFinished together with in-debugger=true means the
+    package's drop handler errored -- that IS the finding; inspect with
+    elate_debug show, unwind with elate_debug abort. After a drop,
+    elate_wait condition='stable' on the target buffer is the settle
+    primitive.
+    """
+    sess = None
+    try:
+        sess = _load(session)
+        data = S.dnd_drop(sess, uris=uris, buffer=buffer, pos=pos, line=line,
+                          col=col, x=x, y=y, action=action, hover=hover,
+                          hover_ms=hover_ms, timeout=timeout, via="mcp")
         return _ok(data)
     except Exception as exc:
         return _fail(exc, sess)

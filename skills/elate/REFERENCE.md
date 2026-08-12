@@ -48,6 +48,9 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 - [`elate messages`](#elate-messages)
 - [`elate echo`](#elate-echo)
 - [`elate state`](#elate-state)
+- [`elate window-info`](#elate-window-info)
+- [`elate pointer`](#elate-pointer)
+- [`elate dnd`](#elate-dnd)
 - [`elate describe`](#elate-describe)
 - [`elate mcp`](#elate-mcp)
 - [`elate screenshot`](#elate-screenshot)
@@ -269,7 +272,7 @@ evaluate an elisp form
 
 trace elisp functions (log calls/args/returns), then read the accumulated log
 
-Wrap trace-function-background around one or more functions so each call records its args and return value. Tracing is invisible: the *trace-output* buffer is never displayed, so the window layout under test stays untouched. 'on FUNC...' starts tracing; drive the session (keys/eval/...); 'read' returns and clears the log so each read sees only new calls; 'off [FUNC...]' untraces the named functions (or all). Drives Emacs internals you cannot see on screen -- why an advice fires twice, what args a hook receives.
+Wrap trace-function-background around one or more functions so each call records its args and return value. Tracing is invisible: the *trace-output* buffer is never displayed, so the window layout under test stays untouched. 'on FUNC...' starts tracing; drive the session (keys/eval/...); 'read' returns and clears the log so each read sees only new calls; 'off [FUNC...]' untraces the named functions (or all). Drives Emacs internals you cannot see on screen -- why an advice fires twice, what args a hook receives. 'read' JSON carries both the raw *trace-output* text ('output') and structured per-call records: 'records' is a list of {fn, depth, args: [printed...], ret, error} in call-completion order (a nested call precedes its caller; depth 1 = outermost), each value printed and clipped -- assert on records, not on regexed text.
 
 - `{on,off,read}`
 - `[FUNC]` (repeatable) -- function name(s): required for 'on', optional for 'off' (default: untrace all), unused for 'read'
@@ -360,9 +363,51 @@ current echo area / minibuffer line
 
 one-call scene snapshot (layout, prompt, point, modes, messages tail)
 
-Full-snapshot shape: current-buffer facts (buffer, file, point, line, column, major-mode, minor-modes, region, narrowed, modified), echo, minibuffer (prompt/input/completions or null), input-pending, last-command, idle (secs or null), recursion-depth + in-debugger (non-zero/true = a recursive edit or the Lisp debugger is eating input -- see `debug`), popups, messages-tail, and 'windows': the window-tree as nested objects, NOT a flat list -- an inner node is {split: 'vertical'|'horizontal', children: [...]}, a leaf is one window {buffer, selected, width, height, line, column, start-line, end-line, mode-line, text, ...}; recurse until nodes have no 'children'.
+Full-snapshot shape: current-buffer facts (buffer, file, point, line, column, major-mode, minor-modes, region, narrowed, modified), echo, minibuffer (prompt/input/completions or null), input-pending, last-command, idle (secs or null), recursion-depth + in-debugger (non-zero/true = a recursive edit or the Lisp debugger is eating input -- see `debug`), popups, messages-tail, and 'windows': the window-tree as nested objects, NOT a flat list -- an inner node is {split: 'vertical'|'horizontal', children: [...]}, a leaf is one window {buffer, selected, width, height, line, column, start-line, end-line, mode-line, text, ...}; recurse until nodes have no 'children'. Sizes are character cells; for pixel geometry and X11 window ids see `window-info`.
 
 - `--since TOKEN` -- return only what changed since the TOKEN from a prior state call (new/killed/modified buffers, point/selection movement, new *Messages* lines, minibuffer change) -- much cheaper than a full snapshot, and 'changed':false means your last action did nothing observable. Every state result carries a fresh 'token'; an unknown/stale one degrades to a full snapshot.
+
+## elate window-info
+
+window-system ids and pixel geometry per frame (for external X11 clients: drops, warps, screenshots)
+
+Per frame (selected first): name, selected, graphic, window-system (x/ns/pgtk/... or null), units ('pixels' on GUI frames, 'chars' on TTY), outer-window-id + window-id as INTEGERS (null off X11), outer-edges + native-edges [left, top, right, bottom], char-width + char-height (the cell size for line/col-to-pixel math), and windows: [{buffer, selected, edges, body-edges}] with root-absolute pixel edges on GUI frames. Complements `state`, which has buffer content and character-cell layout but no window-system numbers.
+
+- `--timeout SECS` (default: 15)
+
+## elate pointer
+
+move (warp) or read (query) the real window-system pointer (gui only)
+
+Drives the REAL pointer, not a synthesized event: code dispatched below the command loop (drag-and-drop ClientMessages -- XdndDrop carries no coordinates, Emacs reads the live pointer position) only sees this. For clicking/dragging through the command loop use `mouse` instead. 'warp' targets root-absolute --x/--y or a buffer location (--buffer/--pos/--line/--col; buffer targets land mid-glyph) and replies with the post-warp position; 'query' reports {x, y, frame, buffer, pos, line, col, area} with nulls when the pointer is not over a session frame.
+
+- `{warp,query}`
+- `--x PX` -- warp: root-absolute pixel x (pairs with --y)
+- `--y PY` -- warp: root-absolute pixel y (pairs with --x)
+- `--buffer NAME` -- warp: buffer whose window to target (default: selected window; searched across all frames)
+- `--pos N` -- warp: absolute buffer position
+- `--line L` -- warp: buffer line (1-based)
+- `--col C` -- warp: column on --line (0-based)
+- `--timeout SECS` (default: 15)
+
+## elate dnd
+
+synthesize a real XDND drag-and-drop onto a buffer (X11 gui only; needs the elate[dnd] extra)
+
+An external X client speaks the full XDND protocol at the Emacs frame, so the drop exercises the C-level event dispatch, special-event-map, and x-dnd.el -- the layers `mouse` (command-loop synthesis) bypasses. The pointer is warped to the target first (XdndDrop carries no coordinates; Emacs reads the live pointer). X11 sessions only (--ui gui --headless on Linux is the CI-friendly path); needs python-xlib: pip install 'elate[dnd]'. A drop the target refuses returns status 'rejected' with exit 0 -- assert via --field status. Every result carries 'in-debugger'; a missing XdndFinished with in-debugger true is returned as a normal result (the drop handler errored -- inspect with `debug show`). After a drop, `wait stable --buffer B` is the settle primitive.
+
+- `{drop}`
+- `--uris URI[,URI...]` (required) -- comma-separated URIs to drop (text/uri-list, so ASCII only -- percent-encode; a literal comma in a URI must be %%2C); file URIs for local files: file:///abs/path
+- `--buffer NAME` -- buffer whose window to drop on (default: selected window)
+- `--pos N` -- absolute buffer position to drop at
+- `--line L` -- buffer line to drop at (1-based)
+- `--col C` -- column on --line (0-based)
+- `--x PX` -- root-absolute pixel x (pairs with --y; excludes buffer targeting)
+- `--y PY` -- root-absolute pixel y (pairs with --x)
+- `--action {copy,move}` (default: copy) -- XDND action to propose (default copy)
+- `--hover` -- Enter + Position only -- assert drag feedback without dropping; dwells --hover-ms, then leaves
+- `--hover-ms MS` (default: 500) -- hover dwell before XdndLeave (default 500, max 10000)
+- `--timeout SECS` (default: 15)
 
 ## elate describe
 

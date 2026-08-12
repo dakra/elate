@@ -573,7 +573,13 @@ def build_parser() -> argparse.ArgumentParser:
                     "each read sees only new calls; 'off [FUNC...]' "
                     "untraces the named functions (or all). Drives Emacs "
                     "internals you cannot see on screen -- why an advice "
-                    "fires twice, what args a hook receives.")
+                    "fires twice, what args a hook receives. 'read' JSON "
+                    "carries both the raw *trace-output* text ('output') and "
+                    "structured per-call records: 'records' is a list of "
+                    "{fn, depth, args: [printed...], ret, error} in call-"
+                    "completion order (a nested call precedes its caller; "
+                    "depth 1 = outermost), each value printed and clipped -- "
+                    "assert on records, not on regexed text.")
     sp.add_argument("action", choices=["on", "off", "read"])
     sp.add_argument("functions", nargs="*", metavar="FUNC",
                     help="function name(s): required for 'on', optional for "
@@ -731,7 +737,9 @@ def build_parser() -> argparse.ArgumentParser:
                     "{split: 'vertical'|'horizontal', children: [...]}, a "
                     "leaf is one window {buffer, selected, width, height, "
                     "line, column, start-line, end-line, mode-line, text, "
-                    "...}; recurse until nodes have no 'children'.")
+                    "...}; recurse until nodes have no 'children'. Sizes "
+                    "are character cells; for pixel geometry and X11 window "
+                    "ids see `window-info`.")
     sp.add_argument("--since", metavar="TOKEN",
                     help="return only what changed since the TOKEN from a "
                          "prior state call (new/killed/modified buffers, "
@@ -741,6 +749,103 @@ def build_parser() -> argparse.ArgumentParser:
                          "action did nothing observable. Every state result "
                          "carries a fresh 'token'; an unknown/stale one "
                          "degrades to a full snapshot.")
+
+    sp = sub.add_parser(
+        "window-info",
+        help="window-system ids and pixel geometry per frame (for external "
+             "X11 clients: drops, warps, screenshots)",
+        description="Per frame (selected first): name, selected, graphic, "
+                    "window-system (x/ns/pgtk/... or null), units ('pixels' "
+                    "on GUI frames, 'chars' on TTY), outer-window-id + "
+                    "window-id as INTEGERS (null off X11), outer-edges + "
+                    "native-edges [left, top, right, bottom], char-width + "
+                    "char-height (the cell size for line/col-to-pixel math), "
+                    "and windows: [{buffer, selected, edges, body-edges}] "
+                    "with root-absolute pixel edges on GUI frames. "
+                    "Complements `state`, which has buffer content and "
+                    "character-cell layout but no window-system numbers.")
+    sp.add_argument("--timeout", type=float, default=15.0, metavar="SECS")
+
+    sp = sub.add_parser(
+        "pointer",
+        help="move (warp) or read (query) the real window-system pointer "
+             "(gui only)",
+        description="Drives the REAL pointer, not a synthesized event: code "
+                    "dispatched below the command loop (drag-and-drop "
+                    "ClientMessages -- XdndDrop carries no coordinates, "
+                    "Emacs reads the live pointer position) only sees this. "
+                    "For clicking/dragging through the command loop use "
+                    "`mouse` instead. 'warp' targets root-absolute --x/--y "
+                    "or a buffer location (--buffer/--pos/--line/--col; "
+                    "buffer targets land mid-glyph) and replies with the "
+                    "post-warp position; 'query' reports {x, y, frame, "
+                    "buffer, pos, line, col, area} with nulls when the "
+                    "pointer is not over a session frame.")
+    sp.add_argument("action", choices=["warp", "query"])
+    sp.add_argument("--x", type=int, metavar="PX",
+                    help="warp: root-absolute pixel x (pairs with --y)")
+    sp.add_argument("--y", type=int, metavar="PY",
+                    help="warp: root-absolute pixel y (pairs with --x)")
+    sp.add_argument("--buffer", metavar="NAME",
+                    help="warp: buffer whose window to target (default: "
+                         "selected window; searched across all frames)")
+    sp.add_argument("--pos", type=int, metavar="N",
+                    help="warp: absolute buffer position")
+    sp.add_argument("--line", type=int, metavar="L",
+                    help="warp: buffer line (1-based)")
+    sp.add_argument("--col", type=int, metavar="C",
+                    help="warp: column on --line (0-based)")
+    sp.add_argument("--timeout", type=float, default=15.0, metavar="SECS")
+
+    sp = sub.add_parser(
+        "dnd",
+        help="synthesize a real XDND drag-and-drop onto a buffer "
+             "(X11 gui only; needs the elate[dnd] extra)",
+        description="An external X client speaks the full XDND protocol at "
+                    "the Emacs frame, so the drop exercises the C-level "
+                    "event dispatch, special-event-map, and x-dnd.el -- the "
+                    "layers `mouse` (command-loop synthesis) bypasses. The "
+                    "pointer is warped to the target first (XdndDrop "
+                    "carries no coordinates; Emacs reads the live pointer). "
+                    "X11 sessions only (--ui gui --headless on Linux is the "
+                    "CI-friendly path); needs python-xlib: pip install "
+                    "'elate[dnd]'. A drop the target refuses returns "
+                    "status 'rejected' with exit 0 -- assert via --field "
+                    "status. Every result carries 'in-debugger'; a missing "
+                    "XdndFinished with in-debugger true is returned as a "
+                    "normal result (the drop handler errored -- inspect "
+                    "with `debug show`). After a drop, `wait stable "
+                    "--buffer B` is the settle primitive.")
+    sp.add_argument("action", choices=["drop"])
+    sp.add_argument("--uris", required=True, metavar="URI[,URI...]",
+                    help="comma-separated URIs to drop (text/uri-list, so "
+                         "ASCII only -- percent-encode; a literal comma in "
+                         "a URI must be %%2C); file URIs for local files: "
+                         "file:///abs/path")
+    sp.add_argument("--buffer", metavar="NAME",
+                    help="buffer whose window to drop on (default: selected "
+                         "window)")
+    sp.add_argument("--pos", type=int, metavar="N",
+                    help="absolute buffer position to drop at")
+    sp.add_argument("--line", type=int, metavar="L",
+                    help="buffer line to drop at (1-based)")
+    sp.add_argument("--col", type=int, metavar="C",
+                    help="column on --line (0-based)")
+    sp.add_argument("--x", type=int, metavar="PX",
+                    help="root-absolute pixel x (pairs with --y; excludes "
+                         "buffer targeting)")
+    sp.add_argument("--y", type=int, metavar="PY",
+                    help="root-absolute pixel y (pairs with --x)")
+    sp.add_argument("--action", dest="dnd_action", choices=["copy", "move"],
+                    default="copy",
+                    help="XDND action to propose (default copy)")
+    sp.add_argument("--hover", action="store_true",
+                    help="Enter + Position only -- assert drag feedback "
+                         "without dropping; dwells --hover-ms, then leaves")
+    sp.add_argument("--hover-ms", type=int, default=500, metavar="MS",
+                    help="hover dwell before XdndLeave (default 500, "
+                         "max 10000)")
+    sp.add_argument("--timeout", type=float, default=15.0, metavar="SECS")
 
     sp = sub.add_parser("describe", help="structured docs/binding lookup")
     sp.add_argument("kind", choices=["key", "function", "variable", "mode"])
@@ -1785,6 +1890,12 @@ def cmd_trace(args: argparse.Namespace) -> Result:
         if data.get("truncated"):
             lines.append(f"(output truncated to {len(data.get('output') or '')}"
                          f" of {data.get('output-length')} chars)")
+        records = data.get("records") or []
+        if records:
+            lines.append(f"{len(records)} structured record(s) (JSON: "
+                         "'records')"
+                         + (" -- oldest dropped"
+                            if data.get("records-truncated") else ""))
         if data.get("active"):
             lines.append("tracing: " + " ".join(data["active"]))
         return data, "\n".join(lines), 0
@@ -1799,6 +1910,75 @@ def cmd_trace(args: argparse.Namespace) -> Result:
     if data.get("all"):
         return data, "untraced all functions", 0
     return data, "untraced " + " ".join(data.get("untraced") or []), 0
+
+
+def _human_window_info(data: dict[str, Any]) -> str:
+    lines = []
+    for frame in data.get("frames") or []:
+        ids = (f"outer-window-id {frame.get('outer-window-id')}"
+               if frame.get("outer-window-id") else "no window ids")
+        lines.append(
+            f"frame {frame.get('name')}"
+            f"{' [selected]' if frame.get('selected') else ''}: "
+            f"{frame.get('window-system') or 'tty'}, {ids}, "
+            f"outer {frame.get('outer-edges')}, "
+            f"cell {frame.get('char-width')}x{frame.get('char-height')} "
+            f"({frame.get('units')})")
+        for win in frame.get("windows") or []:
+            lines.append(
+                f"  {win.get('buffer')}"
+                f"{' [selected]' if win.get('selected') else ''}: "
+                f"edges {win.get('edges')}, body {win.get('body-edges')}")
+    return "\n".join(lines) or "(no frames)"
+
+
+def cmd_window_info(args: argparse.Namespace) -> Result:
+    sess = _require_session(args)
+    data = S.window_info(sess, timeout=args.timeout)
+    return data, _human_window_info(data), 0
+
+
+def _human_pointer(data: dict[str, Any]) -> str:
+    where = f"pointer at ({data.get('x')}, {data.get('y')})"
+    if data.get("buffer"):
+        where += (f" -- {data['buffer']} line {data.get('line')} "
+                  f"col {data.get('col')} (pos {data.get('pos')})")
+    elif data.get("area"):
+        where += f" -- {data.get('frame')} {data['area']}"
+    elif data.get("frame"):
+        where += f" -- frame {data['frame']}, not over buffer text"
+    else:
+        where += " -- not over a session frame"
+    return where
+
+
+def cmd_pointer(args: argparse.Namespace) -> Result:
+    sess = _require_session(args)
+    data = S.pointer_action(sess, args.action, x=args.x, y=args.y,
+                            buffer=args.buffer, pos=args.pos, line=args.line,
+                            col=args.col, timeout=args.timeout)
+    return data, _human_pointer(data), 0
+
+
+def cmd_dnd(args: argparse.Namespace) -> Result:
+    sess = _require_session(args)
+    uris = [u for u in (args.uris or "").split(",") if u]
+    data = S.dnd_drop(sess, uris=uris, buffer=args.buffer, pos=args.pos,
+                      line=args.line, col=args.col, x=args.x, y=args.y,
+                      action=args.dnd_action, hover=args.hover,
+                      hover_ms=args.hover_ms, timeout=args.timeout)
+    verb = "hovered" if data.get("hover") else "dropped"
+    where = data.get("buffer") or f"window {data.get('target-window')}"
+    bits = [data.get("status") or "?"]
+    if data.get("dropped"):
+        bits.append("finished" if data.get("finished") else "NOT finished")
+    if data.get("in-debugger"):
+        bits.append("in-debugger: the drop handler errored -- inspect with "
+                    f"`elate -s {sess.name} debug show`, unwind with "
+                    "`debug abort`")
+    human = (f"{verb} {len(uris)} uri(s) on {where} "
+             f"@{data.get('x')},{data.get('y')} ({', '.join(bits)})")
+    return data, human, 0
 
 
 def _faces_cell_human(data: dict[str, Any]) -> list[str]:
@@ -2830,6 +3010,9 @@ _COMMANDS = {
     "messages": cmd_messages,
     "echo": cmd_echo,
     "state": cmd_state,
+    "window-info": cmd_window_info,
+    "pointer": cmd_pointer,
+    "dnd": cmd_dnd,
     "describe": cmd_describe,
     "screenshot": cmd_screenshot,
     "wait": cmd_wait,
@@ -2975,7 +3158,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except ElateError as exc:
         if args.json:
-            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+            payload = {"ok": False, "error": str(exc)}
+            # XdndError (and future kin) carry a machine-readable reason
+            # like ScreenshotError does; spread it so callers can branch.
+            reason = getattr(exc, "reason", None)
+            if reason is not None:
+                payload["reason"] = reason
+            print(json.dumps(payload, ensure_ascii=False))
         else:
             print(f"elate: {exc}", file=sys.stderr)
         return 1

@@ -2,9 +2,59 @@
 
 ## 0.15.0
 
-Fixes from a live GUI/XDND test session's feedback: observability must
-not perturb what it observes, and a session stuck in the Lisp debugger
-must be visible and recoverable instead of silently eating the test.
+Fixes and features from a live GUI/XDND test session's feedback:
+observability must not perturb what it observes, a session stuck in the
+Lisp debugger must be visible and recoverable instead of silently eating
+the test, and the window-system layer below the command loop — real
+pointer position, real drag-and-drop — is now drivable first-class
+instead of via hand-rolled X clients.
+
+- **`dnd drop`** (CLI + MCP `elate_dnd`, scenario verb `dnd`): synthesize
+  a real XDND drag-and-drop onto a buffer. An external X client (the new
+  `elate[dnd]` extra, python-xlib) speaks the full protocol — timestamp
+  harvest, `XdndSelection` ownership, Enter/Position/Status/Drop,
+  selection conversion, Finished — so the drop travels Emacs's C-level
+  event dispatch, `special-event-map`, and x-dnd.el exactly like a user
+  drag; the layer every terminal/dired/image/org-attach package needs
+  tested and previously each author re-implemented by hand (~180 lines
+  of protocol code in the field). Targets mirror `mouse` (buffer/line/
+  col, or root-absolute pixels); `--hover` asserts drag feedback without
+  dropping; a refused drop is data (`status: "rejected"`, exit 0), and
+  every result carries `in-debugger` — a missing `XdndFinished` with
+  `in-debugger: true` is returned as a normal result naming the real
+  finding: the package's drop handler errored. X11 GUI sessions only
+  (`--ui gui --headless` on Linux is the CI path).
+
+- **`pointer warp|query`** (CLI + MCP `elate_pointer`): move and read
+  the REAL window-system pointer. `mouse` synthesizes events through the
+  command loop, which is exactly the layer drag-and-drop bypasses:
+  `XdndDrop` carries no coordinates, Emacs reads the live pointer at
+  drop time — in the field this attributed a drop to whatever window
+  the pointer happened to sit over, producing a false negative. Warp
+  targets root-absolute pixels or a buffer location (landing mid-glyph);
+  both actions reply with the position resolved back to buffer/line/col,
+  and a warp the window system ignored (macOS declines targets on
+  displays at negative global coordinates; a human moving the physical
+  mouse overrides warps) errors instead of reporting the stale position
+  as success.
+
+- **`window-info`** (CLI + MCP `elate_window_info`): the window-system
+  numbers an external client needs, as real JSON — `outer-window-id` /
+  `window-id` as **ints** (`frame-parameter` prints X11 ids as decimal
+  strings), frame outer/native edges, per-window absolute pixel edges,
+  and the char cell size for line/col-to-pixel math. Replaces a
+  frame-parameter + `window-absolute-pixel-edges` + root-tree-walk eval
+  scavenger hunt; TTY frames report character cells.
+
+- **Structured `trace read` records**: alongside the raw
+  `*trace-output*` text, `read` now returns `records` — `{fn, depth,
+  args, ret, error}` per call, captured structurally at trace time
+  (never parsed from the text), values clipped per-field, bounded ring,
+  drained on read like the text. Asserting on a traced call no longer
+  means regexing `N -> (fn args)` lines. Layout-neutrality is
+  preserved: capture is advice-only and touches no buffer or window.
+
+The correctness round from the same feedback:
 
 - **`trace on` no longer touches the window layout**: functions are
   traced via `trace-function-background`, so `*trace-output*` is never

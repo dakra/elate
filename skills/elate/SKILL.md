@@ -279,10 +279,13 @@ uvx elate -s s trace read                             # calls+args+returns, in o
 uvx elate -s s trace off                              # untrace all
 ```
 
-Each call records nesting, arguments, and return value (`trace-function`
-under the hood). `read` clears the log, so each read sees only new calls
-(`--keep` to accumulate). Trace a handful of named functions, not a whole
-package — tracing is per-function.
+Each call records nesting, arguments, and return value. `read` clears the
+log, so each read sees only new calls (`--keep` to accumulate). Trace a
+handful of named functions, not a whole package — tracing is per-function.
+With `--json`, `read` also carries structured `records` — `{fn, depth,
+args, ret, error}` per call, in completion order (a nested call precedes
+its caller; depth 1 = outermost) — assert on those, never regex the raw
+`output` text.
 
 ## Tests, lint, profile, bench — fresh sessions only
 
@@ -401,6 +404,27 @@ permissions) and works on TTY too. GUI differences: no `--raw` channel;
 Recording permission (elate preflights and reports instead of prompting).
 On Linux/CI add `--headless` for a private Xvfb.
 
+Three GUI-level commands reach *below* the command loop, where
+`special-event-map` code (drag-and-drop in particular) lives:
+
+```sh
+uvx elate -s g window-info                                # X11 ids as ints, pixel edges per window
+uvx elate -s g pointer warp --buffer '*scratch*' --line 3 --col 5
+uvx elate -s g dnd drop --uris file:///tmp/a,file:///tmp/b --buffer dired
+```
+
+`pointer` moves/reads the REAL pointer (`mouse` synthesizes command-loop
+events; dnd code reads the live pointer instead, so only `pointer` can
+target it). `dnd drop` runs a full XDND exchange from an external X
+client — the drop travels Emacs's C event dispatch and x-dnd.el exactly
+like a user drag; X11 sessions only (`--ui gui --headless` on Linux),
+needs `pip install 'elate[dnd]'`. A refused drop returns
+`status: "rejected"` with exit 0; every result carries `in-debugger` —
+true with `finished: false` means the package's drop handler errored
+(inspect with `debug show`). `--hover` asserts drag feedback without
+dropping. After a drop, `wait stable --buffer B` is the settle
+primitive.
+
 ## When the MCP server fits better
 
 This skill drives the CLI via shell — the full feature set with near-zero
@@ -410,7 +434,7 @@ images** instead of PNG files to read. If `elate_*` MCP tools are already
 available in your session (someone registered the server — the plugin is
 CLI-first and does not register it for you), use them directly — do **not**
 register a duplicate; otherwise register it with
-`claude mcp add elate -- uvx elate mcp`. The 32 `elate_*` tools cover the core surface (`attach`, `resize`,
+`claude mcp add elate -- uvx elate mcp`. The 35 `elate_*` tools cover the core surface (`attach`, `resize`,
 `prune`, `stderr`, `export-script`, `snap`, `matrix`, `install`, and `update` stay CLI-only); `prune`
 aliases `purge` and `stderr` aliases `logs`. Sessions are shared
 between both (same names, same sandboxes), so you can mix.

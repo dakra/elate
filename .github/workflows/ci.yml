@@ -168,8 +168,11 @@ jobs:
           tmux -V
           import -version | head -n 1
 
+      # --extra dnd: the XDND drop tests in tests/test_gui.py need
+      # python-xlib (they skip without it, which would silently drop the
+      # only leg that can exercise them).
       - name: Install project
-        run: uv sync --frozen
+        run: uv sync --frozen --extra dnd
 
       # tests/test_gui.py needs $DISPLAY on Linux — xvfb-run provides it.
       # test_snap_series_gui is the one display-gated test outside that

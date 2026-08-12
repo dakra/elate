@@ -997,6 +997,58 @@ screenshots."
   (let ((value (frame-parameter nil (intern name))))
     (list :name name :value (if value (format "%s" value) :null))))
 
+(defun elate--window-id-int (frame param)
+  "Frame PARAM of FRAME as an integer window-system id, or :null.
+X11 reports window ids as decimal strings; JSON consumers get ints."
+  (let ((v (frame-parameter frame param)))
+    (cond ((integerp v) v)
+          ((and (stringp v) (string-match-p "\\`[0-9]+\\'" v))
+           (string-to-number v))
+          (t :null))))
+
+(defun elate--window-geometry (win graphic)
+  "Geometry plist for WIN: absolute pixel edges (GUI) or cell edges (TTY)."
+  (list :buffer (buffer-name (window-buffer win))
+        :selected (elate--jbool (eq win (selected-window)))
+        :edges (vconcat (if graphic
+                            (window-absolute-pixel-edges win)
+                          (window-edges win)))
+        :body-edges (vconcat (if graphic
+                                 (window-absolute-body-pixel-edges win)
+                               (window-edges win t)))))
+
+(defun elate--rpc-window-info ()
+  "Per-frame window-system ids and pixel geometry, selected frame first.
+Complements `state': `state' carries buffer content and character-cell
+sizes, this carries the window-system-level numbers an external client
+needs (X11 window ids as ints, absolute pixel edges, char cell size for
+line/col to pixel math).  On a TTY frame edges are character cells
+\(:units \"chars\") and the ids are :null."
+  (let ((frames (cons (selected-frame)
+                      (delq (selected-frame) (frame-list)))))
+    (list :frames
+          (vconcat
+           (mapcar
+            (lambda (f)
+              (let ((graphic (display-graphic-p f))
+                    (ws (window-system f)))
+                (list :name (elate--jnull (frame-parameter f 'name))
+                      :selected (elate--jbool (eq f (selected-frame)))
+                      :graphic (elate--jbool graphic)
+                      :window-system (if ws (symbol-name ws) :null)
+                      :units (if graphic "pixels" "chars")
+                      :outer-window-id (elate--window-id-int f 'outer-window-id)
+                      :window-id (elate--window-id-int f 'window-id)
+                      :outer-edges (vconcat (frame-edges f 'outer-edges))
+                      :native-edges (vconcat (frame-edges f 'native-edges))
+                      :char-width (frame-char-width f)
+                      :char-height (frame-char-height f)
+                      :windows (vconcat
+                                (mapcar (lambda (w)
+                                          (elate--window-geometry w graphic))
+                                        (window-list f))))))
+            frames)))))
+
 ;;;; Mouse synthesis
 ;;
 ;; Mouse events are synthesized inside Emacs: build a real posn at the
@@ -1128,6 +1180,132 @@ when the triggered command itself reads input)."
           :pos (elate--jnull (posn-point posn))
           :events (length events)
           :delivered delivery)))
+
+;;;; System pointer (warp / query)
+;;
+;; Unlike `mouse' above, which synthesizes events through the command
+;; loop, these move and read the REAL window-system pointer.  Code
+;; dispatched from `special-event-map' (drag-and-drop ClientMessages,
+;; XdndDrop in particular carries no coordinates) reads the live pointer
+;; position below the command loop, so only a real warp can target it.
+
+(defun elate--pointer-query ()
+  "Root-absolute pointer position, resolved to a buffer location if ours.
+When the pointer sits over one of this Emacs's frames, :buffer/:pos/
+:line/:col name the spot under it (:area for non-text parts like the
+mode line); over foreign windows or the root they are :null.  Frames
+are matched by edge containment in `frame-list' order, not stacking
+order: a foreign window covering the frame is invisible here."
+  (let* ((pp (mouse-absolute-pixel-position))
+         (x (car pp)) (y (cdr pp))
+         (frame (seq-find
+                 (lambda (f)
+                   (and (display-graphic-p f)
+                        (pcase-let ((`(,l ,top ,r ,b)
+                                     (frame-edges f 'outer-edges)))
+                          (and (<= l x) (< x r) (<= top y) (< y b)))))
+                 (frame-list)))
+         (posn (when frame
+                 (pcase-let ((`(,nl ,nt ,_r ,_b)
+                              (frame-edges frame 'native-edges)))
+                   (posn-at-x-y (- x nl) (- y nt) frame t))))
+         (base (list :x x :y y
+                     :frame (if frame
+                                (elate--jnull (frame-parameter frame 'name))
+                              :null))))
+    (if (and posn (windowp (posn-window posn))
+             (null (posn-area posn)) (posn-point posn))
+        (let ((win (posn-window posn))
+              (pt (posn-point posn)))
+          (with-current-buffer (window-buffer win)
+            (save-excursion
+              (goto-char pt)
+              (append base
+                      (list :buffer (buffer-name)
+                            :pos pt
+                            :line (line-number-at-pos pt t)
+                            :col (current-column)
+                            :area :null)))))
+      (append base
+              (list :buffer :null :pos :null :line :null :col :null
+                    :area (if (and posn (posn-area posn))
+                              (format "%s" (posn-area posn))
+                            :null))))))
+
+(defun elate--pointer-warp (payload)
+  "Warp the system pointer per PAYLOAD (an alist), then report back.
+PAYLOAD carries either root-absolute x + y, or a buffer location
+\(buffer, and pos or line + col; buffer defaults to the selected
+window's).  Buffer targets land in the middle of the glyph cell so the
+point is unambiguously inside it.  The reply is a fresh
+`elate--pointer-query'; a warp the window system ignored (macOS
+declines targets on displays at negative global coordinates) signals
+instead of reporting the stale position as success."
+  (let* ((x (alist-get 'x payload))
+         (y (alist-get 'y payload))
+         (target
+          (if (and x y)
+              (cons x y)
+            (let* ((bufname (alist-get 'buffer payload))
+                   (win (if bufname
+                            (or (get-buffer-window bufname t)
+                                (error (concat "elate: buffer %S is not "
+                                               "displayed in any window; show "
+                                               "it first, e.g. eval "
+                                               "(pop-to-buffer %S)")
+                                       bufname bufname))
+                          (selected-window)))
+                   (frame (window-frame win))
+                   (pos (elate--mouse-resolve-pos win payload))
+                   (pp (or (window-absolute-pixel-position pos win)
+                           (error (concat "elate: position %d is not visible "
+                                          "in window %s; scroll it into view "
+                                          "first")
+                                  pos win))))
+              (cons (+ (car pp) (/ (frame-char-width frame) 2))
+                    (+ (cdr pp) (/ (frame-char-height frame) 2)))))))
+    ;; Warp, then confirm it took. Retried a few times: a human moving
+    ;; the physical mouse overrides a warp instantly, so a transient
+    ;; mismatch gets another chance before it is declared a refusal.
+    (let ((attempts 3)
+          (tol 5)
+          (landed nil)
+          (ok nil))
+      (while (and (not ok) (> attempts 0))
+        (set-mouse-absolute-pixel-position (car target) (cdr target))
+        (sit-for 0.05)
+        (setq landed (mouse-absolute-pixel-position))
+        (setq ok (and (<= (abs (- (car landed) (car target))) tol)
+                      (<= (abs (- (cdr landed) (cdr target))) tol))
+              attempts (1- attempts)))
+      (unless ok
+        (error (concat "elate: the window system did not move the pointer "
+                       "(asked for (%d, %d), it sits at (%d, %d)) -- the "
+                       "target may lie on a display macOS refuses to warp "
+                       "to (negative global coordinates), or a human is "
+                       "moving the physical mouse")
+               (car target) (cdr target) (car landed) (cdr landed))))
+    (elate--pointer-query)))
+
+(defun elate--rpc-pointer (&optional action payload-b64)
+  "Move or read the real window-system pointer.  GUI frames only.
+ACTION \"query\" (default): where the pointer is, root-absolute, plus
+the buffer/line/col under it when over one of our frames.  ACTION
+\"warp\": PAYLOAD-B64 (base64 JSON) targets root-absolute {x,y} or a
+buffer location {buffer,pos|line,col}; replies with the post-warp
+query so callers get confirmation in one round trip."
+  (unless (display-graphic-p)
+    (error "elate: pointer is GUI-only; a TTY frame has no system pointer"))
+  (pcase (or action "query")
+    ("query" (elate--pointer-query))
+    ("warp"
+     (unless payload-b64
+       (error "elate: pointer warp needs a target payload"))
+     (elate--pointer-warp
+      (json-parse-string (elate--decode-string payload-b64)
+                         :object-type 'alist
+                         :null-object nil :false-object nil)))
+    (other (error "elate: unknown pointer action %S (use warp/query)" other))))
 
 ;;;; Focus and ordered-event injection
 ;;
@@ -2471,6 +2649,75 @@ reply travels the same ~50 KB/s emacsclient print path as eval.")
                     (push (symbol-name s) out))))
       (sort out #'string<))))
 
+(defconst elate--max-trace-records 500
+  "Cap on buffered structured trace records; oldest are dropped beyond it.")
+
+(defconst elate--max-trace-arg-len 500
+  "Per-value print cap inside a structured trace record.")
+
+(defvar elate--trace-records nil
+  "Captured call records, newest first; `trace read' drains and reverses.")
+
+(defvar elate--trace-records-dropped nil
+  "Non-nil when records were dropped to `elate--max-trace-records'.")
+
+(defvar elate--trace-depth 0
+  "Dynamic nesting depth of in-flight traced calls.")
+
+(defvar elate--trace-advised nil
+  "Symbols currently carrying the record-capturing advice.")
+
+(defun elate--trace-clip (obj)
+  "OBJ printed for a trace record, clipped to `elate--max-trace-arg-len'."
+  (let ((print-length 50)
+        (print-level 6))
+    (let ((s (prin1-to-string obj)))
+      (if (> (length s) elate--max-trace-arg-len)
+          (concat (substring s 0 elate--max-trace-arg-len) "...")
+        s))))
+
+(defun elate--trace-push (sym depth args ret err)
+  "Buffer one call record, bounded by `elate--max-trace-records'."
+  (push (list :fn (symbol-name sym) :depth depth :args args
+              :ret (elate--jnull ret) :error (elate--jnull err))
+        elate--trace-records)
+  (when (> (length elate--trace-records) elate--max-trace-records)
+    (setcdr (nthcdr (1- elate--max-trace-records) elate--trace-records) nil)
+    (setq elate--trace-records-dropped t)))
+
+(defun elate--trace-advice-for (sym)
+  "The :around advice capturing structured records for calls of SYM.
+Pure capture: no buffer or window is touched, preserving the
+layout-neutrality of background tracing.  Tracing a function the
+recorder itself calls (`prin1-to-string', `format',
+`error-message-string') recurses -- the same hazard as trace.el; a
+nonlocal exit (`throw', quit) skips the record."
+  (lambda (orig &rest args)
+    (let ((elate--trace-depth (1+ elate--trace-depth))
+          (clipped (vconcat (mapcar #'elate--trace-clip args))))
+      (condition-case err
+          (let ((ret (apply orig args)))
+            (elate--trace-push sym elate--trace-depth clipped
+                               (elate--trace-clip ret) nil)
+            ret)
+        (error
+         (elate--trace-push sym elate--trace-depth clipped nil
+                            (error-message-string err))
+         (signal (car err) (cdr err)))))))
+
+(defun elate--trace-record-on (sym)
+  "Install the record-capturing advice on SYM (idempotent)."
+  (unless (advice-member-p 'elate--trace-record sym)
+    (advice-add sym :around (elate--trace-advice-for sym)
+                '((name . elate--trace-record))))
+  (unless (memq sym elate--trace-advised)
+    (push sym elate--trace-advised)))
+
+(defun elate--trace-record-off (sym)
+  "Remove the record-capturing advice from SYM."
+  (advice-remove sym 'elate--trace-record)
+  (setq elate--trace-advised (delq sym elate--trace-advised)))
+
 (defun elate--rpc-trace (action &optional names keep)
   "Drive function tracing.  ACTION is \"on\", \"off\", or \"read\".
 NAMES is a whitespace-separated string of function names.  \"on\" traces
@@ -2481,8 +2728,9 @@ window-sensitive code under test (popups, dnd, terminals) depends on
 error); all names are resolved before any is traced, so a bad name
 leaves nothing half-traced.  \"off\" untraces the
 named functions, or ALL of them when NAMES is empty.  \"read\" returns
-the accumulated `*trace-output*' text and, unless KEEP, clears it so each
-read sees only new calls."
+the accumulated `*trace-output*' text plus structured per-call records
+\(:records, oldest first) and, unless KEEP, clears both so each read
+sees only new calls."
   (let ((names (split-string (or names "") nil t)))
     (pcase action
       ("on"
@@ -2496,7 +2744,8 @@ read sees only new calls."
              (if (and (fboundp 'trace-is-traced) (trace-is-traced sym))
                  (push name already)
                (trace-function-background sym)
-               (push name traced)))
+               (push name traced))
+             (elate--trace-record-on sym))
            (setq ns (cdr ns) ss (cdr ss)))
          (list :traced (vconcat (nreverse traced))
                :already (vconcat (nreverse already)))))
@@ -2505,9 +2754,14 @@ read sees only new calls."
            (let ((off '()))
              (dolist (name names)
                (let ((sym (intern-soft name)))
-                 (when sym (untrace-function sym) (push name off))))
+                 (when sym
+                   (untrace-function sym)
+                   (elate--trace-record-off sym)
+                   (push name off))))
              (list :untraced (vconcat (nreverse off)) :all :false))
          (untrace-all)
+         (dolist (sym (copy-sequence elate--trace-advised))
+           (elate--trace-record-off sym))
          (list :untraced :null :all t)))
       ("read"
        (let* ((buf (get-buffer trace-buffer))
@@ -2516,14 +2770,20 @@ read sees only new calls."
                           (buffer-substring-no-properties (point-min) (point-max)))
                       ""))
               (len (length text))
-              (truncated (> len elate--max-trace-output)))
+              (truncated (> len elate--max-trace-output))
+              (records (vconcat (reverse elate--trace-records)))
+              (dropped elate--trace-records-dropped))
          (unless keep
            (when (buffer-live-p buf)
              (with-current-buffer buf
-               (let ((inhibit-read-only t)) (erase-buffer)))))
+               (let ((inhibit-read-only t)) (erase-buffer))))
+           (setq elate--trace-records nil
+                 elate--trace-records-dropped nil))
          (list :output (if truncated (substring text 0 elate--max-trace-output) text)
                :truncated (elate--jbool truncated)
                :output-length len
+               :records records
+               :records-truncated (elate--jbool dropped)
                :cleared (elate--jbool (not keep))
                :active (vconcat (elate--trace-active-names)))))
       (_ (error "elate: unknown trace action %S (use on/off/read)" action)))))

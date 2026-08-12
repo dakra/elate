@@ -6,12 +6,14 @@ import base64
 import dataclasses
 import fnmatch
 import json
+import os
 import re
 import secrets
 import shlex
 import shutil
 import signal
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -1904,6 +1906,274 @@ def mouse_event(
     b64 = base64.b64encode(
         json.dumps(payload).encode("utf-8")).decode("ascii")
     return sess.semantic().rpc("mouse", b64, timeout=timeout)
+
+
+def window_info(sess: Session, timeout: float = 15.0,
+                via: str | None = None) -> dict[str, Any]:
+    """Per-frame window-system ids and pixel geometry, as real JSON.
+
+    Complements `state`: `state` carries buffer content and character
+    sizes, this carries what an external window-system client needs —
+    X11 window ids as ints (never the decimal strings frame-parameter
+    prints), absolute pixel edges per window, and the char cell size for
+    line/col-to-pixel math. TTY frames report character-cell edges
+    (units "chars") with null ids.
+    """
+    sess.log("window-info", **({"via": via} if via else {}))
+    return sess.semantic().rpc("window-info", timeout=timeout)
+
+
+POINTER_ACTIONS = ("warp", "query")
+
+
+def pointer_action(
+    sess: Session,
+    action: str,
+    *,
+    x: int | None = None,
+    y: int | None = None,
+    buffer: str | None = None,
+    pos: int | None = None,
+    line: int | None = None,
+    col: int | None = None,
+    timeout: float = 15.0,
+    via: str | None = None,
+) -> dict[str, Any]:
+    """Move ("warp") or read ("query") the real window-system pointer.
+
+    Unlike `mouse_event`, which synthesizes events through the command
+    loop, this drives the actual pointer — the thing code below the
+    command loop (drag-and-drop ClientMessage handling in particular)
+    reads. GUI sessions only.
+
+    Warp targets are root-absolute pixels (x + y) or a buffer location
+    (buffer, and pos or line/col; buffer defaults to the selected
+    window's). Both actions reply with the resulting position, resolved
+    to buffer/line/col when the pointer sits over one of the session's
+    frames.
+    """
+    if action not in POINTER_ACTIONS:
+        raise UsageError(
+            f"unknown pointer action {action!r} (use {'/'.join(POINTER_ACTIONS)})")
+    if sess.ui != "gui":
+        raise UsageError(
+            "pointer needs a GUI session; a TTY frame has no system pointer")
+    targeting = {"x": x, "y": y, "buffer": buffer, "pos": pos,
+                 "line": line, "col": col}
+    given = {k for k, v in targeting.items() if v is not None}
+    if action == "query":
+        if given:
+            raise UsageError(
+                f"pointer query takes no target ({', '.join(sorted(given))} given)")
+        sess.log("pointer", action=action,
+                 **({"via": via} if via else {}))
+        return sess.semantic().rpc("pointer", action, timeout=timeout)
+    if (x is None) != (y is None):
+        raise UsageError("pointer warp needs both --x and --y, or neither")
+    if x is not None and given & {"buffer", "pos", "line", "col"}:
+        raise UsageError(
+            "pointer warp targets either --x/--y or a buffer location, not both")
+    if x is None and not given:
+        raise UsageError(
+            "pointer warp needs a target: --x/--y or --buffer/--pos/--line/--col")
+    if col is not None and line is None and pos is None:
+        raise UsageError(
+            "pointer warp --col needs --line (or --pos); a bare column has "
+            "no row to land on")
+    for label, value, minimum in (("pos", pos, 1), ("line", line, 1),
+                                  ("col", col, 0)):
+        if value is not None and value < minimum:
+            raise ElateError(f"pointer {label} must be >= {minimum}, got {value}")
+    b64 = base64.b64encode(
+        json.dumps(targeting).encode("utf-8")).decode("ascii")
+    sess.log("pointer", action=action,
+             **{k: v for k, v in targeting.items() if v is not None},
+             **({"via": via} if via else {}))
+    return sess.semantic().rpc("pointer", action, b64, timeout=timeout)
+
+
+DND_ACTIONS = ("copy", "move")
+
+
+def _dnd_target_frame(info: dict[str, Any], buffer: str | None,
+                      x: int | None, y: int | None) -> dict[str, Any]:
+    """The window-info frame an XDND exchange should address."""
+    frames = info.get("frames") or []
+    if buffer is not None:
+        for frame in frames:
+            if any(w.get("buffer") == buffer
+                   for w in frame.get("windows") or []):
+                return frame
+        raise ElateError(
+            f"buffer {buffer!r} is not displayed in any window; show it "
+            f"first, e.g. eval (pop-to-buffer {buffer!r})")
+    if x is not None and y is not None:
+        for frame in frames:
+            left, top, right, bottom = frame.get("outer-edges") or (0, 0, 0, 0)
+            if left <= x < right and top <= y < bottom:
+                return frame
+    for frame in frames:
+        if frame.get("selected"):
+            return frame
+    raise ElateError("session has no frames")  # unreachable on a live session
+
+
+def dnd_drop(
+    sess: Session,
+    *,
+    uris: Sequence[str],
+    buffer: str | None = None,
+    pos: int | None = None,
+    line: int | None = None,
+    col: int | None = None,
+    x: int | None = None,
+    y: int | None = None,
+    action: str = "copy",
+    hover: bool = False,
+    hover_ms: int = 500,
+    timeout: float = 15.0,
+    via: str | None = None,
+) -> dict[str, Any]:
+    """Synthesize a real XDND drag-and-drop onto the session's frame.
+
+    An external X client (see :mod:`elate.xdnd`) speaks the full XDND
+    protocol at the frame, so the drop exercises Emacs's C-level event
+    dispatch, special-event-map, and x-dnd.el -- the exact layers that
+    in-process event synthesis (`mouse_event`) bypasses. The pointer is
+    warped to the target first: XdndDrop carries no coordinates, Emacs
+    reads the live pointer position at drop time.
+
+    X11 GUI sessions only. Targets mirror `pointer_action` warp:
+    root-absolute x/y or a buffer location. A rejected drop is a result
+    (status "rejected"), not an error. Every result carries the
+    post-protocol "in-debugger" flag; a missing XdndFinished paired with
+    in-debugger=true is returned as a normal result (the drop handler
+    errored -- that is the finding, not a harness failure).
+    """
+    from . import xdnd
+
+    if sess.ui != "gui":
+        raise UsageError(
+            "dnd needs a GUI session; XDND does not exist on a TTY")
+    if action not in DND_ACTIONS:
+        raise UsageError(
+            f"unknown dnd action {action!r} (use {'/'.join(DND_ACTIONS)})")
+    uris = list(uris)
+    if not uris:
+        raise UsageError("dnd drop needs at least one URI")
+    for uri in uris:
+        if not urllib.parse.urlsplit(uri).scheme:
+            raise UsageError(
+                f"{uri!r} is not a URI (no scheme); for a local file use "
+                "file:// -- in Python: Path(p).resolve().as_uri()")
+        if not uri.isascii():
+            # text/uri-list is ASCII by spec; as_uri() percent-encodes.
+            raise UsageError(
+                f"{uri!r} is not ASCII; percent-encode it -- in Python: "
+                "Path(p).resolve().as_uri()")
+    if (x is None) != (y is None):
+        raise UsageError("dnd drop needs both --x and --y, or neither")
+    if x is not None and any(v is not None for v in (buffer, pos, line, col)):
+        raise UsageError(
+            "dnd drop targets either --x/--y or a buffer location, not both")
+    if not 0 <= hover_ms <= 10000:
+        raise UsageError(f"hover-ms must be 0..10000, got {hover_ms}")
+
+    info = window_info(sess, timeout=timeout)
+    frame = _dnd_target_frame(info, buffer, x, y)
+    if frame.get("window-system") != "x":
+        raise UsageError(
+            "XDND is X11-only; this frame's window-system is "
+            f"{frame.get('window-system') or 'tty'} (ns/pgtk drops are a "
+            "future port)")
+    target_window = frame.get("outer-window-id")
+    if not target_window:
+        raise ElateError("frame has no outer-window-id; cannot address it")
+    display = sess.display or os.environ.get("DISPLAY")
+    if not display:
+        raise ElateError(
+            "no DISPLAY to reach the session's X server: headless sessions "
+            "record theirs in session.json; for a non-headless GUI session "
+            "run where DISPLAY is set")
+
+    # Warp first, then trust the warp's own report of where the pointer
+    # actually sits: the live position (what Emacs reads at drop time)
+    # and the XdndPosition coordinates must agree.
+    landed = pointer_action(sess, "warp", x=x, y=y, buffer=buffer, pos=pos,
+                            line=line, col=col, timeout=timeout, via=via)
+    px, py = landed.get("x"), landed.get("y")
+    if px is None or py is None:
+        raise ElateError("pointer warp did not report a position")
+    if px < 0 or py < 0:
+        # XdndPosition packs coords as two unsigned 16-bit halves; a frame
+        # on a monitor left of/above the X11 origin would wrap.
+        raise ElateError(
+            f"drop target sits at negative root coordinates ({px}, {py}), "
+            "which XdndPosition cannot encode; move the frame onto a "
+            "monitor at or right/below the origin")
+
+    sess.log("dnd", action="drop", uris=uris,
+             **{k: v for k, v in (("buffer", buffer), ("pos", pos),
+                                  ("line", line), ("col", col),
+                                  ("x", x), ("y", y)) if v is not None},
+             landed_buffer=landed.get("buffer"), landed_x=px, landed_y=py,
+             dnd_action=action, hover=hover,
+             **({"hover_ms": hover_ms} if hover and hover_ms != 500 else {}),
+             **({"via": via} if via else {}))
+
+    def _idle_probe() -> dict[str, Any]:
+        try:
+            return sess.semantic().rpc("idle", timeout=5.0)
+        except (EvalTimeout, TransportError, RpcError):
+            return {}
+
+    try:
+        res = xdnd.xdnd_drop(display, int(target_window), int(px), int(py),
+                             uris, action=action, hover=hover,
+                             hover_ms=hover_ms, timeout=timeout)
+    except xdnd.XdndError as exc:
+        if exc.reason != "finished-timeout":
+            raise
+        probe = _idle_probe()
+        if not probe.get("in-debugger"):
+            raise
+        # Emacs never sends XdndFinished when the drop handler threw it
+        # into the debugger: that is the caller's finding, not a harness
+        # failure. Inspect with `debug show`, unwind with `debug abort`.
+        data = {
+            "target-window": int(target_window),
+            "xdnd-version": exc.xdnd_version,
+            "display": display, "buffer": landed.get("buffer"),
+            "x": px, "y": py, "uris": uris, "action": action,
+            "status": "accepted", "dropped": True, "finished": False,
+            "finished-action": None,
+            "served-selection": exc.served_selection,
+            "hover": False, "in-debugger": True,
+            "recursion-depth": probe.get("recursion-depth"),
+        }
+        sess.log("dnd-result", **{k: v for k, v in data.items()
+                                  if k != "uris"})
+        return data
+
+    probe = _idle_probe()
+    data = {
+        "target-window": res.target_window,
+        "xdnd-version": res.xdnd_version,
+        "display": display,
+        "buffer": landed.get("buffer"),
+        "x": res.x, "y": res.y,
+        "uris": uris, "action": action,
+        "status": res.status,
+        "dropped": res.dropped,
+        "finished": res.finished,
+        "finished-action": res.finished_action,
+        "served-selection": res.served_selection,
+        "hover": hover,
+        "in-debugger": bool(probe.get("in-debugger")),
+    }
+    sess.log("dnd-result", **{k: v for k, v in data.items()
+                              if k not in ("uris",)})
+    return data
 
 
 # --- Focus and ordered-event injection ------------------------------------

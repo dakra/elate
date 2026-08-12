@@ -54,11 +54,22 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   command line — check it when input vanishes, and `eval` the package's own
   send function when it writes through a raw fd no process fronts. To see
   which internal functions ran (args, order), use `trace on FN…` / `trace
-  read` instead of advice spies. `faces-at --pos N` / `--run K` reads cells
-  by position / a run at once.
-- Eval forms don't run in the selected window's buffer — wrap
-  buffer-mutating forms in `(with-current-buffer …)`. Output truncates at
-  64 KiB. `wait text` patterns are **Python** regexps, not elisp.
+  read` instead of advice spies — `read`'s JSON carries structured
+  `records` (`{fn, depth, args, ret, error}` per call, completion order;
+  assert on those, never regex the raw text). `faces-at --pos N` /
+  `--run K` reads cells by position / a run at once.
+- Below the command loop (GUI only): `window-info` returns per-frame X11
+  window ids **as ints** + absolute pixel edges per window; `pointer
+  warp/query` drives the REAL pointer (`mouse` synthesizes command-loop
+  events — dnd code reads the live pointer instead); `dnd drop --uris
+  file:///a,file:///b --buffer B` runs a full XDND exchange from an
+  external X client through C dispatch + x-dnd.el (X11 sessions only,
+  needs the `elate[dnd]` extra; rejected drops return `status:
+  "rejected"` with exit 0; `in-debugger: true` + `finished: false` means
+  the drop handler errored — `debug show`).
+- Eval forms run in the **selected window's buffer** (or `--buffer NAME`),
+  so `current-buffer`/point probes see what is on screen. Output truncates
+  at 64 KiB. `wait text` patterns are **Python** regexps, not elisp.
   The default `value` is a printed sexp string — for structured probes use
   `eval --json-result` (real JSON in `value`; fallback flagged by
   `value-encoding`), `eval --raw` (bare value, no envelope, stdout empty on

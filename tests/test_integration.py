@@ -18,7 +18,7 @@ import pytest
 
 from elate import cli
 from elate import session as S
-from elate.errors import ElateError, SessionExists, WaitTimeout
+from elate.errors import ElateError, SessionExists, UsageError, WaitTimeout
 
 HAVE_DEPS = bool(
     shutil.which("emacs") and shutil.which("tmux") and shutil.which("emacsclient")
@@ -908,6 +908,63 @@ def test_trace_on_eval_read_cycle(sess: S.Session) -> None:
     assert S.trace_functions(sess, "read")["output"] == ""
     off = S.trace_functions(sess, "off")
     assert off["all"] is True
+
+
+def test_trace_read_structured_records(sess: S.Session) -> None:
+    sem = sess.semantic()
+    sem.eval_form("(defun elate-tr-rec-sq (x) (* x x))")
+    sem.eval_form("(defun elate-tr-rec-outer (x) (elate-tr-rec-sq (1+ x)))")
+    S.trace_functions(sess, "on", ["elate-tr-rec-sq", "elate-tr-rec-outer"])
+    try:
+        sem.eval_form("(elate-tr-rec-outer 6)")
+        r = S.trace_functions(sess, "read", keep=True)
+        # Records need no regexing: fn/depth/args/ret are fields. Order is
+        # call-completion, so the nested call precedes its caller.
+        assert r["records"] == [
+            {"fn": "elate-tr-rec-sq", "depth": 2, "args": ["7"],
+             "ret": "49", "error": None},
+            {"fn": "elate-tr-rec-outer", "depth": 1, "args": ["6"],
+             "ret": "49", "error": None},
+        ]
+        assert r["records-truncated"] is False
+        # keep=True left the ring intact; a clearing read drains it.
+        assert len(S.trace_functions(sess, "read")["records"]) == 2
+        assert S.trace_functions(sess, "read")["records"] == []
+        # A signalling call records the error and re-signals.
+        sem.eval_form("(ignore-errors (elate-tr-rec-sq \"boom\"))")
+        rec = S.trace_functions(sess, "read")["records"][0]
+        assert rec["fn"] == "elate-tr-rec-sq"
+        assert rec["ret"] is None and "wrong type" in rec["error"].lower()
+    finally:
+        S.trace_functions(sess, "off")
+    # Untracing removes the capture advice: new calls record nothing.
+    sem.eval_form("(elate-tr-rec-sq 3)")
+    assert S.trace_functions(sess, "read")["records"] == []
+
+
+def test_window_info_tty(sess: S.Session) -> None:
+    info = S.window_info(sess)
+    frames = info["frames"]
+    assert frames and frames[0]["selected"] is True
+    frame = frames[0]
+    assert frame["graphic"] is False
+    assert frame["units"] == "chars"
+    assert frame["window-system"] is None
+    assert frame["outer-window-id"] is None
+    assert frame["window-id"] is None
+    assert len(frame["outer-edges"]) == 4
+    assert frame["char-width"] >= 1 and frame["char-height"] >= 1
+    wins = frame["windows"]
+    assert wins and any(w["selected"] for w in wins)
+    for win in wins:
+        assert isinstance(win["buffer"], str)
+        left, top, right, bottom = win["edges"]
+        assert right > left and bottom > top
+
+
+def test_pointer_rejected_on_tty(sess: S.Session) -> None:
+    with pytest.raises(UsageError, match="GUI session"):
+        S.pointer_action(sess, "query")
 
 
 def test_debugger_visibility_wait_idle_and_abort(sess: S.Session) -> None:

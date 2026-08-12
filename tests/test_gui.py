@@ -12,6 +12,7 @@ mechanism is UI-independent by design.
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import os
 import shutil
@@ -26,7 +27,9 @@ import pytest
 from elate import cli
 from elate import gui as G
 from elate import screenshot as shot
+from elate import script as SC
 from elate import session as S
+from elate import xdnd
 from elate.errors import ElateError, RpcError
 
 from _gui_probe import GUI_UNAVAILABLE_REASON
@@ -678,6 +681,92 @@ def test_screenshot_ansi_rejected_on_gui(gui_sess: S.Session,
     assert "TTY" in out["error"]
 
 
+# -- window-info and the real pointer ------------------------------------------
+
+def test_window_info_gui(gui_sess: S.Session) -> None:
+    reset_scratch(gui_sess)
+    info = S.window_info(gui_sess)
+    frame = info["frames"][0]
+    assert frame["selected"] is True and frame["graphic"] is True
+    assert frame["units"] == "pixels"
+    assert frame["window-system"] in ("x", "ns", "pgtk")
+    # Ids are ints or null -- never the decimal strings frame-parameter
+    # prints; on X11 the outer id is what an external XDND client targets.
+    for key in ("outer-window-id", "window-id"):
+        assert frame[key] is None or isinstance(frame[key], int)
+    if frame["window-system"] == "x":
+        assert isinstance(frame["outer-window-id"], int)
+    assert frame["char-width"] > 1 and frame["char-height"] > 1
+    ol, ot, orr, ob = frame["outer-edges"]
+    assert orr > ol and ob > ot
+    win = next(w for w in frame["windows"] if w["selected"])
+    wl, wt, wr, wb = win["edges"]
+    assert wr > wl and wb > wt
+    # A window's absolute pixel edges sit inside its frame's outer edges.
+    assert ol <= wl and wr <= orr and ot <= wt and wb <= ob
+
+
+def test_pointer_warp_query_roundtrip(gui_sess: S.Session) -> None:
+    sem = gui_sess.semantic()
+    frame = S.window_info(gui_sess)["frames"][0]
+    if sys.platform == "darwin" and min(frame["outer-edges"][:2]) < 0:
+        # macOS declines warps to displays at negative global coordinates
+        # (the agent now signals instead of no-opping); where the frame
+        # opens depends on the desktop's monitor arrangement.
+        pytest.skip("frame sits on a display at negative global "
+                    "coordinates; macOS cannot warp the pointer there")
+    before = S.pointer_action(gui_sess, "query")
+    time.sleep(0.4)
+    now = S.pointer_action(gui_sess, "query")
+    if (before["x"], before["y"]) != (now["x"], now["y"]):
+        # A physical mouse in motion overrides warps instantly; that is
+        # a live human, not a bug. CI machines never hit this.
+        pytest.skip("the physical pointer is moving (a human is using "
+                    "this desktop); warps cannot stick")
+    sem.eval_form(
+        '(progn (switch-to-buffer "*scratch*") (delete-other-windows)'
+        ' (erase-buffer)'
+        ' (dotimes (i 6) (insert (format "line-%d-abcdefghij\\n" (1+ i)))))')
+    try:
+        landed = S.pointer_action(gui_sess, "warp", buffer="*scratch*",
+                                  line=3, col=5)
+        assert (landed["buffer"], landed["line"], landed["col"]) \
+            == ("*scratch*", 3, 5)
+        # The reply IS a fresh query: the real pointer moved.
+        again = S.pointer_action(gui_sess, "query")
+        assert (again["x"], again["y"]) == (landed["x"], landed["y"])
+        # The landing point sits inside the window's absolute pixel edges.
+        info = S.window_info(gui_sess)
+        win = next(w for w in info["frames"][0]["windows"] if w["selected"])
+        left, top, right, bottom = win["edges"]
+        assert left <= landed["x"] < right and top <= landed["y"] < bottom
+        # Root-absolute x/y warps work too.
+        moved = S.pointer_action(gui_sess, "warp", x=landed["x"] + 3,
+                                 y=landed["y"])
+        assert moved["x"] == landed["x"] + 3
+    finally:
+        reset_scratch(gui_sess)
+        if isinstance(before.get("x"), int):  # leave the desktop as found
+            try:
+                S.pointer_action(gui_sess, "warp",
+                                 x=before["x"], y=before["y"])
+            except ElateError:
+                pass  # original spot may be un-warpable (other display)
+
+
+def test_pointer_warp_invisible_position_errors(gui_sess: S.Session) -> None:
+    sem = gui_sess.semantic()
+    sem.eval_form(
+        '(progn (switch-to-buffer "*scratch*") (delete-other-windows)'
+        ' (erase-buffer) (dotimes (_ 200) (insert "filler\\n"))'
+        ' (goto-char (point-min)) (redisplay))')
+    try:
+        with pytest.raises(RpcError, match="not visible"):
+            S.pointer_action(gui_sess, "warp", buffer="*scratch*", line=200)
+    finally:
+        reset_scratch(gui_sess)
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"),
                     reason="Xvfb headless GUI is Linux-only")
 def test_headless_xvfb_session(elate_home: str) -> None:  # pragma: no cover
@@ -701,6 +790,234 @@ def test_headless_rejected_on_macos(elate_home: str) -> None:
         S.start_session(f"{NAME}hx", ui="gui", headless=True)
     assert not (S.sessions_root() / f"{NAME}hx" / "session.json").exists() or \
         S.load_session(f"{NAME}hx").status != "running"
+
+
+# -- XDND: real drag-and-drop (Linux/X11 + python-xlib only) --------------------
+#
+# The one CI leg that can run these is "Linux GUI (Xvfb)" (it installs the
+# elate[dnd] extra). Everything protocol-level below goes through
+# S.dnd_drop -> elate.xdnd against the frame's real X window.
+
+XDND_SKIP = (
+    None if sys.platform.startswith("linux")
+    else "XDND drops are X11-only (Linux)"
+) or (None if importlib.util.find_spec("Xlib") is not None
+      else "XDND tests need python-xlib (install the elate[dnd] extra)")
+
+xdnd_only = pytest.mark.skipif(XDND_SKIP is not None, reason=str(XDND_SKIP))
+
+# Observe received drops at the dnd.el layer: the handler fires only after
+# the full path (C event dispatch -> special-event-map -> x-dnd.el ->
+# dnd-protocol-alist) ran, which is exactly what these tests exist to prove.
+DROP_RECORDER = (
+    "(progn"
+    " (setq elate-test-drops nil)"
+    " (defvar elate-test-saved-dnd dnd-protocol-alist)"
+    " (defun elate-test-record-drop (url &optional action)"
+    "   (push (list url action (buffer-name)) elate-test-drops)"
+    "   'private)"
+    " (setq dnd-protocol-alist"
+    "       '((\"\\\\`file:\" . elate-test-record-drop))))"
+)
+
+RESTORE_RECORDER = "(setq dnd-protocol-alist elate-test-saved-dnd)"
+
+
+def _drop_target(sem: Any, name: str = "drop-target") -> None:
+    sem.eval_form(
+        f'(progn (switch-to-buffer "{name}") (delete-other-windows)'
+        ' (erase-buffer)'
+        ' (dotimes (i 8) (insert (format "row-%d\\n" i))))')
+
+
+def _drops(sem: Any) -> str:
+    return sem.eval_form('(format "%S" (reverse elate-test-drops))')["value"]
+
+
+@xdnd_only
+def test_dnd_drop_two_uris_dispatches_handlers(gui_sess: S.Session) -> None:
+    sem = gui_sess.semantic()
+    _drop_target(sem)
+    sem.eval_form(DROP_RECORDER)
+    try:
+        data = S.dnd_drop(gui_sess, uris=["file:///tmp/elate-a",
+                                          "file:///tmp/elate-b"],
+                          buffer="drop-target", line=3, col=2)
+        assert data["status"] == "accepted"
+        assert data["dropped"] is True and data["finished"] is True
+        assert data["served-selection"] is True
+        assert data["in-debugger"] is False
+        drops = _drops(sem)
+        assert "file:///tmp/elate-a" in drops
+        assert "file:///tmp/elate-b" in drops
+        assert drops.index("elate-a") < drops.index("elate-b")  # in order
+        assert "copy" in drops
+        assert "drop-target" in drops  # dispatched in the target's buffer
+    finally:
+        sem.eval_form(RESTORE_RECORDER)
+        reset_scratch(gui_sess)
+
+
+@xdnd_only
+def test_dnd_move_action_reaches_handler(gui_sess: S.Session) -> None:
+    sem = gui_sess.semantic()
+    _drop_target(sem)
+    sem.eval_form(DROP_RECORDER)
+    try:
+        data = S.dnd_drop(gui_sess, uris=["file:///tmp/elate-m"],
+                          buffer="drop-target", line=2, action="move")
+        assert data["status"] == "accepted" and data["finished"] is True
+        assert "move" in _drops(sem)
+    finally:
+        sem.eval_form(RESTORE_RECORDER)
+        reset_scratch(gui_sess)
+
+
+@xdnd_only
+def test_dnd_drop_opens_local_file(gui_sess: S.Session, tmp_path) -> None:
+    # Stock dnd-protocol-alist: the default dnd-open-local-file handler
+    # visits the dropped file -- the full end-to-end a user would see.
+    target = tmp_path / "dropped-file.txt"
+    target.write_text("dropped payload\n", encoding="utf-8")
+    uri = target.resolve().as_uri()
+    sem = gui_sess.semantic()
+    _drop_target(sem)
+    try:
+        data = S.dnd_drop(gui_sess, uris=[uri], buffer="drop-target", line=2)
+        assert data["finished"] is True and data["in-debugger"] is False
+        visiting = sem.eval_form(
+            f'(and (find-buffer-visiting "{target}") t)')["value"]
+        assert visiting == "t"
+    finally:
+        sem.eval_form(f'(let ((b (find-buffer-visiting "{target}")))'
+                      ' (when b (kill-buffer b)))')
+        reset_scratch(gui_sess)
+
+
+@xdnd_only
+def test_dnd_hover_status_without_drop(gui_sess: S.Session) -> None:
+    sem = gui_sess.semantic()
+    _drop_target(sem)
+    sem.eval_form(DROP_RECORDER)
+    try:
+        data = S.dnd_drop(gui_sess, uris=["file:///tmp/elate-h"],
+                          buffer="drop-target", line=2, hover=True,
+                          hover_ms=200)
+        assert data["status"] == "accepted"
+        assert data["dropped"] is False and data["finished"] is False
+        assert "elate-h" not in _drops(sem)  # nothing was dropped
+        # The Leave reset x-dnd's state: a follow-up real drop works.
+        data = S.dnd_drop(gui_sess, uris=["file:///tmp/elate-h"],
+                          buffer="drop-target", line=2)
+        assert data["finished"] is True
+        assert "elate-h" in _drops(sem)
+    finally:
+        sem.eval_form(RESTORE_RECORDER)
+        reset_scratch(gui_sess)
+
+
+@xdnd_only
+def test_dnd_rejected_by_target(gui_sess: S.Session) -> None:
+    sem = gui_sess.semantic()
+    _drop_target(sem)
+    sem.eval_form(DROP_RECORDER)
+    sem.eval_form("(progn"
+                  " (defvar elate-test-saved-tf x-dnd-test-function)"
+                  " (setq x-dnd-test-function (lambda (_w _a _t) nil)))")
+    try:
+        data = S.dnd_drop(gui_sess, uris=["file:///tmp/elate-r"],
+                          buffer="drop-target", line=2)
+        assert data["status"] == "rejected"
+        assert data["dropped"] is False and data["finished"] is False
+        assert "elate-r" not in _drops(sem)
+    finally:
+        sem.eval_form("(setq x-dnd-test-function elate-test-saved-tf)")
+        sem.eval_form(RESTORE_RECORDER)
+        reset_scratch(gui_sess)
+
+
+@xdnd_only
+def test_dnd_target_not_xdnd_aware(gui_sess: S.Session) -> None:
+    from Xlib import display as xdisplay
+    d = xdisplay.Display(os.environ["DISPLAY"])
+    try:
+        root_id = d.screen().root.id
+    finally:
+        d.close()
+    with pytest.raises(xdnd.XdndError) as exc:
+        xdnd.xdnd_drop(os.environ["DISPLAY"], root_id, 10, 10,
+                       ["file:///tmp/elate-x"], timeout=5.0)
+    assert exc.value.reason == "not-aware"
+    assert "window-info" in str(exc.value)
+
+
+@xdnd_only
+def test_dnd_headless_session_uses_recorded_display(
+        elate_home: str) -> None:
+    # The module fixture exercises the os.environ DISPLAY fallback (under
+    # xvfb-run); this one exercises the sess.display path a headless
+    # session records in session.json.
+    name = f"{NAME}dx"
+    sess = S.start_session(name, ui="gui", headless=True, cols=90, rows=30)
+    try:
+        assert sess.display
+        sem = sess.semantic()
+        _drop_target(sem)
+        sem.eval_form(DROP_RECORDER)
+        data = S.dnd_drop(sess, uris=["file:///tmp/elate-hl"],
+                          buffer="drop-target", line=2)
+        assert data["display"] == sess.display
+        assert data["finished"] is True
+        assert "elate-hl" in _drops(sem)
+    finally:
+        S.stop_session(name)
+
+
+@xdnd_only
+def test_dnd_script_verb_runs(gui_sess: S.Session) -> None:
+    sem = gui_sess.semantic()
+    _drop_target(sem, "script-drop")
+    sem.eval_form(DROP_RECORDER)
+    try:
+        script = {
+            "name": "dnd-step",
+            "steps": [
+                {"dnd": ["file:///tmp/elate-s1", "file:///tmp/elate-s2"],
+                 "buffer": "script-drop", "line": 2, "col": 0},
+                {"assert": {"eval": "(= (length elate-test-drops) 2)"}},
+            ],
+        }
+        result = SC.run_script(script, session=gui_sess)
+        assert result["success"] is True, result
+    finally:
+        sem.eval_form(RESTORE_RECORDER)
+        reset_scratch(gui_sess)
+
+
+@xdnd_only
+def test_dnd_handler_error_surfaces_in_debugger(gui_sess: S.Session) -> None:
+    sem = gui_sess.semantic()
+    _drop_target(sem)
+    sem.eval_form("(progn"
+                  " (defvar elate-test-saved-dnd-err dnd-protocol-alist)"
+                  " (defun elate-test-err-drop (_url &optional _action)"
+                  "   (error \"elate dnd handler boom\"))"
+                  " (setq dnd-protocol-alist"
+                  "       '((\"\\\\`file:\" . elate-test-err-drop)))"
+                  " (setq debug-on-error t))")
+    try:
+        data = S.dnd_drop(gui_sess, uris=["file:///tmp/elate-e"],
+                          buffer="drop-target", line=2, timeout=6.0)
+        # Whether Emacs sent XdndFinished before or after dispatching the
+        # handler is version-dependent; the invariant is that the result
+        # itself says the handler is parked in the debugger.
+        assert data["in-debugger"] is True
+        aborted = S.debug_session(gui_sess, "abort")
+        assert aborted["depth-after"] == 0
+    finally:
+        sem.eval_form("(progn (setq debug-on-error nil)"
+                      " (setq dnd-protocol-alist elate-test-saved-dnd-err))")
+        reset_scratch(gui_sess)
 
 
 # -- MCP: gui sessions through the server --------------------------------------

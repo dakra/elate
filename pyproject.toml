@@ -24,6 +24,11 @@ dependencies = [
     "pyobjc-framework-Quartz>=10; sys_platform == 'darwin'",
 ]
 
+# Real XDND drag-and-drop synthesis (`elate dnd`) needs an X11 protocol
+# client; keep it out of the base install (the feature is Linux/X11-only).
+[project.optional-dependencies]
+dnd = ["python-xlib>=0.33"]
+
 [project.urls]
 Homepage = "https://github.com/dakra/elate"
 Repository = "https://github.com/dakra/elate"

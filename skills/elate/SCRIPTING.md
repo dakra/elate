@@ -160,6 +160,7 @@ Timeouts are numbers in `(0, 600]` seconds.
 | `mouse` | `"click"` \| `"double"` \| `"drag"` \| `"wheel"` | `button` (int 1–3, 1); `buffer`; `pos`/`line`/`to_pos`/`to_line` (int >= 1); `col`/`to_col` (int >= 0); `part`: `"text"`(default)/`"mode-line"`; `direction`: `"down"`(default)/`"up"`; `count` (int 1–50, 1); `delivery`: `"macro"`(default)/`"events"`; `timeout` (15) |
 | `focus` | `"in"` \| `"out"` | `frame` (string); `set_focus_state` (bool); `timeout` (15) |
 | `send_events` | non-empty list of event tokens | `buffer`; `frame` (string); `set_focus_state` (bool); `timeout` (15). Tokens: `focus-in`/`focus-out`, `down-mouse-N`/`mouse-N`/`up-mouse-N`/`double-mouse-N`/`wheel-up`/`wheel-down` (N=1–3, optional `@LINE,COL` [1-based line, 0-based col] or `#POS`), `key:KBD`. Focus tokens are auto-split into separate drained batches (a focus event only fires at the head of a command-loop turn). |
+| `dnd` | URI string, or non-empty list of URIs | `buffer`; `pos`/`line` (int >= 1); `col` (int >= 0); `x`/`y` (root-absolute pixels, pair only); `action`: `"copy"`(default)/`"move"`; `hover` (bool: Enter+Position only, no drop); `hover_ms` (int 0–10000, 500); `allow_rejected` (bool); `timeout` (15). Real XDND from an external X client — X11 GUI sessions only, needs the `elate[dnd]` extra. |
 | `test` | ERT selector string (`"t"` = all) | `load_files` (list of paths); `timeout` (60); `allow_unexpected` (bool) |
 | `lint` | non-empty list of file paths | `timeout` (60); `allow_findings` (bool) |
 | `screenshot` | output path, or `null` to embed text | `ansi` (bool, TTY only) |
@@ -168,6 +169,9 @@ Timeouts are numbers in `(0, 600]` seconds.
 
 Failure semantics:
 - An `eval` step fails on an elisp error (backtrace in the step record).
+- A `dnd` step fails when the target rejects the drop **unless**
+  `allow_rejected` (or `hover`), and always fails when the drop handler
+  errors into the Lisp debugger.
 - A `test` step fails on unexpected results or timeout **unless**
   `allow_unexpected` — set it when you'd rather assert exact counts.
 - A `lint` step fails on any finding **unless** `allow_findings`.

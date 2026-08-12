@@ -86,7 +86,7 @@ MAX_STEP_TIMEOUT = 600.0
 _SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
 
 VERBS = ("keys", "type", "eval", "wait", "mouse", "focus", "send_events",
-         "test", "lint", "screenshot", "resize", "assert")
+         "dnd", "test", "lint", "screenshot", "resize", "assert")
 
 # Keys allowed on every step besides the verb itself.
 #   "optional": a failing step does not fail the run and does not stop it
@@ -118,6 +118,8 @@ _STEP_OPTIONS: dict[str, set[str]] = {
               "timeout"},
     "focus": {"frame", "set_focus_state", "timeout"},
     "send_events": {"buffer", "frame", "set_focus_state", "timeout"},
+    "dnd": {"buffer", "pos", "line", "col", "x", "y", "action", "hover",
+            "hover_ms", "timeout", "allow_rejected"},
     "test": {"load_files", "timeout", "allow_unexpected"},
     "lint": {"timeout", "allow_findings"},
     "screenshot": {"ansi"},
@@ -159,7 +161,7 @@ _SESSION_KEYS = {"ui", "size", "config", "init_file", "load", "require",
 
 _DEFAULT_TIMEOUTS = {"keys": 15.0, "eval": 15.0, "wait": 10.0,
                      "mouse": 15.0, "focus": 15.0, "send_events": 15.0,
-                     "test": 60.0, "lint": 60.0}
+                     "dnd": 15.0, "test": 60.0, "lint": 60.0}
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +686,38 @@ def _validate_step(step: Any, index: int) -> None:
         _check_str(step, "buffer", where)
         _check_str(step, "frame", where)
         _check_bool(step, "set_focus_state", where)
+    if verb == "dnd":
+        if isinstance(val, str):
+            uris = [val]
+        elif isinstance(val, list) and val \
+                and all(isinstance(u, str) for u in val):
+            uris = val
+        else:
+            raise ElateError(
+                f'{where}: "dnd" takes a URI string or a non-empty list '
+                'of URIs')
+        for uri in uris:
+            if ":" not in uri:
+                raise ElateError(
+                    f"{where}: {uri!r} is not a URI (no scheme); local "
+                    "files as file:///abs/path")
+            if not uri.isascii():
+                raise ElateError(
+                    f"{where}: {uri!r} is not ASCII; percent-encode it "
+                    "(text/uri-list is ASCII by spec)")
+        if step.get("action", "copy") not in S.DND_ACTIONS:
+            raise ElateError(
+                f"{where}: dnd action must be one of "
+                f"{'/'.join(S.DND_ACTIONS)}, got {step.get('action')!r}")
+        _check_str(step, "buffer", where)
+        for key in ("pos", "line"):
+            _check_int(step, key, where, minimum=1)
+        _check_int(step, "col", where, minimum=0)
+        for key in ("x", "y"):
+            _check_int(step, key, where)
+        _check_int(step, "hover_ms", where, 0, 10000)
+        _check_bool(step, "hover", where)
+        _check_bool(step, "allow_rejected", where)
     if verb == "test" and not isinstance(val, str):
         raise ElateError(f'{where}: "test" takes an ERT selector string')
     if verb == "test":
@@ -1338,6 +1372,28 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
                              frame=step.get("frame"), set_focus_state=set_state,
                              timeout=timeout)
 
+    if verb == "dnd":
+        val = step["dnd"]
+        uris = [val] if isinstance(val, str) else list(val)
+        data = S.dnd_drop(
+            sess, uris=uris, buffer=step.get("buffer"), pos=step.get("pos"),
+            line=step.get("line"), col=step.get("col"), x=step.get("x"),
+            y=step.get("y"), action=step.get("action", "copy"),
+            hover=bool(step.get("hover")),
+            hover_ms=int(step.get("hover_ms", 500)),
+            timeout=_step_timeout(step, verb, defaults), via="script")
+        if data.get("in-debugger"):
+            raise _StepFailure(
+                "the drop handler errored into the Lisp debugger "
+                "(inspect with `debug show`, unwind with `debug abort`)",
+                {"dnd": data})
+        if (data.get("status") == "rejected" and not step.get("hover")
+                and not step.get("allow_rejected")):
+            raise _StepFailure(
+                'target rejected the drop (set "allow_rejected": true to '
+                "assert on the status instead)", {"dnd": data})
+        return data
+
     if verb == "test":
         timeout = _step_timeout(step, verb, defaults)
         load_files = [_resolve(p, base) for p in step.get("load_files") or []]
@@ -1879,6 +1935,18 @@ def _event_step(e: dict[str, Any]) -> dict[str, Any] | None:  # noqa: C901
         t = e.get("timeout")
         if isinstance(t, (int, float)) and t != _DEFAULT_TIMEOUTS["wait"]:
             step["timeout"] = t
+        return step
+    if ev == "dnd" and isinstance(e.get("uris"), list) and e["uris"]:
+        step = {"dnd": e["uris"]}
+        for key in ("buffer", "pos", "line", "col", "x", "y"):
+            if e.get(key) is not None:
+                step[key] = e[key]
+        if e.get("dnd_action") not in (None, "copy"):
+            step["action"] = e["dnd_action"]
+        if e.get("hover"):
+            step["hover"] = True
+            if isinstance(e.get("hover_ms"), int):
+                step["hover_ms"] = e["hover_ms"]
         return step
     if ev == "mouse" and isinstance(e.get("action"), str) \
             and e["action"] in S.MOUSE_ACTIONS:

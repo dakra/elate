@@ -44,6 +44,7 @@ EXPECTED_TOOLS = {
     "elate_keys", "elate_type", "elate_send_process", "elate_mouse",
     "elate_focus", "elate_send_events",
     "elate_eval", "elate_state", "elate_screenshot",
+    "elate_window_info", "elate_pointer", "elate_dnd",
     "elate_buffer", "elate_messages", "elate_echo",
     "elate_wait", "elate_describe",
     "elate_test", "elate_lint", "elate_popups", "elate_faces_at",
@@ -322,6 +323,31 @@ def test_debug_tool_show_and_noop_abort(elate_home: str,
                   {"session": NAME, "action": "abort"})
     assert ab["ok"] is True
     assert ab["scheduled"] is False and ab["depth-after"] == 0
+
+
+def test_window_info_tool(elate_home: str,
+                          mcp_session: dict[str, Any]) -> None:
+    out = one_call(elate_home, "elate_window_info", {"session": NAME})
+    assert out["ok"] is True
+    frame = out["frames"][0]
+    assert frame["units"] == "chars" and frame["outer-window-id"] is None
+    assert any(w["selected"] for w in frame["windows"])
+
+
+def test_pointer_tool_rejects_tty(elate_home: str,
+                                  mcp_session: dict[str, Any]) -> None:
+    out = one_call(elate_home, "elate_pointer",
+                   {"session": NAME, "action": "query"})
+    assert out["ok"] is False
+    assert "GUI session" in out["error"]
+
+
+def test_dnd_tool_validates_before_any_io(elate_home: str,
+                                          mcp_session: dict[str, Any]) -> None:
+    out = one_call(elate_home, "elate_dnd",
+                   {"session": NAME, "uris": ["file:///tmp/x"]})
+    assert out["ok"] is False
+    assert "GUI session" in out["error"]
 
 
 def test_eval_json_result(elate_home: str, mcp_session: dict[str, Any]) -> None:
