@@ -302,7 +302,7 @@ leaked descendants as `orphans`).
 
 Heavy parallel runs: `start --replace` recreates a name in place, `start`
 without `--name` auto-generates one, `stop --all` clears everything
-running, and `elate list --older-than 1h` / `elate purge --all
+running, and `elate list --older-than 1h` / `elate purge
 --stopped-older-than 1h` find and GC stale sandboxes. A successful `elate
 run` purges its own throwaway sandbox; failed runs stay on disk — sweep
 them with `elate purge --glob 'run-*'`.

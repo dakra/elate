@@ -133,7 +133,7 @@ Delete the sandbox directories (transcripts included) of sessions that are no lo
 
 - `[NAME]` (repeatable) -- session to purge (repeatable)
 - `--all` -- purge every session that is not running
-- `--stopped-older-than DUR` -- only purge sessions inert at least this long (e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- keeps just-stopped sandboxes during heavy runs
+- `--stopped-older-than DUR` -- only purge sessions inert at least this long (e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- keeps just-stopped sandboxes during heavy runs; alone it purges every session inert this long
 - `--glob PATTERN` -- purge sessions whose name matches this glob (e.g. 'run-*') -- a bulk selector like --all; running matches are skipped
 - `--name-prefix PREFIX` -- purge sessions whose name starts with PREFIX (e.g. 'run-') -- a bulk selector like --all
 - `--owner NAME` -- purge sessions started with --owner NAME -- a bulk selector like --all; combines with the other filters
@@ -146,7 +146,7 @@ Alias for `purge`: delete the sandbox directories of sessions that are no longer
 
 - `[NAME]` (repeatable) -- session to prune (repeatable)
 - `--all` -- prune every session that is not running
-- `--stopped-older-than DUR` -- only prune sessions inert at least this long (e.g. 30s, 15m, 2h, 1d; bare number = seconds)
+- `--stopped-older-than DUR` -- only prune sessions inert at least this long (e.g. 30s, 15m, 2h, 1d; bare number = seconds); alone it prunes every session inert this long
 - `--glob PATTERN` -- prune sessions whose name matches this glob (e.g. 'run-*') -- a bulk selector like --all
 - `--name-prefix PREFIX` -- prune sessions whose name starts with PREFIX (e.g. 'run-') -- a bulk selector like --all
 - `--owner NAME` -- prune sessions started with --owner NAME -- a bulk selector like --all

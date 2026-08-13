@@ -848,6 +848,11 @@ def test_purge_tool(elate_home: str, mcp_session: dict[str, Any]) -> None:
                            {"session": throwaway}))["ok"] is True
         # A target is required.
         assert (await call(cs, "elate_purge", {}))["ok"] is False
+        # stopped_older_than alone is a selector: nothing is old enough
+        # here, so it sweeps nothing but passes the guard.
+        out = await call(cs, "elate_purge", {"stopped_older_than": 3600})
+        assert out["ok"] is True
+        assert not out["purged"] and throwaway in out["skipped_recent"]
         # Naming the running module session is a loud error -- never deleted.
         assert (await call(cs, "elate_purge", {"names": [NAME]}))["ok"] is False
         # stopped_older_than keeps a just-stopped session (kept, not purged).

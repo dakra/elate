@@ -174,6 +174,19 @@ def test_purge_stopped_older_than_filters_by_age(elate_home: Path):
     assert not (root / "old").exists() and (root / "fresh").is_dir()
 
 
+def test_purge_stopped_older_than_alone_is_a_selector(elate_home: Path):
+    import time as _time
+    root = elate_home / "sessions"
+    now = _time.time()
+    _plant_stopped_registry(root / "old", "old", stopped_at=now - 7200)    # 2h
+    _plant_stopped_registry(root / "fresh", "fresh", stopped_at=now - 60)  # 1m
+    # No names/--all/bulk selector needed: the age bound is the selector.
+    result = S.purge_sessions(stopped_older_than=3600)
+    assert [p["name"] for p in result["purged"]] == ["old"]
+    assert result["skipped_recent"] == ["fresh"]
+    assert not (root / "old").exists() and (root / "fresh").is_dir()
+
+
 def test_purge_all_preserves_foreign_entries(elate_home: Path,
                                              tmp_path: Path):
     """Non-elate files/dirs in sessions_root (no session.json) are never

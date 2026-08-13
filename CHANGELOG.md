@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **`purge --stopped-older-than` works standalone**: the age bound is now
+  a selector in its own right — `elate purge --stopped-older-than 1h`
+  sweeps every session inert at least that long, exactly the command the
+  `elate list` inert-sessions hint suggests (previously it required
+  `--all` alongside and the hinted form was rejected). Same for `prune`
+  and MCP `elate_purge`'s `stopped_older_than`.
+
 ## 0.15.0
 
 Fixes and features from a live GUI/XDND test session's feedback:

@@ -5,7 +5,7 @@
 # skill files change (tests/skill_content_version.txt pins this); `elate
 # start` compares it against installed copies to nudge about staleness.
 name: elate
-version: 0.15.0
+version: 0.16.0
 description: Spawns sandboxed Emacs sessions (terminal or GUI) and drives them
   with keys, mouse, and elisp to test Emacs Lisp interactively - run ERT tests
   in a live session, inspect faces/overlays/popups structurally, lint, profile,
@@ -459,7 +459,7 @@ its own throwaway sandbox on success, so only failed runs pile up — named
 findable: sweep them by pattern with `elate purge --glob 'run-*'` (or a
 targeted `--glob 'run-my-scen-*'`, or `--name-prefix run-`). During a
 long parallel run, GC only the stale ones with `elate
-purge --all --stopped-older-than 1h`, and preview which they are with
+purge --stopped-older-than 1h`, and preview which they are with
 `elate list --older-than 1h`. Sandboxes live under `~/.cache/elate/sessions/<name>`
 (`$ELATE_HOME` overrides the base).
 

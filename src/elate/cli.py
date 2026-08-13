@@ -301,7 +301,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--stopped-older-than", metavar="DUR", type=_parse_duration,
                     help="only purge sessions inert at least this long "
                          "(e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- "
-                         "keeps just-stopped sandboxes during heavy runs")
+                         "keeps just-stopped sandboxes during heavy runs; "
+                         "alone it purges every session inert this long")
     sp.add_argument("--glob", metavar="PATTERN", dest="name_glob",
                     help="purge sessions whose name matches this glob (e.g. "
                          "'run-*') -- a bulk selector like --all; running "
@@ -326,7 +327,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="prune every session that is not running")
     sp.add_argument("--stopped-older-than", metavar="DUR", type=_parse_duration,
                     help="only prune sessions inert at least this long "
-                         "(e.g. 30s, 15m, 2h, 1d; bare number = seconds)")
+                         "(e.g. 30s, 15m, 2h, 1d; bare number = seconds); "
+                         "alone it prunes every session inert this long")
     sp.add_argument("--glob", metavar="PATTERN", dest="name_glob",
                     help="prune sessions whose name matches this glob "
                          "(e.g. 'run-*') -- a bulk selector like --all")

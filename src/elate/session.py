@@ -901,7 +901,9 @@ def purge_sessions(names: Sequence[str] | None = None,
     have been inert at least that long (by their ``idle_for``); fresher
     ones are reported under ``skipped_recent`` and left alone, so a heavy
     parallel run can GC stale sandboxes without touching just-stopped
-    ones.  It composes with both explicit names and ``all_sessions``.
+    ones.  It composes with both explicit names and ``all_sessions``,
+    and on its own it is a selector: every non-running session at least
+    that old is purged.
 
     Running sessions are NEVER purged: naming one is a loud error, and
     under ``all_sessions`` they are skipped and reported.  Before the
@@ -924,11 +926,12 @@ def purge_sessions(names: Sequence[str] | None = None,
     """
     filtered = (name_glob is not None or name_prefix is not None
                 or owner is not None)
-    if not names and not all_sessions and not filtered:
+    if (not names and not all_sessions and not filtered
+            and stopped_older_than is None):
         raise ElateError(
             "purge needs explicit session names, --all, --glob, "
-            "--name-prefix, or --owner (purge --all removes every "
-            "stopped/dead sandbox)")
+            "--name-prefix, --owner, or --stopped-older-than (purge --all "
+            "removes every stopped/dead sandbox)")
     if names and filtered:
         raise ElateError(
             "purge: --glob/--name-prefix/--owner select by pattern and "

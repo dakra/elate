@@ -405,7 +405,8 @@ def elate_purge(
         "Only purge sessions inert at least this many seconds (by their "
         "idle_for); fresher ones are kept and reported under skipped_recent. "
         "Lets a heavy parallel run GC stale sandboxes without removing "
-        "just-stopped ones."))] = None,
+        "just-stopped ones. Alone it is a selector: every session inert at "
+        "least this long is purged."))] = None,
     name_glob: Annotated[str | None, Field(description=(
         "Purge sessions whose name matches this glob (e.g. 'run-*') -- a "
         "bulk selector like all_sessions; running matches are skipped. "
@@ -426,16 +427,18 @@ def elate_purge(
     and reported. Leftover processes of dead sessions are cleaned up first;
     only directories directly under the sessions root are removed (a
     symlinked session dir is unlinked, not followed). Returns purged /
-    skipped_running / skipped_recent / freed_bytes. Pass names or
-    all_sessions (one required); stopped_older_than narrows either.
+    skipped_running / skipped_recent / freed_bytes. Pass names,
+    all_sessions, a bulk selector, or stopped_older_than alone;
+    stopped_older_than also narrows any of the others.
     """
     try:
         names = names or []
         if (not names and not all_sessions and not name_glob
-                and not name_prefix and not owner):
+                and not name_prefix and not owner
+                and stopped_older_than is None):
             raise ElateError(
                 "elate_purge needs names, all_sessions=true, name_glob, "
-                "name_prefix, or owner")
+                "name_prefix, owner, or stopped_older_than")
         return _ok(S.purge_sessions(names, all_sessions=all_sessions,
                                     stopped_older_than=stopped_older_than,
                                     name_glob=name_glob, name_prefix=name_prefix,

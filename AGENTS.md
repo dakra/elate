@@ -15,8 +15,8 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   subcommand. Stopped sessions keep an inert sandbox (and a `stopped`
   list entry) at `~/.cache/elate/sessions/<name>` for their transcripts —
   `elate purge NAME…`/`elate purge --all` deletes them (never running
-  sessions; `prune` is an alias); `elate purge --all --stopped-older-than
-  1h` GCs only stale ones (`elate list --older-than 1h` previews them).
+  sessions; `prune` is an alias); `elate purge --stopped-older-than 1h`
+  GCs only stale ones (`elate list --older-than 1h` previews them).
   `start` auto-names when `--name` is omitted; `start --name X --replace`
   recreates a live `X`; `stop` is idempotent (missing session = no-op) and
   `stop --all` stops every running session.
