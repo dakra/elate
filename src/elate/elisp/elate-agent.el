@@ -682,7 +682,43 @@ only while the selected buffer is unchanged (a switch shows as
                                                   :depth cur-depth))))))))
     (cons :changed (cons (elate--jbool changed) out))))
 
-(defun elate--rpc-state (&optional since)
+(defun elate--shown-buffers ()
+  "The buffers shown in a window on any frame (minibuffers excluded)."
+  (delete-dups (mapcar #'window-buffer (window-list-1 nil 'no-minibuf t))))
+
+(defvar elate--seen-window-buffers (elate--shown-buffers)
+  "Buffers shown in windows at the last baseline-moving `state' call.
+Seeded when the agent loads, before the session's --load/--eval forms
+run, so a window they pop up is news to the first `state'.")
+
+(defconst elate--alert-buffers '("*Warnings*" "*Backtrace*")
+  "Buffers whose window appearing means something went wrong.")
+
+(defun elate--layout-news (&optional peek)
+  "Plist :windows-appeared (buffers newly shown since the last `state'
+call on this session, across frames) and :alerts (visible
+`elate--alert-buffers').  Moves the baseline unless PEEK, so each
+user-facing call reports what appeared since the one before -- a
+*Warnings* split from a missing lexical-binding cookie, a *Backtrace* --
+instead of silently changing every later measurement; internal
+snapshots (error reports, wait polling, script assertions) peek.  A
+window closed and reopened between two calls is not news (the buffer
+is still in the baseline); buffers are tracked as objects, so renaming
+one is not news either."
+  (let* ((cur (elate--shown-buffers))
+         (appeared (seq-remove (lambda (b) (memq b elate--seen-window-buffers))
+                               cur))
+         (names (lambda (bufs) (vconcat (mapcar #'buffer-name bufs)))))
+    (unless peek
+      (setq elate--seen-window-buffers cur))
+    (list :windows-appeared (funcall names appeared)
+          :alerts (funcall names
+                           (seq-filter (lambda (b)
+                                         (member (buffer-name b)
+                                                 elate--alert-buffers))
+                                       cur)))))
+
+(defun elate--rpc-state (&optional since peek)
   "Full scene snapshot, or a delta when SINCE (a prior token) is given.
 Both forms carry a fresh :token and a :mode (\"full\" or \"delta\").  An
 undecodable token, or one minted by a since-restarted Emacs, degrades to
@@ -690,23 +726,38 @@ a full snapshot tagged with :since-status (\"unknown\"/\"stale-session\")
 plus a fresh token, so the caller is never left without usable state.
 Both forms always carry :recursion-depth and :in-debugger (see
 `elate--debug-state') -- a session parked in the Lisp debugger must be
-visible in every snapshot, delta or not."
+visible in every snapshot, delta or not.  Full snapshots always carry
+:windows-appeared and :alerts (see `elate--layout-news'); a delta
+carries them when non-empty.  PEEK leaves the windows-appeared baseline
+alone: internal snapshots pass it, only the user-facing `state' moves it."
   (let* ((snap (elate--state-snapshot))
-         (token (elate--mint-token snap)))
+         (token (elate--mint-token snap))
+         (news (elate--layout-news peek)))
     (append
      (elate--debug-state)
      (if (not since)
-         (append (elate--state-full) (list :mode "full" :token token))
+         (append (elate--state-full) news (list :mode "full" :token token))
        (let ((base (elate--decode-token since)))
          (cond
           ((null base)
-           (append (elate--state-full)
+           (append (elate--state-full) news
                    (list :mode "full" :since-status "unknown" :token token)))
           ((not (equal (gethash "ep" base) (emacs-pid)))
-           (append (elate--state-full)
+           (append (elate--state-full) news
                    (list :mode "full" :since-status "stale-session" :token token)))
-          (t (append (elate--state-delta base snap)
-                     (list :mode "delta" :token token)))))))))
+          (t (let ((delta (elate--state-delta base snap)))
+               ;; A window appearing is a change even when no buffer did
+               ;; (an existing buffer shown anew); alerts ride along only
+               ;; while present, like every other delta key.
+               (when (> (length (plist-get news :windows-appeared)) 0)
+                 (plist-put delta :changed t)
+                 (setq delta (append delta
+                                     (list :windows-appeared
+                                           (plist-get news :windows-appeared)))))
+               (when (> (length (plist-get news :alerts)) 0)
+                 (setq delta (append delta
+                                     (list :alerts (plist-get news :alerts)))))
+               (append delta (list :mode "delta" :token token))))))))))
 
 (defun elate--state-full ()
   "One-call snapshot of the full interactive scene.
@@ -1049,6 +1100,122 @@ line/col to pixel math).  On a TTY frame edges are character cells
                                         (window-list f))))))
             frames)))))
 
+
+(defun elate--eval-defun (path name)
+  "Evaluate the top-level definition of NAME in the file at PATH.
+The last `(def... NAME' form whose head is a definer (a macro or
+special form: defun, defmacro, defvar, defcustom, cl-defmethod,
+define-minor-mode, cl-defstruct, ...; the last wins as under `load',
+so a forward `(defvar NAME)' does not shadow the real definition) is
+read with the Lisp reader and evaluated in the current buffer under the
+file's lexical-binding cookie, with `load-file-name' bound to PATH.
+Returns a plist (:name :type :line :lexical) describing what ran.
+Loads nothing else from the file: the point is swapping one definition
+in or out, e.g. the version from another git revision."
+  (let ((sym (intern name)) found lexical)
+    (with-temp-buffer
+      (insert-file-contents path)
+      (delay-mode-hooks (emacs-lisp-mode))
+      (let ((enable-local-variables :safe))
+        (hack-local-variables))
+      (setq lexical lexical-binding)
+      (goto-char (point-min))
+      (let ((re (concat "^(\\(?:cl-\\)?def[a-z-]*[ \t\n]+"
+                        (regexp-quote name) "\\_>")))
+        (while (re-search-forward re nil t)
+          (let* ((start (match-beginning 0))
+                 (form (condition-case err
+                           (progn (goto-char start) (read (current-buffer)))
+                         (error
+                          (error "elate: cannot read the definition at %s:%d: %s"
+                                 path (line-number-at-pos start)
+                                 (error-message-string err)))))
+                 (head (car-safe form))
+                 (what (car-safe (cdr-safe form))))
+            (if (and (symbolp head) (or (macrop head) (special-form-p head))
+                     (or (eq what sym) (eq (car-safe what) sym)))
+                (setq found (cons form (line-number-at-pos start)))
+              (goto-char (match-end 0)))))))
+    (unless found
+      (error "elate: no top-level definition of %s in %s" name path))
+    (let ((load-file-name path))
+      (eval (car found) lexical))
+    (list :name name :type (symbol-name (car (car found)))
+          :line (cdr found)
+          :lexical (and lexical t))))
+
+(defun elate--rpc-lines (&optional bufname)
+  "Display geometry of every screen line in the window showing BUFNAME.
+BUFNAME nil means the selected window.  Each line: :index (0-based
+screen row; rows a multi-line display string owns have no buffer start
+and are skipped), :start / :end (buffer positions; the line covers
+start..end, end being where the next screen line starts, so a wrapped
+buffer line yields several entries), :line (absolute buffer line
+number of :start, ignoring narrowing), :y (top edge relative to the
+text area, below any tab/header line -- the frame of `mouse' x/y;
+negative when vscroll hides part of the first row), :height (visible
+pixel height), :clipped-top / :clipped-bottom (pixels hidden above /
+below the window) and :partial.  Window fields: :start / :end
+\(window-start, window-end), :vscroll (pixels), :hscroll (columns),
+:body-width / :body-height (text area pixels), :text-area (frame pixel
+edges), the char cell size and the tab/header/mode line heights.  On a
+TTY frame a pixel is a character cell (:units \"chars\").  Everything
+reflects the last redisplay, like `window-line-height' itself: :lines
+is empty when the window has not been redisplayed since its buffer
+changed."
+  (let* ((win (elate--mouse-window bufname (selected-window)))
+         (frame (window-frame win))
+         (start (window-start win))
+         (end (window-end win))
+         ;; `window-line-height' y is window-relative; the text area
+         ;; (where `mouse' x/y live) starts below the tab/header lines.
+         (yoff (+ (window-tab-line-height win) (window-header-line-height win)))
+         (rows nil))
+    (with-current-buffer (window-buffer win)
+      (save-excursion
+        (goto-char start)
+        (let ((vpos 0) (done nil))
+          (while (not done)
+            (let* ((pos (point))
+                   (wlh (window-line-height vpos win))
+                   (vis (pos-visible-in-window-p pos win t)))
+              ;; `window-line-height' clamps a row index past the last
+              ;; displayed row to that row instead of returning nil; the
+              ;; visibility of the row's start position is the reliable
+              ;; stop (a partially visible bottom row still counts).
+              (if (or (null wlh) (null vis))
+                  (setq done t)
+                (let ((moved (vertical-motion 1 win))
+                      (top (or (and vis (nth 2 vis)) 0))
+                      (bottom (nth 3 wlh)))
+                  (push (list :index vpos
+                              :start pos :end (point)
+                              :line (line-number-at-pos pos t)
+                              :y (- (nth 2 wlh) yoff) :height (nth 0 wlh)
+                              :clipped-top top :clipped-bottom bottom
+                              :partial (elate--jbool (or (> top 0)
+                                                         (> bottom 0))))
+                        rows)
+                  ;; A multi-line display string spans several rows in
+                  ;; one motion; follow the rows actually crossed.
+                  (setq vpos (+ vpos (max moved 1)))
+                  (when (or (zerop moved) (<= (point) pos) (> (point) end))
+                    (setq done t)))))))))
+    (list :buffer (buffer-name (window-buffer win))
+          :units (if (display-graphic-p frame) "pixels" "chars")
+          :start start :end end
+          :vscroll (window-vscroll win t)
+          :hscroll (window-hscroll win)
+          :body-width (window-body-width win t)
+          :body-height (window-body-height win t)
+          :text-area (vconcat (window-inside-pixel-edges win))
+          :char-width (frame-char-width frame)
+          :char-height (frame-char-height frame)
+          :tab-line-height (window-tab-line-height win)
+          :header-line-height (window-header-line-height win)
+          :mode-line-height (window-mode-line-height win)
+          :lines (vconcat (nreverse rows)))))
+
 ;;;; Mouse synthesis
 ;;
 ;; Mouse events are synthesized inside Emacs: build a real posn at the
@@ -1076,63 +1243,222 @@ pos/line/col clamp to the nearest valid position."
                (point)))
        (t (window-point win))))))
 
-(defun elate--mouse-posn (win target)
-  "A posn in WIN at the place TARGET describes.
-TARGET is an alist with either part=\"mode-line\" (+ optional col, a
-character offset into the mode line) or a buffer location (pos, or
-line + col; default: window-point).  Buffer positions must be visible
-in WIN -- scrolling on the caller's behalf would be a side effect."
-  (if (equal (alist-get 'part target) "mode-line")
-      (let* ((frame (window-frame win))
-             (edges (window-pixel-edges win))
-             (col (or (alist-get 'col target) 1))
-             (x (min (+ (nth 0 edges) (* col (frame-char-width frame)))
-                     (- (nth 2 edges) 1)))
-             (y (- (nth 3 edges) 1))
-             (posn (posn-at-x-y x y frame t)))
-        (unless (and posn (eq (posn-area posn) 'mode-line))
-          (error "elate: cannot hit the mode line of %s at column %d"
-                 win col))
-        posn)
-    (let* ((pos (elate--mouse-resolve-pos win target))
-           (posn (posn-at-point pos win)))
-      (unless posn
-        (error (concat "elate: position %d is not visible in window %s; "
-                       "scroll it into view first, e.g. eval "
-                       "(with-selected-window (get-buffer-window %S) "
-                       "(goto-char %d) (recenter))")
-               pos win (buffer-name (window-buffer win)) pos))
-      posn)))
+(defun elate--seed-mouse-event-kinds ()
+  "Give the synthesized mouse event symbols the `event-kind' the C layer sets.
+Emacs puts `event-kind' on mouse-N (and its down-/drag-/double- variants)
+only when it generates the first real event of that kind, so a sandboxed
+Emacs that never saw a real click has none.  `read-key-sequence' keys the
+mode-line/fringe prefix expansion and the switch to the clicked buffer's
+keymaps on that property: without it a synthesized mode-line click
+dispatches as a plain `mouse-1' looked up in the current buffer."
+  (dolist (button '(1 2 3))
+    (dolist (mod '("" "down-" "up-" "drag-"
+                   "double-" "double-down-" "double-drag-"))
+      (let ((sym (intern (format "%smouse-%d" mod button))))
+        (unless (get sym 'event-kind)
+          (put sym 'event-kind 'mouse-click)))))
+  (dolist (sym '(wheel-up wheel-down))
+    (unless (get sym 'event-kind)
+      (put sym 'event-kind 'mouse-click))))
 
-(defun elate--mouse-events (action button posn win to direction count)
-  "The event sequence implementing ACTION at POSN, as a list.
-BUTTON is the mouse button number (1-3).  For drag, TO describes the
-destination in WIN (resolved via `elate--mouse-posn').  For wheel,
-DIRECTION is \"up\" or \"down\" and COUNT the number of notches."
-  (let* ((down (intern (format "down-mouse-%d" button)))
-         (click (intern (format "mouse-%d" button)))
-         ;; In special areas (mode line), a down event would enter the
-         ;; binding's mouse-tracking loop (e.g. mouse-drag-mode-line),
-         ;; which wedges without real motion events; the bare click
-         ;; event is what mode-line bindings fire on.
-         (special (posn-area posn)))
+(elate--seed-mouse-event-kinds)
+
+(defconst elate--mouse-areas
+  '(("mode-line" . mode-line) ("header-line" . header-line)
+    ("tab-line" . tab-line) ("left-fringe" . left-fringe)
+    ("right-fringe" . right-fringe) ("left-margin" . left-margin)
+    ("right-margin" . right-margin))
+  "Mouse target part names and the `posn-area' symbol each resolves to.")
+
+(defun elate--mouse-window (bufname default)
+  "The window showing buffer BUFNAME (on any frame), or DEFAULT when nil."
+  (if bufname
+      (or (get-buffer-window bufname t)
+          (error (concat "elate: buffer %S is not displayed in any window; "
+                         "show it first, e.g. eval (pop-to-buffer %S)")
+                 bufname bufname))
+    default))
+
+(defun elate--text-posn (win target)
+  "The `posn-at-point' posn in WIN at TARGET's buffer location."
+  (let* ((pos (elate--mouse-resolve-pos win target))
+         (posn (posn-at-point pos win)))
+    (unless posn
+      (error (concat "elate: position %d is not visible in window %s; "
+                     "scroll it into view first, e.g. eval "
+                     "(with-selected-window (get-buffer-window %S) "
+                     "(goto-char %d) (recenter))")
+             pos win (buffer-name (window-buffer win)) pos))
+    posn))
+
+(defun elate--text-xy (win target)
+  "Frame pixel (X . Y) of the glyph top-left at TARGET's location in WIN.
+A text-area posn's x/y are relative to the window's text area."
+  (let ((inside (window-inside-pixel-edges win))
+        (xy (posn-x-y (elate--text-posn win target))))
+    (cons (+ (nth 0 inside) (car xy)) (+ (nth 1 inside) (cdr xy)))))
+
+(defun elate--scan-area (frame area fixed from to horizontal)
+  "First frame pixel (X . Y) whose posn lies in AREA, scanning FROM..TO.
+The scanned coordinate is x when HORIZONTAL, else y; FIXED is the other
+one.  Nil when no probe hits AREA."
+  (let ((step (if (<= from to) 1 -1)) (v from) found)
+    (while (and (not found) (if (> step 0) (<= v to) (>= v to)))
+      (let* ((xy (if horizontal (cons v fixed) (cons fixed v)))
+             (posn (posn-at-x-y (car xy) (cdr xy) frame t)))
+        (if (and posn (eq (posn-area posn) area))
+            (setq found xy)
+          (setq v (+ v step)))))
+    found))
+
+(defun elate--line-filler-x (frame xy left step)
+  "XY moved left, by STEP pixels at a time, off constructs with a keymap.
+A mode/header/tab line construct carrying a `local-map' or `keymap'
+text property runs that map instead of the global [AREA mouse-N]
+binding; the rightmost spot without one (filler on a stock mode line)
+is where \"click the mode line\" means the global binding.  Falls back
+to XY when every column down to LEFT has a map (a narrow window whose
+mode line is all constructs)."
+  (let ((x (car xy)) (y (cdr xy)) (found nil))
+    (while (and (not found) (>= x left))
+      (let* ((str (posn-string (posn-at-x-y x y frame t))))
+        (if (and (consp str) (stringp (car str))
+                 (or (get-text-property (cdr str) 'local-map (car str))
+                     (get-text-property (cdr str) 'keymap (car str))))
+            (setq x (- x step))
+          (setq found (cons x y)))))
+    (or found xy)))
+
+(defun elate--area-xy (win part target)
+  "Frame pixel (X . Y) inside window part PART of WIN, per TARGET.
+Mode/header/tab line: the column is TARGET's col (character offset
+from the window's left edge; default: the rightmost column whose
+construct has no keymap of its own, see `elate--line-filler-x').  Fringes/margins:
+the row is that of TARGET's buffer location (pos, or line + col;
+default: window-point).  Errors when WIN has no such part."
+  (let* ((frame (window-frame win))
+         (area (cdr (assoc part elate--mouse-areas)))
+         (edges (window-pixel-edges win))
+         (left (nth 0 edges)) (top (nth 1 edges))
+         (right (1- (nth 2 edges))) (bottom (1- (nth 3 edges)))
+         ;; The rightmost char cell of a non-rightmost window's mode line
+         ;; is the vertical-line grab zone, not the mode line.
+         (line-right (- (nth 2 edges) (frame-char-width frame)
+                        (window-right-divider-width win)))
+         (xy (pcase area
+               ((or 'mode-line 'header-line 'tab-line)
+                (let* ((col (alist-get 'col target))
+                       (x (if col
+                              (min (+ left (* col (frame-char-width frame)))
+                                   line-right)
+                            line-right))
+                       (xy (if (eq area 'mode-line)
+                               (elate--scan-area frame area x bottom top nil)
+                             (elate--scan-area frame area x top bottom nil))))
+                  (if (or col (null xy))
+                      xy
+                    (elate--line-filler-x frame xy left
+                                          (frame-char-width frame)))))
+               ((or 'left-fringe 'left-margin)
+                (elate--scan-area frame area (cdr (elate--text-xy win target))
+                                  left right t))
+               ((or 'right-fringe 'right-margin)
+                (elate--scan-area frame area (cdr (elate--text-xy win target))
+                                  right left t))
+               (_ (error "elate: unknown mouse target part %S" part)))))
+    (or xy
+        (error "elate: window %s (%s) has no %s%s" win
+               (buffer-name (window-buffer win)) part
+               (pcase area
+                 ('mode-line "")
+                 ('header-line " (header-line-format is nil)")
+                 ('tab-line " (tab-line-format is nil)")
+                 ((or 'left-fringe 'right-fringe)
+                  " (zero width; TTY frames have none)")
+                 (_ " (zero width; see set-window-margins)"))))))
+
+(defun elate--mouse-target (win target)
+  "The posn in WIN at the place TARGET describes, consed with its frame xy.
+TARGET is an alist: part (\"text\", a name in `elate--mouse-areas', or
+\"outside\": a frame posn off every window), a location inside the
+part (pos, or line + col; col alone for the mode/header/tab line --
+see `elate--area-xy'), or instead x + y, pixels relative to the text
+area's top-left (relative to the frame for \"outside\", default (-1 . 0)),
+plus dx + dy pixel offsets applied last.  Buffer positions must be
+visible in WIN -- scrolling on the caller's behalf would be a side
+effect.  The cdr is
+the frame pixel (X . Y) the posn was built at, the coordinate system
+`posn-at-x-y' takes for interpolating a drag path."
+  (let* ((frame (window-frame win))
+         (part (or (alist-get 'part target) "text"))
+         (x (alist-get 'x target)) (y (alist-get 'y target))
+         (dx (or (alist-get 'dx target) 0))
+         (dy (or (alist-get 'dy target) 0))
+         (plain (and (equal part "text") (not x) (zerop dx) (zerop dy)))
+         (xy (cond
+              ((equal part "outside") (cons (or x -1) (or y 0)))
+              (x (let ((inside (window-inside-pixel-edges win)))
+                   (cons (+ (nth 0 inside) x) (+ (nth 1 inside) y))))
+              ((equal part "text") (elate--text-xy win target))
+              (t (elate--area-xy win part target))))
+         (xy (cons (+ (car xy) dx) (+ (cdr xy) dy)))
+         (posn (progn
+                 (when (or (< (car xy) -1) (< (cdr xy) 0))
+                   (error "elate: target (%d, %d) lies left of or above the frame"
+                          (car xy) (cdr xy)))
+                 (if plain
+                     (elate--text-posn win target)
+                   (posn-at-x-y (car xy) (cdr xy) frame t)))))
+    (when (and (not (equal part "outside")) (not x) (zerop dx) (zerop dy)
+               (not (eq (posn-area posn) (cdr (assoc part elate--mouse-areas)))))
+      (error "elate: %s target in %s resolved to %s instead" part win
+             (or (posn-area posn) "buffer text")))
+    (cons posn xy)))
+
+(defun elate--mouse-posn (win target)
+  "The posn in WIN at the place TARGET describes (see `elate--mouse-target')."
+  (car (elate--mouse-target win target)))
+
+(defun elate--mouse-path (from to steps frame)
+  "STEPS posns spread evenly along the straight line FROM -> TO.
+FROM and TO are frame-relative pixel (X . Y) conses; the last posn is at
+TO itself."
+  (let (path)
+    (dotimes (i steps)
+      (let* ((k (/ (float (1+ i)) steps))
+             (x (round (+ (car from) (* k (- (car to) (car from))))))
+             (y (round (+ (cdr from) (* k (- (cdr to) (cdr from)))))))
+        (push (posn-at-x-y x y frame t) path)))
+    (nreverse path)))
+
+(defun elate--mouse-events (action button target to direction count steps)
+  "The event sequence implementing ACTION at TARGET, as a list.
+TARGET (and, for drag, the destination TO) is an `elate--mouse-target'
+cons; BUTTON the mouse button number (1-3).  For drag, STEPS is the
+number of `mouse-movement' events emitted along the way, between the
+down and the drag event; they are delivered regardless of `track-mouse',
+so the down binding's own tracking scope sees them like real motion.
+For wheel, DIRECTION is \"up\" or \"down\" and COUNT the number of
+notches."
+  (let* ((posn (car target))
+         (down (intern (format "down-mouse-%d" button)))
+         (click (intern (format "mouse-%d" button))))
     (pcase action
       ("click"
-       (if special
-           (list (list click posn 1))
-         (list (list down posn 1) (list click posn 1))))
+       (list (list down posn 1) (list click posn 1)))
       ("double"
        (let ((ddown (intern (format "double-down-mouse-%d" button)))
              (dclick (intern (format "double-mouse-%d" button))))
-         (if special
-             (list (list click posn 1) (list dclick posn 2))
-           (list (list down posn 1) (list click posn 1)
-                 (list ddown posn 2) (list dclick posn 2)))))
+         (list (list down posn 1) (list click posn 1)
+               (list ddown posn 2) (list dclick posn 2))))
       ("drag"
-       (let ((to-posn (elate--mouse-posn win to)))
-         (list (list down posn 1)
-               (list (intern (format "drag-mouse-%d" button))
-                     posn to-posn))))
+       (append
+        (list (list down posn 1))
+        (mapcar (lambda (p) (list 'mouse-movement p))
+                (elate--mouse-path (cdr target) (cdr to) steps
+                                   (window-frame (posn-window posn))))
+        (list (list (intern (format "drag-mouse-%d" button))
+                    posn (car to)))))
       ("wheel"
        (make-list count
                   (list (if (equal direction "up") 'wheel-up 'wheel-down)
@@ -1141,8 +1467,8 @@ DIRECTION is \"up\" or \"down\" and COUNT the number of notches."
 
 (defun elate--rpc-mouse (payload-b64)
   "Synthesize the mouse interaction described by PAYLOAD-B64 (base64 JSON).
-Payload: {action, button, direction, count, delivery,
-target: {buffer, pos, line, col, part}, to: {pos, line, col}}.
+Payload: {action, button, direction, count, steps, delivery,
+target: {buffer, pos, line, col, part, x, y, dx, dy}, to: (same keys)}.
 Delivery \"macro\" (default) dispatches synchronously via
 `execute-kbd-macro'; \"events\" queues on `unread-command-events' (use
 when the triggered command itself reads input)."
@@ -1152,34 +1478,71 @@ when the triggered command itself reads input)."
          (action (alist-get 'action payload))
          (button (or (alist-get 'button payload) 1))
          (count (or (alist-get 'count payload) 1))
+         (steps (or (alist-get 'steps payload) 0))
          (direction (or (alist-get 'direction payload) "down"))
          (delivery (or (alist-get 'delivery payload) "macro"))
          (target (alist-get 'target payload))
-         (bufname (alist-get 'buffer target))
-         (win (if bufname
-                  (or (get-buffer-window bufname)
-                      (error (concat "elate: buffer %S is not displayed in "
-                                     "any window; show it first, e.g. eval "
-                                     "(pop-to-buffer %S)")
-                             bufname bufname))
-                (selected-window)))
-         (posn (elate--mouse-posn win target))
-         (events (elate--mouse-events action button posn win
-                                      (alist-get 'to payload)
-                                      direction count)))
+         (win (elate--mouse-window (alist-get 'buffer target)
+                                   (selected-window)))
+         (resolved (elate--mouse-target win target))
+         (posn (car resolved))
+         (to (alist-get 'to payload))
+         (to-resolved (when (equal action "drag")
+                        (elate--mouse-target
+                         (elate--mouse-window (alist-get 'buffer to) win) to)))
+         (events (elate--mouse-events action button resolved to-resolved
+                                      direction count steps)))
     (pcase delivery
       ("events"
        (setq unread-command-events
              (nconc unread-command-events (copy-sequence events))))
-      ("macro" (execute-kbd-macro (vconcat events)))
+      ("macro"
+       (condition-case err
+           (execute-kbd-macro (vconcat events))
+         (user-error
+          ;; `undefined' (an unbound key) dings, and a ding aborts the
+          ;; macro with this generic message; say where the click went.
+          (if (string-match-p "ringing the bell" (error-message-string err))
+              (error (concat "elate: Emacs rang the bell dispatching %s "
+                             "mouse-%d at %s in %s%s -- an unbound key "
+                             "there (e.g. [%smouse-%d]) or a command that "
+                             "dinged")
+                     action button
+                     (or (posn-area posn) (if (windowp (posn-window posn))
+                                              "buffer text" "no window"))
+                     (if (windowp (posn-window posn))
+                         (buffer-name (window-buffer (posn-window posn)))
+                       "the frame")
+                     (if to-resolved
+                         (format " (drag end: %s)"
+                                 (plist-get (elate--posn-summary to-resolved)
+                                            :area))
+                       "")
+                     (if (posn-area posn) (format "%s " (posn-area posn)) "")
+                     button)
+            (signal (car err) (cdr err))))))
       (other (error "elate: unknown mouse delivery %S" other)))
-    (list :action action
-          :button button
-          :buffer (buffer-name (window-buffer win))
-          :area (if (posn-area posn) (format "%s" (posn-area posn)) :null)
-          :pos (elate--jnull (posn-point posn))
-          :events (length events)
-          :delivered delivery)))
+    (append
+     (list :action action
+           :button button
+           :events (length events)
+           :delivered delivery)
+     (elate--posn-summary resolved)
+     (when to-resolved
+       (list :to (elate--posn-summary to-resolved))))))
+
+(defun elate--posn-summary (resolved)
+  "Result plist for RESOLVED (an `elate--mouse-target' cons).
+:area is the posn's area, \"outside\" for a frame posn off every window,
+or null for buffer text; :x/:y are frame pixels (cells on a TTY)."
+  (let* ((posn (car resolved)) (w (posn-window posn)))
+    (list :buffer (if (windowp w) (buffer-name (window-buffer w)) :null)
+          :area (cond ((not (windowp w)) "outside")
+                      ((posn-area posn) (format "%s" (posn-area posn)))
+                      (t :null))
+          :pos (elate--jnull (and (windowp w) (posn-point posn)))
+          :x (car (cdr resolved))
+          :y (cdr (cdr resolved)))))
 
 ;;;; System pointer (warp / query)
 ;;
@@ -1352,6 +1715,10 @@ after focus-out)."
   (unless (advice-member-p #'elate--focus-state-override 'frame-focus-state)
     (advice-add 'frame-focus-state :override #'elate--focus-state-override)))
 
+(defvar elate--event-last-down nil
+  "Posn of the latest down-mouse spec in the `send-events' batch being built.
+A drag-mouse spec starts its drag there, as the C layer would.")
+
 (defun elate--event-from-spec (spec win frame)
   "The Emacs event(s) for one decoded SPEC (an alist), as a list.
 WIN is the target window for mouse locations; FRAME the frame for focus
@@ -1368,10 +1735,19 @@ exactly one, so the caller `append's the results into one ordered stream."
             (button (or (alist-get 'button spec) 1))
             (posn (elate--mouse-posn win (alist-get 'loc spec))))
        (pcase event
-         ((or "wheel-up" "wheel-down")
+         ((or "wheel-up" "wheel-down" "mouse-movement")
           (list (list (intern event) posn)))
          ("double-mouse"
           (list (list (intern (format "double-mouse-%d" button)) posn 2)))
+         ("drag-mouse"
+          (unless elate--event-last-down
+            (error "elate: drag-mouse-%d needs a down-mouse-%d earlier in the same batch (a focus token starts a new batch)"
+                   button button))
+          (list (list (intern (format "drag-mouse-%d" button))
+                      elate--event-last-down posn)))
+         ("down-mouse"
+          (setq elate--event-last-down posn)
+          (list (list (intern (format "down-mouse-%d" button)) posn 1)))
          (_ (list (list (intern (format "%s-%d" event button)) posn 1))))))
     (other (error "elate: unknown event spec type %S" other))))
 
@@ -1397,6 +1773,7 @@ installs the (non-native) `frame-focus-state' shim."
                                      "(pop-to-buffer %S)")
                              bufname bufname))
                 (selected-window)))
+         (elate--event-last-down nil)
          (events (apply #'append
                         (mapcar (lambda (s) (elate--event-from-spec s win frame))
                                 specs))))

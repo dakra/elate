@@ -113,9 +113,10 @@ _STEP_OPTIONS: dict[str, set[str]] = {
     "type": set(),
     "eval": {"timeout", "buffer"},
     "wait": {"pattern", "pred", "buffer", "timeout", "min_idle"},
-    "mouse": {"button", "buffer", "pos", "line", "col", "part", "to_pos",
-              "to_line", "to_col", "direction", "count", "delivery",
-              "timeout"},
+    "mouse": {"button", "buffer", "pos", "line", "col", "part", "x", "y",
+              "dx", "dy", "to_buffer", "to_pos", "to_line", "to_col",
+              "to_part", "to_x", "to_y", "to_dx", "to_dy", "steps",
+              "direction", "count", "delivery", "timeout"},
     "focus": {"frame", "set_focus_state", "timeout"},
     "send_events": {"buffer", "frame", "set_focus_state", "timeout"},
     "dnd": {"buffer", "pos", "line", "col", "x", "y", "action", "hover",
@@ -653,17 +654,24 @@ def _validate_step(step: Any, index: int) -> None:
             raise ElateError(
                 f"{where}: mouse delivery must be macro/events, "
                 f"got {step.get('delivery')!r}")
-        if step.get("part", "text") not in ("text", "mode-line"):
-            raise ElateError(
-                f"{where}: mouse part must be text/mode-line, "
-                f"got {step.get('part')!r}")
+        for key in ("part", "to_part"):
+            if step.get(key, "text") not in S.MOUSE_PARTS:
+                raise ElateError(
+                    f"{where}: mouse {key} must be one of "
+                    f"{'/'.join(S.MOUSE_PARTS)}, got {step.get(key)!r}")
         if step.get("direction", "down") not in ("up", "down"):
             raise ElateError(
                 f"{where}: mouse direction must be up/down, "
                 f"got {step.get('direction')!r}")
         _check_str(step, "buffer", where)
+        _check_str(step, "to_buffer", where)
+        for key in ("x", "y", "dx", "dy", "to_x", "to_y", "to_dx", "to_dy"):
+            _check_int(step, key, where)
         _check_int(step, "button", where, 1, 3)
         _check_int(step, "count", where, 1, 50)
+        _check_int(step, "steps", where, 0, 200)
+        if step.get("steps") and val != "drag":
+            raise ElateError(f"{where}: mouse steps only applies to drag")
         for key in ("pos", "line", "to_pos", "to_line"):
             _check_int(step, key, where, minimum=1)
         for key in ("col", "to_col"):
@@ -1344,10 +1352,16 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
             action=step["mouse"], button=int(step.get("button", 1)),
             buffer=step.get("buffer"), pos=step.get("pos"),
             line=step.get("line"), col=step.get("col"),
-            part=step.get("part", "text"), to_pos=step.get("to_pos"),
+            part=step.get("part", "text"), x=step.get("x"), y=step.get("y"),
+            dx=int(step.get("dx", 0)), dy=int(step.get("dy", 0)),
+            to_buffer=step.get("to_buffer"), to_pos=step.get("to_pos"),
             to_line=step.get("to_line"), to_col=step.get("to_col"),
+            to_part=step.get("to_part", "text"), to_x=step.get("to_x"),
+            to_y=step.get("to_y"), to_dx=int(step.get("to_dx", 0)),
+            to_dy=int(step.get("to_dy", 0)),
             direction=step.get("direction", "down"),
             count=int(step.get("count", 1)),
+            steps=int(step.get("steps", 0)),
             delivery=step.get("delivery", "macro"),
         )
         sess.log("mouse", via="script", **kwargs)
@@ -1568,7 +1582,7 @@ def _eval_assert(sess: S.Session, spec: dict[str, Any],
         return {"buffer": data.get("name"), "matched": val}
 
     if kind == "state":
-        state = sess.semantic().rpc("state")
+        state = sess.semantic().rpc("state", None, True)
         mismatches = {}
         for path, expected in val.items():
             actual = _dig(state, path)
@@ -1707,7 +1721,7 @@ def _capture_snapshot(sess: S.Session, of: str,
         data = sess.semantic().rpc("buffer", spec.get("buffer"),
                                    spec.get("from"), spec.get("to"), True)
         return _canon_json(_normalize_faces(data)), ".faces.json"
-    data = sess.semantic().rpc("state")
+    data = sess.semantic().rpc("state", None, True)
     return _canon_json(_normalize_state(data)), ".state.json"
 
 
@@ -1956,14 +1970,20 @@ def _event_step(e: dict[str, Any]) -> dict[str, Any] | None:  # noqa: C901
     if ev == "mouse" and isinstance(e.get("action"), str) \
             and e["action"] in S.MOUSE_ACTIONS:
         step = {"mouse": e["action"]}
-        for key in ("buffer", "pos", "line", "col",
-                    "to_pos", "to_line", "to_col"):
+        for key in ("buffer", "pos", "line", "col", "x", "y",
+                    "to_buffer", "to_pos", "to_line", "to_col", "to_x", "to_y"):
             if e.get(key) is not None:
+                step[key] = e[key]
+        for key in ("dx", "dy", "to_dx", "to_dy"):
+            if e.get(key):
                 step[key] = e[key]
         if e.get("button") not in (None, 1):
             step["button"] = e["button"]
-        if e.get("part") == "mode-line":
-            step["part"] = "mode-line"
+        for key in ("part", "to_part"):
+            if e.get(key) not in (None, "text"):
+                step[key] = e[key]
+        if e["action"] == "drag" and e.get("steps"):
+            step["steps"] = e["steps"]
         if e["action"] == "wheel":
             if e.get("direction"):
                 step["direction"] = e["direction"]

@@ -27,6 +27,12 @@ def test_parse_mouse_tokens() -> None:
     assert S.parse_event_token("up-mouse-1")["event"] == "up-mouse"
     assert S.parse_event_token("wheel-up")["event"] == "wheel-up"
     assert S.parse_event_token("wheel-down@1,0")["loc"]["line"] == 1
+    assert S.parse_event_token("drag-mouse-1@4,5") == {
+        "type": "mouse", "event": "drag-mouse", "button": 1,
+        "loc": {"pos": None, "line": 4, "col": 5}}
+    assert S.parse_event_token("mouse-movement#7") == {
+        "type": "mouse", "event": "mouse-movement", "button": 1,
+        "loc": {"pos": 7, "line": None, "col": None}}
     # No location -> window point (None).
     assert S.parse_event_token("mouse-1")["loc"] is None
 
@@ -38,7 +44,8 @@ def test_parse_key_token() -> None:
 
 @pytest.mark.parametrize("bad", [
     "bogus", "mouse-9", "mouse-0", "focus-sideways", "@1,2", "key:",
-    "wheel-up@x", "down-mouse-1@1", "down-mouse-4",
+    "wheel-up@x", "down-mouse-1@1", "down-mouse-4", "drag-mouse-4",
+    "mouse-movement-1", "move-mouse",
 ])
 def test_parse_rejects_bad_tokens(bad: str) -> None:
     with pytest.raises(ElateError):

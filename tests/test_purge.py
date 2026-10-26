@@ -97,6 +97,25 @@ def test_field_text_rendering():
     assert _field_text(r, "l") == '[1, "two"]'
 
 
+def test_stop_purge_removes_the_sandbox(elate_home: Path,
+                                        capsys: pytest.CaptureFixture[str]):
+    if not (shutil.which("emacs") and shutil.which("tmux")):
+        pytest.skip("needs emacs + tmux")
+    name = f"sp{os.getpid()}"
+    sess = S.start_session(name, ui="tty", cols=80, rows=24)
+    assert sess.dir.is_dir()
+    code = cli.main(["--json", "-s", name, "stop", "--purge"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["stopped"] is True and out["purged"] is True
+    assert out["freed_bytes"] > 0
+    assert not sess.dir.exists()
+    assert name not in {e["name"] for e in S.list_sessions()}
+    # Idempotent, and the purge verdict is explicit on a missing session.
+    code = cli.main(["--json", "-s", name, "stop", "--purge"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0 and out["stopped"] is False and out["purged"] is False
+
+
 def test_purge_needs_names_or_all(elate_home: Path):
     with pytest.raises(ElateError, match="--all"):
         S.purge_sessions()

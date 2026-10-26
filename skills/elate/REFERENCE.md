@@ -49,6 +49,7 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 - [`elate echo`](#elate-echo)
 - [`elate state`](#elate-state)
 - [`elate window-info`](#elate-window-info)
+- [`elate lines`](#elate-lines)
 - [`elate pointer`](#elate-pointer)
 - [`elate dnd`](#elate-dnd)
 - [`elate describe`](#elate-describe)
@@ -96,6 +97,7 @@ stop a session (or --all / a filter)
 - `--glob PATTERN` -- stop running sessions whose name matches this glob (e.g. 'rx-*') -- a bulk selector like --all
 - `--name-prefix PREFIX` -- stop running sessions whose name starts with PREFIX -- a bulk selector like --all
 - `--owner NAME` -- stop running sessions started with --owner NAME; combines with --glob/--name-prefix
+- `--purge` -- also delete the sandbox (transcript, logs, scratch) once stopped -- `stop` + `purge NAME` in one call, for sessions nobody will look at again
 
 ## elate interrupt
 
@@ -210,11 +212,23 @@ synthesize a mouse interaction (semantic; works for tty and gui)
 - `--buffer NAME` -- target the window showing this buffer (default: selected window)
 - `--pos N` -- buffer position
 - `--line L` -- buffer line (1-based)
-- `--col C` -- column (with --line, or offset into the mode line)
-- `--mode-line` -- click the window's mode line instead of buffer text
+- `--col C` -- column (with --line, or the character offset into a mode/header/tab line)
+- `--area {text,mode-line,header-line,tab-line,left-fringe,right-fringe,left-margin,right-margin,outside}` (default: text) -- window part to target (MCP/scenario: part): text (default), mode-line, header-line, tab-line, left-fringe, right-fringe, left-margin, right-margin, or outside (a frame posn off every window). A mode/header/tab line is hit at --col (default: the rightmost column whose construct has no keymap of its own, so the global [AREA mouse-N] binding applies), a fringe/margin at the row of --pos/--line (default: point)
+- `--mode-line` -- same as --area mode-line
+- `--x PX` -- pixel x relative to the window's text area (frame-relative with --area outside; a cell on a TTY), with --y; replaces --pos/--line/--col
+- `--y PX` -- pixel y, with --x
+- `--dx PX` (default: 0) -- pixel offset added to the resolved x (from the glyph's top-left for text targets)
+- `--dy PX` (default: 0) -- pixel offset added to the resolved y, e.g. height-1 from `lines` to hit the bottom of a row
+- `--to-buffer NAME` -- drag: end in the window showing this buffer (default: the start window)
 - `--to-pos N` -- drag: end position
 - `--to-line L` -- drag: end line
 - `--to-col C` -- drag: end column
+- `--to-area {text,mode-line,header-line,tab-line,left-fringe,right-fringe,left-margin,right-margin,outside}` (default: text) -- drag: end window part (see --area)
+- `--to-x PX` -- drag: end pixel x (see --x), with --to-y
+- `--to-y PX` -- drag: end pixel y, with --to-x
+- `--to-dx PX` (default: 0) -- drag: pixel offset added to the end x
+- `--to-dy PX` (default: 0) -- drag: pixel offset added to the end y
+- `--steps N` (default: 0) -- drag: emit N mouse-movement events spread along the path between the down and the drag event, so the down binding's own tracking scope (a transient drag map, mouse-drag-track) sees them like real motion
 - `--direction {up,down}` (default: down) -- wheel: scroll direction
 - `--count N` (default: 1) -- wheel: number of notches
 - `--events` -- queue on unread-command-events instead of the synchronous default (use when the triggered command itself reads input)
@@ -233,7 +247,7 @@ inject a window-system focus event (focus-in/out; semantic, tty and gui)
 
 inject an ordered stream of focus/mouse/key events (drains through the command loop in order)
 
-- `EVENT...` (repeatable) -- event tokens in order: focus-in, focus-out, down-mouse-N, mouse-N, up-mouse-N, double-mouse-N, wheel-up, wheel-down (N=1..3, each with optional @LINE,COL [1-based line, 0-based col] or #POS), or key:KBD (e.g. key:RET). A focus event only fires at the head of a command-loop turn, so any focus events are delivered in separate drained batches automatically -- making any ordering faithful, including a mouse-down before a focus-in
+- `EVENT...` (repeatable) -- event tokens in order: focus-in, focus-out, down-mouse-N, mouse-N, up-mouse-N, drag-mouse-N, double-mouse-N, wheel-up, wheel-down, mouse-movement (N=1..3, each with optional @LINE,COL [1-based line, 0-based col] or #POS; a drag-mouse-N starts at the batch's latest down-mouse location, its own location is the drag end), or key:KBD (e.g. key:RET). A focus event only fires at the head of a command-loop turn, so any focus events are delivered in separate drained batches automatically -- making any ordering faithful, including a mouse-down before a focus-in
 - `--buffer NAME` -- target the window showing this buffer for mouse events (default: selected window)
 - `--frame NAME` -- target frame for focus events (default: selected)
 - `--set-focus-state` -- also make (frame-focus-state) report injected focus (non-native shim; see 'elate focus')
@@ -261,6 +275,8 @@ evaluate an elisp form
 
 - `[form]` -- elisp source: one or more forms, evaluated as (progn ...); omit when using --file
 - `--file PATH` -- read the elisp source from PATH instead of the FORM argument ('-' reads stdin). Sidesteps shell quoting entirely, so forms containing ' or #' run verbatim -- use this to test snippets exactly as written. One or more forms, evaluated as (progn ...) like the positional FORM
+- `--defun NAME` -- with --file: evaluate only NAME's top-level definition (the last `(def... NAME' form -- defun, defvar, defcustom, cl-defmethod, define-minor-mode, ... -- as under load), read by the Lisp reader and run under the file's lexical-binding cookie; nothing else in the file loads. The result's value is {name, type, line, lexical}
+- `--rev REV` -- with --file: take the file's text from this git revision (`git show REV:FILE`) instead of the working tree -- with --defun, swap in one definition as it was at REV; rerun without --rev to restore the working-tree version
 - `--buffer NAME` -- evaluate in this buffer (default: the selected window's buffer, so current-buffer/point/line see what is on screen, not an arbitrary buffer)
 - `--timeout SECS` (default: 15)
 - `--backtrace` -- on error, also return structured backtrace frames (each frame's function + printed args), not just the rendered backtrace string
@@ -363,7 +379,7 @@ current echo area / minibuffer line
 
 one-call scene snapshot (layout, prompt, point, modes, messages tail)
 
-Full-snapshot shape: current-buffer facts (buffer, file, point, line, column, major-mode, minor-modes, region, narrowed, modified), echo, minibuffer (prompt/input/completions or null), input-pending, last-command, idle (secs or null), recursion-depth + in-debugger (non-zero/true = a recursive edit or the Lisp debugger is eating input -- see `debug`), popups, messages-tail, and 'windows': the window-tree as nested objects, NOT a flat list -- an inner node is {split: 'vertical'|'horizontal', children: [...]}, a leaf is one window {buffer, selected, width, height, line, column, start-line, end-line, mode-line, text, ...}; recurse until nodes have no 'children'. Sizes are character cells; for pixel geometry and X11 window ids see `window-info`.
+Full-snapshot shape: current-buffer facts (buffer, file, point, line, column, major-mode, minor-modes, region, narrowed, modified), echo, minibuffer (prompt/input/completions or null), input-pending, last-command, idle (secs or null), recursion-depth + in-debugger (non-zero/true = a recursive edit or the Lisp debugger is eating input -- see `debug`), popups, windows-appeared (buffers newly shown in a window since the previous state call on this session -- internal snapshots such as error reports and wait polling do not count -- a *Warnings* split from a stray warning, a popup, a *Backtrace*), alerts (visible *Warnings*/*Backtrace* windows, always listed while they are up), messages-tail, and 'windows': the window-tree as nested objects, NOT a flat list -- an inner node is {split: 'vertical'|'horizontal', children: [...]}, a leaf is one window {buffer, selected, width, height, line, column, start-line, end-line, mode-line, text, ...}; recurse until nodes have no 'children'. Sizes are character cells; for pixel geometry and X11 window ids see `window-info`.
 
 - `--since TOKEN` -- return only what changed since the TOKEN from a prior state call (new/killed/modified buffers, point/selection movement, new *Messages* lines, minibuffer change) -- much cheaper than a full snapshot, and 'changed':false means your last action did nothing observable. Every state result carries a fresh 'token'; an unknown/stale one degrades to a full snapshot.
 
@@ -373,6 +389,15 @@ window-system ids and pixel geometry per frame (for external X11 clients: drops,
 
 Per frame (selected first): name, selected, graphic, window-system (x/ns/pgtk/... or null), units ('pixels' on GUI frames, 'chars' on TTY), outer-window-id + window-id as INTEGERS (null off X11), outer-edges + native-edges [left, top, right, bottom], char-width + char-height (the cell size for line/col-to-pixel math), and windows: [{buffer, selected, edges, body-edges}] with root-absolute pixel edges on GUI frames. Complements `state`, which has buffer content and character-cell layout but no window-system numbers.
 
+- `--timeout SECS` (default: 15)
+
+## elate lines
+
+per-screen-line display geometry of a window (positions, y, height, partial rows, vscroll)
+
+Every visible screen line of the window (a wrapped buffer line yields several): index, start/end buffer positions (the line covers start..end, end = where the next screen line starts), absolute buffer line number (ignores narrowing), y and visible height relative to the text area -- below any tab/header line, the frame of `mouse --y` (y is negative when vscroll hides part of the first row; rows a multi-line display string owns are skipped), clipped-top/clipped-bottom hidden pixels and partial. Window fields: start/end, vscroll (pixels), hscroll (columns), body-width/body-height, text-area (frame pixel edges), char-width/char-height, tab/header/mode line heights. A pixel is a character cell on a TTY (units 'chars'). Reflects the last redisplay (lines is empty when the window has not been redisplayed since its buffer changed). Use with `mouse --y`/`--dy` to hit a given row height.
+
+- `--buffer NAME` -- the window showing this buffer (default: the selected window)
 - `--timeout SECS` (default: 15)
 
 ## elate pointer

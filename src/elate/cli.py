@@ -222,6 +222,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--owner", metavar="NAME",
                     help="stop running sessions started with --owner NAME; "
                          "combines with --glob/--name-prefix")
+    sp.add_argument("--purge", action="store_true",
+                    help="also delete the sandbox (transcript, logs, "
+                         "scratch) once stopped -- `stop` + `purge NAME` in "
+                         "one call, for sessions nobody will look at again")
 
     sp = sub.add_parser(
         "interrupt",
@@ -442,12 +446,57 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--pos", type=int, metavar="N", help="buffer position")
     sp.add_argument("--line", type=int, metavar="L", help="buffer line (1-based)")
     sp.add_argument("--col", type=int, metavar="C",
-                    help="column (with --line, or offset into the mode line)")
-    sp.add_argument("--mode-line", action="store_true",
-                    help="click the window's mode line instead of buffer text")
+                    help="column (with --line, or the character offset into "
+                         "a mode/header/tab line)")
+    sp.add_argument("--area", choices=list(S.MOUSE_PARTS), default="text",
+                    metavar="AREA",
+                    help="window part to target (MCP/scenario: part): text "
+                         "(default), mode-line, header-line, tab-line, "
+                         "left-fringe, right-fringe, left-margin, "
+                         "right-margin, or outside (a frame posn off every "
+                         "window). A mode/header/tab line is hit at --col "
+                         "(default: the rightmost column whose construct "
+                         "has no keymap of its own, so the global "
+                         "[AREA mouse-N] binding applies), a "
+                         "fringe/margin at the row of --pos/--line "
+                         "(default: point)")
+    sp.add_argument("--mode-line", action="store_const", const="mode-line",
+                    dest="area", help="same as --area mode-line")
+    sp.add_argument("--x", type=int, metavar="PX",
+                    help="pixel x relative to the window's text area "
+                         "(frame-relative with --area outside; a cell on a "
+                         "TTY), with --y; replaces --pos/--line/--col")
+    sp.add_argument("--y", type=int, metavar="PX",
+                    help="pixel y, with --x")
+    sp.add_argument("--dx", type=int, default=0, metavar="PX",
+                    help="pixel offset added to the resolved x (from the "
+                         "glyph's top-left for text targets)")
+    sp.add_argument("--dy", type=int, default=0, metavar="PX",
+                    help="pixel offset added to the resolved y, e.g. "
+                         "height-1 from `lines` to hit the bottom of a row")
+    sp.add_argument("--to-buffer", metavar="NAME",
+                    help="drag: end in the window showing this buffer "
+                         "(default: the start window)")
     sp.add_argument("--to-pos", type=int, metavar="N", help="drag: end position")
     sp.add_argument("--to-line", type=int, metavar="L", help="drag: end line")
     sp.add_argument("--to-col", type=int, metavar="C", help="drag: end column")
+    sp.add_argument("--to-area", choices=list(S.MOUSE_PARTS), default="text",
+                    metavar="AREA",
+                    help="drag: end window part (see --area)")
+    sp.add_argument("--to-x", type=int, metavar="PX",
+                    help="drag: end pixel x (see --x), with --to-y")
+    sp.add_argument("--to-y", type=int, metavar="PX",
+                    help="drag: end pixel y, with --to-x")
+    sp.add_argument("--to-dx", type=int, default=0, metavar="PX",
+                    help="drag: pixel offset added to the end x")
+    sp.add_argument("--to-dy", type=int, default=0, metavar="PX",
+                    help="drag: pixel offset added to the end y")
+    sp.add_argument("--steps", type=int, default=0, metavar="N",
+                    help="drag: emit N mouse-movement events spread along "
+                         "the path between the down and the drag event, so "
+                         "the down binding's own tracking scope (a transient "
+                         "drag map, mouse-drag-track) sees them like real "
+                         "motion")
     sp.add_argument("--direction", choices=["up", "down"], default="down",
                     help="wheel: scroll direction")
     sp.add_argument("--count", type=int, default=1, metavar="N",
@@ -476,9 +525,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "events (drains through the command loop in order)")
     sp.add_argument("events", nargs="+", metavar="EVENT",
                     help="event tokens in order: focus-in, focus-out, "
-                         "down-mouse-N, mouse-N, up-mouse-N, double-mouse-N, "
-                         "wheel-up, wheel-down (N=1..3, each with optional "
-                         "@LINE,COL [1-based line, 0-based col] or #POS), or "
+                         "down-mouse-N, mouse-N, up-mouse-N, drag-mouse-N, "
+                         "double-mouse-N, wheel-up, wheel-down, "
+                         "mouse-movement (N=1..3, each with optional "
+                         "@LINE,COL [1-based line, 0-based col] or #POS; a "
+                         "drag-mouse-N starts at the batch's latest down-mouse "
+                         "location, its own location is the drag end), or "
                          "key:KBD (e.g. key:RET). A focus event only fires at "
                          "the head of a command-loop turn, so any focus events "
                          "are delivered in separate drained batches "
@@ -529,6 +581,21 @@ def build_parser() -> argparse.ArgumentParser:
                          "verbatim -- use this to test snippets exactly as "
                          "written. One or more forms, evaluated as "
                          "(progn ...) like the positional FORM")
+    sp.add_argument("--defun", metavar="NAME",
+                    help="with --file: evaluate only NAME's top-level "
+                         "definition (the last `(def... NAME' form -- "
+                         "defun, defvar, defcustom, cl-defmethod, "
+                         "define-minor-mode, ... -- as under load), read "
+                         "by the Lisp reader and run under the file's "
+                         "lexical-binding cookie; nothing else in the file "
+                         "loads. The result's value is {name, type, line, "
+                         "lexical}")
+    sp.add_argument("--rev", metavar="REV",
+                    help="with --file: take the file's text from this git "
+                         "revision (`git show REV:FILE`) instead of the "
+                         "working tree -- with --defun, swap in one "
+                         "definition as it was at REV; rerun without --rev "
+                         "to restore the working-tree version")
     sp.add_argument("--buffer", metavar="NAME",
                     help="evaluate in this buffer (default: the selected "
                          "window's buffer, so current-buffer/point/line see "
@@ -734,6 +801,13 @@ def build_parser() -> argparse.ArgumentParser:
                     "last-command, idle (secs or null), recursion-depth + "
                     "in-debugger (non-zero/true = a recursive edit or the "
                     "Lisp debugger is eating input -- see `debug`), popups, "
+                    "windows-appeared (buffers newly shown in a window "
+                    "since the previous state call on this session -- "
+                    "internal snapshots such as error reports and wait "
+                    "polling do not count -- a *Warnings* split "
+                    "from a stray warning, a popup, a *Backtrace*), alerts "
+                    "(visible *Warnings*/*Backtrace* windows, always "
+                    "listed while they are up), "
                     "messages-tail, and 'windows': the window-tree as "
                     "nested objects, NOT a flat list -- an inner node is "
                     "{split: 'vertical'|'horizontal', children: [...]}, a "
@@ -766,6 +840,33 @@ def build_parser() -> argparse.ArgumentParser:
                     "with root-absolute pixel edges on GUI frames. "
                     "Complements `state`, which has buffer content and "
                     "character-cell layout but no window-system numbers.")
+    sp.add_argument("--timeout", type=float, default=15.0, metavar="SECS")
+
+    sp = sub.add_parser(
+        "lines",
+        help="per-screen-line display geometry of a window (positions, "
+             "y, height, partial rows, vscroll)",
+        description="Every visible screen line of the window (a wrapped "
+                    "buffer line yields several): index, start/end buffer "
+                    "positions (the line covers start..end, end = where the "
+                    "next screen line starts), absolute buffer line number "
+                    "(ignores narrowing), y and visible height relative to "
+                    "the text area -- below any tab/header line, the frame "
+                    "of `mouse --y` (y is negative when vscroll hides part "
+                    "of the first row; rows a multi-line display string "
+                    "owns are skipped), "
+                    "clipped-top/clipped-bottom hidden pixels and partial. "
+                    "Window fields: start/end, vscroll (pixels), hscroll "
+                    "(columns), body-width/body-height, text-area (frame "
+                    "pixel edges), char-width/char-height, tab/header/mode "
+                    "line heights. A pixel is a character cell on a TTY "
+                    "(units 'chars'). Reflects the last redisplay (lines is "
+                    "empty when the window has not been redisplayed since "
+                    "its buffer changed). Use with `mouse --y`/`--dy` to "
+                    "hit a given row height.")
+    sp.add_argument("--buffer", metavar="NAME",
+                    help="the window showing this buffer (default: the "
+                         "selected window)")
     sp.add_argument("--timeout", type=float, default=15.0, metavar="SECS")
 
     sp = sub.add_parser(
@@ -1245,11 +1346,19 @@ def cmd_stop(args: argparse.Namespace) -> Result:
         what = "" if args.all_sessions and not filtered else "matching "
         human = (f"stopped {len(names)} {what}session(s): {', '.join(names)}"
                  if names else f"no running {what}sessions to stop")
-        return {"stopped": names}, human, 0
+        result: dict[str, Any] = {"stopped": names}
+        if args.purge and names:
+            gone = S.purge_sessions(names)
+            result["purged"] = [p["name"] for p in gone["purged"]]
+            result["freed_bytes"] = gone["freed_bytes"]
+            human += f" ({len(result['purged'])} sandbox(es) purged)"
+        return result, human, 0
     name = _name_arg(args)
-    result = S.stop_session(name)
+    result = S.stop_session(name, purge=args.purge)
     if result.get("stopped"):
         human = f"stopped session {name!r}"
+        if result.get("purged"):
+            human += " and purged its sandbox"
     else:
         human = f"no such session {name!r} (nothing to stop)"
     return result, human, 0
@@ -1470,20 +1579,38 @@ def cmd_mouse(args: argparse.Namespace) -> Result:
         pos=args.pos,
         line=args.line,
         col=args.col,
-        part="mode-line" if args.mode_line else "text",
+        part=args.area,
+        x=args.x,
+        y=args.y,
+        dx=args.dx,
+        dy=args.dy,
+        to_buffer=args.to_buffer,
         to_pos=args.to_pos,
         to_line=args.to_line,
         to_col=args.to_col,
+        to_part=args.to_area,
+        to_x=args.to_x,
+        to_y=args.to_y,
+        to_dx=args.to_dx,
+        to_dy=args.to_dy,
         direction=args.direction,
         count=args.count,
+        steps=args.steps,
         delivery="events" if args.events else "macro",
     )
     sess.log("mouse", **kwargs)
     data = S.mouse_event(sess, timeout=args.timeout, **kwargs)
-    where = data.get("area") or f"pos {data.get('pos')}"
-    human = (f"{args.action} mouse-{args.button} at {where} "
-             f"in {data.get('buffer')} ({data.get('delivered')})")
+    human = (f"{args.action} mouse-{args.button} at {_human_posn(data)} "
+             f"({data.get('delivered')})")
+    if data.get("to"):
+        human += f" -> {_human_posn(data['to'])}"
     return data, human, 0
+
+
+def _human_posn(d: dict[str, Any]) -> str:
+    where = d.get("area") or f"pos {d.get('pos')}"
+    at = f"{where} ({d.get('x')},{d.get('y')})"
+    return f"{at} in {d['buffer']}" if d.get("buffer") else at
 
 
 def cmd_focus(args: argparse.Namespace) -> Result:
@@ -1523,43 +1650,50 @@ def cmd_resize(args: argparse.Namespace) -> Result:
     return data, human, 0
 
 
-_EVAL_SOURCE_CAP = 512 * 1024  # bytes of elisp source; travels base64 in argv
+_EVAL_SOURCE_CAP = S.EVAL_SOURCE_CAP
 
 
-def _eval_source(args: argparse.Namespace) -> str:
-    """Resolve eval's elisp source: the FORM argument, --file PATH, or stdin."""
+def _eval_source(args: argparse.Namespace,
+                 sess: S.Session) -> tuple[str, dict[str, Any]]:
+    """Resolve eval's elisp source: the FORM argument, --file PATH, or stdin.
+
+    Returns the form and the metadata (source_file/rev/defun) to merge
+    into the result.
+    """
     if args.source_file is None:
         if args.form is None:
             raise UsageError("eval needs a FORM argument or --file PATH")
-        return args.form
+        if args.defun or args.rev:
+            raise UsageError("--defun and --rev need --file PATH")
+        return args.form, {}
     if args.form is not None:
         raise UsageError("eval takes a FORM argument or --file, not both")
     if args.source_file == "-":
+        if args.defun or args.rev:
+            raise UsageError("--defun and --rev need a file path, not stdin")
         source = sys.stdin.read()
-    else:
-        try:
-            source = Path(args.source_file).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
+        if len(source.encode("utf-8")) > _EVAL_SOURCE_CAP:
             raise ElateError(
-                f"cannot read --file {args.source_file}: {exc}") from exc
-    if len(source.encode("utf-8")) > _EVAL_SOURCE_CAP:
-        raise ElateError(
-            f"--file {args.source_file}: source exceeds the eval channel's "
-            f"{_EVAL_SOURCE_CAP // 1024} KiB cap (it travels over argv); "
-            "eval a (load \"/path/to/file.el\") form instead")
-    return source
+                f"--file -: source exceeds the eval channel's "
+                f"{_EVAL_SOURCE_CAP // 1024} KiB cap (it travels over argv)")
+        return source, {}
+    return S.eval_source(sess, args.source_file, defun=args.defun,
+                         rev=args.rev)
 
 
 def cmd_eval(args: argparse.Namespace) -> Result:
     sess = _require_session(args)
-    form = _eval_source(args)
+    form, meta = _eval_source(args, sess)
     args.form = form  # downstream messages/logging see the real source
-    sess.log("eval", form=form, timeout=args.timeout, buffer=args.buffer)
+    sess.log("eval", form=form, timeout=args.timeout, buffer=args.buffer,
+             **{k: v for k, v in meta.items() if v})
     try:
         data = sess.semantic().eval_form(form, timeout=args.timeout,
                                           backtrace=args.backtrace,
                                           buffer=args.buffer,
-                                          json_result=args.json_result)
+                                          json_result=(args.json_result
+                                                       or bool(args.defun)))
+        data = {**data, **meta}
     except EvalTimeout as exc:
         busy = sess.is_busy()
         sess.log("eval-timeout", form=args.form)
@@ -1609,6 +1743,13 @@ def cmd_eval(args: argparse.Namespace) -> Result:
                 parts.append(f"  {fr.get('fun')}{(' ' + shown) if shown else ''}")
         # Exit 1 below; make the JSON "ok" flag agree with the exit code.
         data = {**data, "ok": False}
+    elif data.get("defun") and isinstance(data.get("value"), dict):
+        v = data["value"]
+        parts.append(f"evaluated {v.get('type')} {v.get('name')} from "
+                     f"{data.get('source_file')}"
+                     f"{'@' + data['rev'] if data.get('rev') else ''} "
+                     f"(line {v.get('line')}, "
+                     f"{'lexical' if v.get('lexical') else 'dynamic'} binding)")
     else:
         if data.get("value-encoding") == "json":
             parts.append(json.dumps(data.get("value"), ensure_ascii=False))
@@ -1938,6 +2079,31 @@ def _human_window_info(data: dict[str, Any]) -> str:
     return "\n".join(lines) or "(no frames)"
 
 
+def cmd_lines(args: argparse.Namespace) -> Result:
+    sess = _require_session(args)
+    data = S.window_lines(sess, buffer=args.buffer, timeout=args.timeout)
+    return data, _human_lines(data), 0
+
+
+def _human_lines(data: dict[str, Any]) -> str:
+    u = "px" if data.get("units") == "pixels" else "cells"
+    head = (f"{data['buffer']}: window-start {data['start']} "
+            f"window-end {data['end']}, vscroll {data['vscroll']}{u}, "
+            f"hscroll {data['hscroll']} cols, "
+            f"body {data['body-width']}x{data['body-height']}{u}, "
+            f"cell {data['char-width']}x{data['char-height']}")
+    out = [head, "  idx  start..end     line     y  height  note"]
+    for ln in data["lines"]:
+        note = ""
+        if ln["partial"]:
+            note = (f"partial (hidden top {ln['clipped-top']}, "
+                    f"bottom {ln['clipped-bottom']})")
+        out.append(f"  {ln['index']:>3}  {ln['start']:>5}..{ln['end']:<6} "
+                   f"{ln['line']:>5} {ln['y']:>5}  {ln['height']:>6}  "
+                   f"{note}".rstrip())
+    return "\n".join(out)
+
+
 def cmd_window_info(args: argparse.Namespace) -> Result:
     sess = _require_session(args)
     data = S.window_info(sess, timeout=args.timeout)
@@ -2132,6 +2298,7 @@ def _human_state(data: dict[str, Any]) -> str:
     if data.get("popups"):
         lines.append(f"popups: {', '.join(data['popups'])} "
                      "(use 'popups' to capture)")
+    lines.extend(_layout_news_lines(data))
     windows: list[dict[str, Any]] = []
     if isinstance(data.get("windows"), dict):
         _flat_windows(data["windows"], windows)
@@ -2160,11 +2327,25 @@ def cmd_state(args: argparse.Namespace) -> Result:
     return data, human, 0
 
 
+def _layout_news_lines(data: dict[str, Any]) -> list[str]:
+    """Human lines for windows that appeared since the last state call and
+    for visible *Warnings*/*Backtrace* windows."""
+    lines = []
+    if data.get("windows-appeared"):
+        lines.append("windows appeared since last state: "
+                     + ", ".join(data["windows-appeared"]))
+    for name in data.get("alerts") or []:
+        lines.append(f"!! {name} window is showing -- read it with "
+                     f"`buffer --buffer '{name}'` (it changed the layout)")
+    return lines
+
+
 def _human_delta(data: dict[str, Any]) -> str:
     """Compact human view of a `state --since` delta."""
-    if not data.get("changed"):
+    if not data.get("changed") and not data.get("alerts"):
         return "no change"
     lines: list[str] = []
+    lines.extend(_layout_news_lines(data))
     bufs = data.get("buffers") or {}
     marks = ([f"+{b}" for b in bufs.get("added") or []]
              + [f"-{b}" for b in bufs.get("removed") or []]
@@ -3020,6 +3201,7 @@ _COMMANDS = {
     "echo": cmd_echo,
     "state": cmd_state,
     "window-info": cmd_window_info,
+    "lines": cmd_lines,
     "pointer": cmd_pointer,
     "dnd": cmd_dnd,
     "describe": cmd_describe,

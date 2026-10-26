@@ -104,6 +104,11 @@ elate --json -s demo eval --json-result '(list :mode major-mode :point (point))'
 [ "$(elate -s demo eval --raw 'major-mode')" = lisp-mode ] && echo yes
 elate --field name -s demo info
 
+# A/B one definition: evaluate my-fn as it is at a git revision (only that
+# form loads), then restore the working-tree version by dropping --rev
+elate -s demo eval --file lisp/my-pkg.el --defun my-fn --rev main
+elate -s demo eval --file lisp/my-pkg.el --defun my-fn
+
 # Semantic keys (execute-kbd-macro inside Emacs)
 elate -s demo keys 'M-x my-pkg-mode RET'
 # Queued semantic delivery — for sequences that leave a prompt open
@@ -135,6 +140,7 @@ elate -s demo wait until '(eq major-mode (quote my-mode))'    # any elisp predic
 cp setup.el "$(elate -s demo path)"/
 
 elate stop demo
+elate stop demo --purge          # stop + delete the sandbox in one call
 
 # Stopped sandboxes stay behind for their transcripts; delete them when
 # done (purge never touches a running session)
@@ -380,12 +386,28 @@ elate --json -s win screenshot          # returns path + pixel dimensions
 # Mouse — semantic, works for BOTH tty and gui sessions, no OS permissions:
 # a real posn is built inside Emacs and a complete click/drag/wheel event
 # sequence goes through the command loop, so buttons, follow-link,
-# mode-line maps, and mwheel react exactly as for a human click.
+# mode-line maps, and mwheel react exactly as for a human click. A click on
+# the mode line runs the keymap at that column, like a real one: the buffer
+# name and coding-system constructs carry their own maps (--col picks one);
+# the default column is the rightmost one without such a map, where the
+# global [mode-line mouse-1] (select window) applies. Results carry the resolved posn
+# (buffer, area, pos, frame pixel x/y; cells on a TTY) and, for drags, `to`.
 elate -s win mouse click --buffer '*my-menu*' --line 3 --col 5
 elate -s win mouse click --button 2 --pos 42
 elate -s win mouse drag --pos 10 --to-pos 25      # selects a region
+elate -s win mouse drag --pos 10 --to-pos 25 --steps 5   # + 5 mouse-movement events on the way
 elate -s win mouse wheel --direction down --count 3
-elate -s win mouse click --mode-line --buffer other-buf   # selects that window
+elate -s win mouse click --mode-line --buffer other-buf   # selects that window (default column: rightmost filler)
+elate -s win mouse click --area header-line --col 12      # also tab-line, left/right-fringe, left/right-margin
+elate -s win mouse click --line 3 --col 4 --dy 17         # 17px below the glyph's top edge (bottom of a tall row)
+elate -s win mouse click --x 0 --y 0                      # raw pixels, relative to the window's text area
+elate -s win mouse drag --line 2 --to-buffer other --to-line 1 --steps 5   # drag that leaves the window
+elate -s win mouse drag --line 2 --to-area outside        # drag end off every window (a frame posn)
+elate -s win send-events 'down-mouse-1@1,0' 'mouse-movement@2,4' 'drag-mouse-1@3,8'  # scripted drag path
+
+# Per-screen-line display geometry: buffer start/end per row, y, height,
+# partial rows, vscroll, text-area edges (tty: cells). Pair with mouse --y/--dy.
+elate -s win lines --buffer '*scratch*'
 
 # Live frame resize (works for tty via tmux too)
 elate -s win resize 120x40
@@ -1050,15 +1072,16 @@ responses embed a compact state snapshot so the model sees why):
 | `elate_keys` | kbd-notation keys; `delivery`: `semantic` (through the command loop — obeys keymaps; a bell aborts and names the culprit), `events` (holds prompts open; bell-tolerant), or `raw` (TTY only; works even when Emacs is wedged) |
 | `elate_type` | literal text: raw terminal bytes (TTY) or queued events (GUI) |
 | `elate_send_process` | send raw input to a buffer's subprocess (comint/REPL/shell/terminal): `char` (e.g. `C-c` → ^C/SIGINT), `text`, or `file` — drives the *process*, not Emacs; a buffer with several live processes is an error naming them (pick one with `process`), and the result echoes the target's name + command line |
-| `elate_mouse` | semantic mouse for both UIs: click/double/drag/wheel at a buffer position, line/column, or the mode line; fires real bindings (buttons, follow-link, mwheel) |
+| `elate_mouse` | semantic mouse for both UIs: click/double/drag/wheel at a buffer position, line/column, pixel offset, or any window part (mode/header/tab line, fringes, margins, off-window); `steps` emits real mouse-movement events during a drag, `to_buffer`/`to_part` end it elsewhere; fires real bindings (buttons, follow-link, mode-line maps, drag maps, mwheel); results carry the resolved posn |
 | `elate_focus` | inject a `focus-in`/`focus-out` event: runs `handle-focus-in`/`-out` through `special-event-map` (fires `after-focus-change-function`, sets `last-focus-update`); `set_focus_state` also shims `(frame-focus-state)` |
 | `elate_send_events` | inject an ordered stream of focus/mouse/key tokens that drains through the command loop in order (a focus event's hooks run before a following click); focus events auto-split into drained batches, so any ordering — including a mouse-down before a focus-in — is faithful |
-| `elate_eval` | elisp eval with value, *Messages* delta, error + backtrace; `json_result` returns the value as real JSON instead of a printed sexp (fallback flagged by `value-encoding`) |
+| `elate_eval` | elisp eval with value, *Messages* delta, error + backtrace; `json_result` returns the value as real JSON instead of a printed sexp (fallback flagged by `value-encoding`); `file` + `defun` evaluates one named definition, `rev` takes the file from a git revision |
 | `elate_test` | interactive ERT run: selector support, per-test status/duration/messages/condition/backtrace; failures are data (`ok` stays true — check `unexpected`) |
 | `elate_lint` | byte-compile + checkdoc by file path: `{file, tool, line, col, severity, message}` items; **executes the file's compile-time code in the session** (see Lint warning above) |
 | `elate_profile` | native profiler: one-shot `run` (start → eval → stop → report) or manual `start`/`stop`/`report`; structured top-function list + depth-limited calltree (cpu samples / mem bytes) |
 | `elate_bench` | `benchmark-run-compiled` wrapper: elapsed/mean, GC runs + GC time, `memory-use-counts` allocation deltas; interpreted fallback when the form won't compile |
 | `elate_state` | one-call scene snapshot: window layout tree with visible text and mode lines, buffer/modes/point/region, minibuffer prompt + input + completion candidates, echo area, visible popup kinds, *Messages* tail |
+| `elate_lines` | per-screen-line display geometry of a window: buffer start/end per row, y, height, partial rows, vscroll, text-area edges (cells on a TTY) |
 | `elate_screenshot` | TTY: rendered screen as text (optionally ANSI-colored). GUI: PNG of the Emacs window, returned as MCP image content plus a JSON block with path + dimensions |
 | `elate_buffer` / `elate_messages` / `elate_echo` | targeted reads (`elate_messages` is cursor-based: only news since the last call); `elate_buffer` takes `props` for face/text-property runs + overlays |
 | `elate_popups` | capture visible popups as text: which-key, transient, hydra, corfu/company, completion-preview, child frames |

@@ -44,7 +44,7 @@ EXPECTED_TOOLS = {
     "elate_keys", "elate_type", "elate_send_process", "elate_mouse",
     "elate_focus", "elate_send_events",
     "elate_eval", "elate_state", "elate_screenshot",
-    "elate_window_info", "elate_pointer", "elate_dnd",
+    "elate_window_info", "elate_lines", "elate_pointer", "elate_dnd",
     "elate_buffer", "elate_messages", "elate_echo",
     "elate_wait", "elate_describe",
     "elate_test", "elate_lint", "elate_popups", "elate_faces_at",
@@ -119,6 +119,17 @@ def mcp_session(elate_home: str) -> Iterator[dict[str, Any]]:
 
 
 # -- protocol surface ----------------------------------------------------------
+
+def test_mcp_stop_purge_deletes_sandbox(elate_home: str) -> None:
+    from elate import session as S
+    name = NAME + "p"
+    started = one_call(elate_home, "elate_start", {"name": name})
+    assert started["ok"] is True, started
+    sdir = S.load_session(name).dir
+    out = one_call(elate_home, "elate_stop", {"session": name, "purge": True})
+    assert out["ok"] is True and out["purged"] is True
+    assert not sdir.exists()
+
 
 def test_list_tools(elate_home: str) -> None:
     async def fn(cs: ClientSession) -> None:

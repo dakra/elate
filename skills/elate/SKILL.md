@@ -209,6 +209,10 @@ uvx elate -s s eval '(my-fn 42)' --timeout 5
 - Shell single-quoting cannot contain `'` — so `#'fn` and `'symbol`
   break as argv. Don't rewrite the elisp: put the forms in a file and
   `eval --file forms.el` (or `--file -` for stdin) to run them verbatim.
+- A/B one definition: `eval --file pkg.el --defun my-fn --rev main`
+  evaluates only `my-fn` as it is at that git revision (nothing else in
+  the file loads); `eval --file pkg.el --defun my-fn` restores the
+  working-tree version. `--rev` alone evaluates the whole file at REV.
 - Errors come back structured: `error` + `backtrace` + the *Messages*
   delta; exit code 1.
 - Printed values are truncated at 64 KiB (`truncated: true` +
@@ -256,6 +260,12 @@ uvx elate -s s popups                        # transient/which-key/corfu/childfr
   (compare a typed cell against the dimmed suggestion beside it). Over MCP it
   is `elate_faces_at` (`pos` / `run`).
 - `state`'s `popups` field tells you when a `popups` capture is worthwhile.
+- `state`'s `windows-appeared` names buffers newly shown in a window since
+  the previous `state` call on this session (a `*Warnings*` split from a
+  stray warning, a `*Backtrace*`, a popup; a split from a `--load` file at
+  startup is news to the first call), and `alerts` lists visible `*Warnings*`/
+  `*Backtrace*` windows as long as they are up — a layout that changed
+  under you is named, not silently measured.
 - TTY `screenshot` prints the rendered screen as text (works post-mortem on
   a crashed Emacs); GUI `screenshot -o x.png` writes a PNG you can Read.
 - GUI capture on **macOS needs an awake, unlocked display** (`--headless`/Xvfb
@@ -399,7 +409,12 @@ uvx elate -s g screenshot -o shot.png          # real PNG; Read it
 uvx elate -s g mouse click --buffer '*menu*' --line 3 --col 5
 ```
 Mouse is semantic (a real event sequence through the command loop — no OS
-permissions) and works on TTY too. GUI differences: no `--raw` channel;
+permissions) and works on TTY too. It targets any window part (`--area
+header-line|tab-line|left-fringe|…|outside`, `--mode-line`), takes pixel
+offsets (`--dx/--dy` from the glyph, `--x/--y` raw text-area pixels — pair
+with `lines` for row heights), and `drag --steps N` emits real
+`mouse-movement` events so drag maps run; `--to-buffer`/`--to-area` end a
+drag in another window or part. Results carry the resolved posn. GUI differences: no `--raw` channel;
 `type` is capped at 10,000 chars; macOS PNG capture needs the Screen
 Recording permission (elate preflights and reports instead of prompting).
 On Linux/CI add `--headless` for a private Xvfb.
@@ -436,7 +451,7 @@ images** instead of PNG files to read. If `elate_*` MCP tools are already
 available in your session (someone registered the server — the plugin is
 CLI-first and does not register it for you), use them directly — do **not**
 register a duplicate; otherwise register it with
-`claude mcp add elate -- uvx elate mcp`. The 35 `elate_*` tools cover the core surface (`attach`, `resize`,
+`claude mcp add elate -- uvx elate mcp`. The 36 `elate_*` tools cover the core surface (`attach`, `resize`,
 `prune`, `stderr`, `export-script`, `snap`, `matrix`, `install`, and `update` stay CLI-only); `prune`
 aliases `purge` and `stderr` aliases `logs`. Sessions are shared
 between both (same names, same sandboxes), so you can mix.
@@ -453,7 +468,8 @@ sandbox dir — and its `stopped` entry in `elate list` (which shows each
 one's idle age) — stays behind on purpose (transcripts outlive the Emacs).
 Stopped sandboxes are inert; when the transcripts are no longer needed,
 `elate purge NAME…` (or `elate purge --all`; `prune` is the same command)
-deletes them — purge never touches a running session. `elate run` purges
+deletes them — purge never touches a running session; `elate stop NAME
+--purge` does both for a session nobody will look at again. `elate run` purges
 its own throwaway sandbox on success, so only failed runs pile up — named
 `run-<scenario>-<hex>` after the scenario file, so a post-mortem is
 findable: sweep them by pattern with `elate purge --glob 'run-*'` (or a

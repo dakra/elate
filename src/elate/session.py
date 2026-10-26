@@ -32,6 +32,7 @@ from .errors import (
 )
 from .paths import sessions_root
 from .raw import SESSION as TMUX_SESSION, RawChannel
+from .semantic import elisp_string
 from .semantic import SemanticChannel
 from .transcript import log_event
 
@@ -738,14 +739,28 @@ def _crash_report(raw: RawChannel) -> str:
         return "(no screen capture available)"
 
 
-def stop_session(name: str, via: str | None = None) -> dict[str, Any]:
+def stop_session(name: str, via: str | None = None,
+                 purge: bool = False) -> dict[str, Any]:
+    """Stop session NAME; with PURGE also delete its sandbox afterwards.
+
+    With PURGE a corrupt registry (unreadable session.json) is purged the
+    way ``purge NAME`` would, instead of failing to load.
+    """
     try:
         sess = load_session(name)
     except SessionNotFound:
         # Stopping a session that does not exist is a no-op success, so
         # `stop` (and `stop --all`, replace, cleanup loops) is idempotent.
         return {"name": name, "stopped": False, "was_alive": False,
-                "reason": "no such session"}
+                "reason": "no such session",
+                **({"purged": False} if purge else {})}
+    except ElateError:
+        if not purge:
+            raise
+        gone = purge_sessions([name])
+        return {"name": name, "stopped": False, "was_alive": False,
+                "reason": "corrupt registry", "purged": bool(gone["purged"]),
+                "freed_bytes": gone["freed_bytes"]}
     was_alive = sess.is_alive()
     if was_alive:
         try:
@@ -786,6 +801,10 @@ def stop_session(name: str, via: str | None = None) -> dict[str, Any]:
     result = {"name": name, "stopped": True, "was_alive": was_alive}
     if reaped:
         result["reaped"] = reaped
+    if purge:
+        gone = purge_sessions([name])
+        result["purged"] = bool(gone["purged"])
+        result["freed_bytes"] = gone["freed_bytes"]
     return result
 
 
@@ -1504,7 +1523,7 @@ def state_dump(sess: Session, compact: bool = True) -> dict[str, Any]:
     """
     dump: dict[str, Any] = {}
     try:
-        state = sess.semantic().rpc("state", timeout=2.0)
+        state = sess.semantic().rpc("state", None, True, timeout=2.0)
         if compact:
             state = _compact_state(state)
         dump["state"] = state
@@ -1705,7 +1724,7 @@ def wait_stable(
 def wait_prompt(sess: Session, timeout: float = 10.0) -> dict[str, Any]:
     """Wait until a minibuffer prompt is active; return its description."""
     def probe() -> dict[str, Any] | None:
-        data = sess.semantic().rpc("state", timeout=2.0)
+        data = sess.semantic().rpc("state", None, True, timeout=2.0)
         mb = data.get("minibuffer")
         if mb:
             return {"prompt": mb.get("prompt"), "contents": mb.get("contents"),
@@ -1839,6 +1858,8 @@ def deliver_type(sess: Session, text: str) -> dict[str, Any]:
 
 
 MOUSE_ACTIONS = ("click", "double", "drag", "wheel")
+MOUSE_PARTS = ("text", "mode-line", "header-line", "tab-line", "left-fringe",
+               "right-fringe", "left-margin", "right-margin", "outside")
 
 
 def mouse_event(
@@ -1851,11 +1872,22 @@ def mouse_event(
     line: int | None = None,
     col: int | None = None,
     part: str = "text",
+    x: int | None = None,
+    y: int | None = None,
+    dx: int = 0,
+    dy: int = 0,
+    to_buffer: str | None = None,
     to_pos: int | None = None,
     to_line: int | None = None,
     to_col: int | None = None,
+    to_part: str = "text",
+    to_x: int | None = None,
+    to_y: int | None = None,
+    to_dx: int = 0,
+    to_dy: int = 0,
     direction: str = "down",
     count: int = 1,
+    steps: int = 0,
     delivery: str = "macro",
     timeout: float = 15.0,
 ) -> dict[str, Any]:
@@ -1866,25 +1898,40 @@ def mouse_event(
     and dispatches a complete event sequence through the command loop, so
     the bindings that would fire for a human click fire here too.
 
-    Targets: a buffer position (pos), a buffer line/column (line, col), or
-    the mode line (part='mode-line', col = character offset into it); each
-    optionally in the window showing BUFFER (default: selected window).
-    Actions: click/double (button 1-3), drag (needs to_pos or
-    to_line/to_col), wheel (direction up/down, count notches).
+    Targets: a window part (PART: 'text' (default), 'mode-line',
+    'header-line', 'tab-line', 'left-fringe', 'right-fringe',
+    'left-margin', 'right-margin', or 'outside' = a frame posn off every
+    window) and a location in it -- a buffer position (pos) or line/col
+    for text and the row of a fringe/margin target, col = character
+    offset into a mode/header/tab line (default: its right edge) -- or
+    instead X/Y, pixels relative to the window's text area (to the frame
+    for 'outside'); DX/DY are pixel offsets applied last (e.g. the
+    bottom of a tall row). Each optionally in the window showing BUFFER
+    (default: selected window). Actions: click/double (button 1-3), drag
+    (destination: the TO_* mirror of the target spec, TO_BUFFER for
+    another window; STEPS mouse-movement events along the path between
+    the down and the drag event, seen by the down binding's tracking
+    scope like real motion), wheel (direction up/down, count notches).
     """
     if action not in MOUSE_ACTIONS:
         raise ElateError(
             f"unknown mouse action {action!r} (use {'/'.join(MOUSE_ACTIONS)})")
     if button not in (1, 2, 3):
         raise ElateError(f"mouse button must be 1, 2, or 3, got {button}")
-    if part not in ("text", "mode-line"):
-        raise ElateError(f"unknown mouse target part {part!r} (text/mode-line)")
+    for label, value in (("part", part), ("to_part", to_part)):
+        if value not in MOUSE_PARTS:
+            raise ElateError(f"unknown mouse {label} {value!r} "
+                             f"(use {'/'.join(MOUSE_PARTS)})")
     if direction not in ("up", "down"):
         raise ElateError(f"wheel direction must be 'up' or 'down', got {direction!r}")
     if delivery not in ("macro", "events"):
         raise ElateError(f"unknown mouse delivery {delivery!r} (macro/events)")
     if not 1 <= count <= 50:
         raise ElateError(f"count must be between 1 and 50, got {count}")
+    if not 0 <= steps <= 200:
+        raise ElateError(f"steps must be between 0 and 200, got {steps}")
+    if steps and action != "drag":
+        raise ElateError("steps only applies to drag")
     # Mirror the MCP schema bounds so CLI callers get a friendly error
     # instead of a raw elisp wholenump complaint.
     for label, value, minimum in (("pos", pos, 1), ("line", line, 1),
@@ -1892,19 +1939,37 @@ def mouse_event(
                                   ("to_line", to_line, 1), ("to_col", to_col, 0)):
         if value is not None and value < minimum:
             raise ElateError(f"mouse {label} must be >= {minimum}, got {value}")
-    if action == "drag" and to_pos is None and to_line is None:
-        raise ElateError("mouse drag needs a destination: to_pos or to_line/to_col")
-    if action == "drag" and part == "mode-line":
-        raise ElateError("mouse drag targets buffer text, not the mode line")
+    for label, xv, yv, pv, lv, partv in (
+            ("", x, y, pos, line, part),
+            ("to_", to_x, to_y, to_pos, to_line, to_part)):
+        if (xv is None) != (yv is None):
+            raise ElateError(f"mouse {label}x and {label}y go together")
+        if xv is not None and (pv is not None or lv is not None):
+            raise ElateError(
+                f"mouse {label}x/{label}y replace {label}pos/{label}line")
+        if xv is not None and partv not in ("text", "outside"):
+            raise ElateError(
+                f"mouse {label}x/{label}y replace {label}part "
+                f"(pixels pick the part); use 'outside' for frame pixels")
+    if action == "drag" and not any(v is not None for v in (
+            to_pos, to_line, to_x, to_buffer)) and to_part == "text":
+        raise ElateError("mouse drag needs a destination: to_pos, "
+                         "to_line/to_col, to_x/to_y, to_buffer or to_part")
+    if action != "drag" and (to_buffer or to_part != "text" or any(
+            v is not None for v in (to_pos, to_line, to_col, to_x, to_y))):
+        raise ElateError("to_* only applies to drag")
     payload = {
         "action": action,
         "button": button,
         "direction": direction,
         "count": count,
+        "steps": steps,
         "delivery": delivery,
         "target": {"buffer": buffer, "pos": pos, "line": line, "col": col,
-                   "part": part},
-        "to": {"pos": to_pos, "line": to_line, "col": to_col},
+                   "part": part, "x": x, "y": y, "dx": dx, "dy": dy},
+        "to": {"buffer": to_buffer, "pos": to_pos, "line": to_line,
+               "col": to_col, "part": to_part, "x": to_x, "y": to_y,
+               "dx": to_dx, "dy": to_dy},
     }
     b64 = base64.b64encode(
         json.dumps(payload).encode("utf-8")).decode("ascii")
@@ -1924,6 +1989,85 @@ def window_info(sess: Session, timeout: float = 15.0,
     """
     sess.log("window-info", **({"via": via} if via else {}))
     return sess.semantic().rpc("window-info", timeout=timeout)
+
+
+EVAL_SOURCE_CAP = 512 * 1024  # bytes of elisp source; travels base64 in argv
+
+
+def _read_source(file: str, rev: str | None) -> str:
+    """The text of FILE, from the working tree or from git revision REV."""
+    path = Path(file)
+    if rev is None:
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ElateError(f"cannot read --file {file}: {exc}") from exc
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path.resolve().parent), "show",
+             f"{rev}:./{path.name}"],
+            capture_output=True, check=False)
+    except OSError as exc:
+        raise ElateError(f"cannot run git for --rev {rev}: {exc}") from exc
+    if proc.returncode:
+        raise ElateError(f"git show {rev}:{file}: "
+                         f"{proc.stderr.decode(errors='replace').strip() or 'failed'}")
+    try:
+        return proc.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ElateError(f"git show {rev}:{file}: not UTF-8: {exc}") from exc
+
+
+def eval_source(sess: Session, file: str, *, defun: str | None = None,
+                rev: str | None = None) -> tuple[str, dict[str, Any]]:
+    """Elisp source for ``eval --file FILE [--rev REV] [--defun NAME]``.
+
+    Returns the form to evaluate and the metadata to merge into the
+    result (``source_file``, ``rev``, ``defun``). Without DEFUN the file's
+    text (from the working tree, or from git revision REV) is the form.
+    With DEFUN only NAME's top-level definition runs, extracted inside
+    Emacs by the Lisp reader from a file on disk: FILE itself, or a copy
+    of the REV text written to the session's scratch dir.
+    """
+    meta: dict[str, Any] = {"source_file": file, "rev": rev, "defun": defun}
+    if defun is None:
+        source = _read_source(file, rev)
+        if len(source.encode("utf-8")) > EVAL_SOURCE_CAP:
+            raise ElateError(
+                f"--file {file}: source exceeds the eval channel's "
+                f"{EVAL_SOURCE_CAP // 1024} KiB cap (it travels over argv); "
+                "eval a (load \"/path/to/file.el\") form instead")
+        return source, meta
+    if rev is None:
+        src = Path(file).resolve()
+        if not src.is_file():
+            raise ElateError(f"cannot read --file {file}: not a file")
+    else:
+        text = _read_source(file, rev)
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", rev)
+        src = sess.scratch_dir() / f"rev-{safe}-{Path(file).name}"
+        src.write_text(text, encoding="utf-8")
+        meta["source_path"] = str(src)
+    form = f"(elate--eval-defun {elisp_string(str(src))} {elisp_string(defun)})"
+    return form, meta
+
+
+def window_lines(sess: Session, buffer: str | None = None,
+                 timeout: float = 15.0, via: str | None = None) -> dict[str, Any]:
+    """Per-screen-line display geometry of one window, as real JSON.
+
+    Every visible screen line (a wrapped buffer line yields several) with
+    its buffer start/end positions, absolute buffer line number, y and
+    visible height relative to the text area (below any tab/header
+    line), hidden pixels at the top/bottom and a partial flag; plus the
+    window's start/end, vscroll, hscroll,
+    text-area size and edges, char cell size and tab/header/mode line
+    heights. Pixels are character cells on a TTY frame. BUFFER picks the
+    window showing it (default: the selected window).
+    """
+    sess.log("lines", buffer=buffer, **({"via": via} if via else {}))
+    return sess.semantic().rpc("lines", buffer, timeout=timeout)
 
 
 POINTER_ACTIONS = ("warp", "query")
@@ -2194,8 +2338,10 @@ def dnd_drop(
 #     bell -- so delivery is always via unread-command-events + a drain.
 
 _MOUSE_EVENT_RE = re.compile(
-    r"^(?P<event>down-mouse|up-mouse|double-mouse|mouse)-(?P<button>[1-3])$")
+    r"^(?P<event>down-mouse|up-mouse|drag-mouse|double-mouse|mouse)"
+    r"-(?P<button>[1-3])$")
 _WHEEL_RE = re.compile(r"^(?:wheel-up|wheel-down)$")
+_MOVE_RE = re.compile(r"^mouse-movement$")
 _LOC_RE = re.compile(r"^(?:@(?P<line>\d+),(?P<col>\d+)|#(?P<pos>\d+))$")
 
 
@@ -2215,9 +2361,12 @@ def parse_event_token(tok: str) -> dict[str, Any]:
     """One send-events token -> a spec dict for elate--event-from-spec.
 
     Tokens: focus-in / focus-out; down-mouse-N / mouse-N / up-mouse-N /
-    double-mouse-N / wheel-up / wheel-down (N=1..3), each with an optional
-    @LINE,COL or #POS location (default: the window's point); key:KBD
-    (e.g. key:RET, key:C-x) for an Emacs key sequence.
+    drag-mouse-N / double-mouse-N / wheel-up / wheel-down (N=1..3) /
+    mouse-movement, each with an optional @LINE,COL or #POS location
+    (default: the window's point); key:KBD (e.g. key:RET, key:C-x) for an
+    Emacs key sequence. A drag-mouse-N event starts at the batch's latest
+    down-mouse location (its own location is the drag end); a focus token
+    starts a new batch.
     """
     if tok.startswith("key:"):
         keys = tok[len("key:"):]
@@ -2236,10 +2385,14 @@ def parse_event_token(tok: str) -> dict[str, Any]:
                 "button": int(mm.group("button")), "loc": loc}
     if _WHEEL_RE.match(base):
         return {"type": "mouse", "event": base, "button": 1, "loc": loc}
+    if _MOVE_RE.match(base):
+        return {"type": "mouse", "event": "mouse-movement", "button": 1,
+                "loc": loc}
     raise ElateError(
         f"unknown event token {tok!r}; expected focus-in/focus-out, "
-        "down-mouse-N/mouse-N/up-mouse-N/double-mouse-N/wheel-up/wheel-down "
-        "(N=1..3, optional @LINE,COL or #POS), or key:KBD")
+        "down-mouse-N/mouse-N/up-mouse-N/drag-mouse-N/double-mouse-N/"
+        "wheel-up/wheel-down/mouse-movement (N=1..3, optional @LINE,COL or "
+        "#POS), or key:KBD")
 
 
 def _split_event_batches(specs: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:

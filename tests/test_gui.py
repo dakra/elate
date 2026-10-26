@@ -173,6 +173,7 @@ def clicked_value(sess: S.Session) -> str:
     return sess.semantic().eval_form("elate-test-clicked")["value"]
 
 
+
 # -- lifecycle / info ---------------------------------------------------------
 
 def test_gui_start_and_info(gui_sess: S.Session) -> None:
@@ -423,6 +424,259 @@ def test_mouse_drag_selects_region(mouse_sess: S.Session) -> None:
     assert data["value"] == "(t 3 9)"
 
 
+DRAG_MAP_SETUP = (
+    '(progn (switch-to-buffer "dragmap") (delete-other-windows)'
+    ' (erase-buffer) (dotimes (i 12) (insert (format "line %02d abcdef\\n" i)))'
+    ' (goto-char (point-min)) (setq el-motions nil el-drag-end nil)'
+    ' (use-local-map (make-sparse-keymap))'
+    ' (local-set-key [down-mouse-1]'
+    '  (lambda () (interactive) (setq track-mouse t)'
+    '   (set-transient-map'
+    '    (let ((m (make-sparse-keymap)))'
+    '     (define-key m [mouse-movement]'
+    '      (lambda (e) (interactive "e")'
+    '       (push (list (posn-point (event-start e)) track-mouse) el-motions)))'
+    '     (define-key m [drag-mouse-1]'
+    '      (lambda (e) (interactive "e") (setq track-mouse nil)'
+    '       (setq el-drag-end (posn-point (event-end e)))))'
+    '     m) t)))'
+    ' t)'
+)
+
+
+def test_mouse_drag_steps_dispatch_motion_through_transient_map(
+        mouse_sess: S.Session) -> None:
+    assert mouse_sess.semantic().eval_form(DRAG_MAP_SETUP)["error"] is None
+    result = S.mouse_event(mouse_sess, action="drag", buffer="dragmap",
+                           line=1, col=2, to_line=5, to_col=6, steps=4)
+    assert result["events"] == 6  # down + 4 motions + drag
+    data = mouse_sess.semantic().eval_form(
+        "(list (reverse el-motions) el-drag-end)", json_result=True)
+    motions, end = data["value"]
+    assert len(motions) == 4
+    # Motion posns walk the path monotonically and arrive after the down
+    # handler ran (it set track-mouse, as a real drag's down binding does).
+    points = [m[0] for m in motions]
+    assert points == sorted(points) and points[-1] == end
+    assert all(m[1] is True for m in motions)
+
+
+def test_mouse_drag_steps_stock_region(mouse_sess: S.Session) -> None:
+    data = mouse_sess.semantic().eval_form(
+        '(progn (switch-to-buffer "drag") (delete-other-windows)'
+        ' (erase-buffer) (insert "0123456789abcdef\\n") t)')
+    assert data["error"] is None
+    # mouse-drag-track consumes the motion events itself and still ends on
+    # the drag event's end posn.
+    result = S.mouse_event(mouse_sess, action="drag", buffer="drag",
+                           pos=3, to_pos=9, steps=3)
+    assert result["events"] == 5
+    data = mouse_sess.semantic().eval_form(
+        '(with-current-buffer "drag"'
+        ' (list (region-active-p) (region-beginning) (region-end)))')
+    assert data["value"] == "(t 3 9)"
+
+
+def test_mouse_steps_validation(gui_sess: S.Session) -> None:
+    with pytest.raises(ElateError, match="steps only applies to drag"):
+        S.mouse_event(gui_sess, action="click", steps=3)
+    with pytest.raises(ElateError, match="steps must be"):
+        S.mouse_event(gui_sess, action="drag", pos=1, to_pos=2, steps=999)
+
+
+def test_mouse_event_kinds_seeded(mouse_sess: S.Session) -> None:
+    # A sandbox Emacs never saw a real click, so the C layer never put
+    # event-kind on the mouse symbols; the agent seeds it so
+    # read-key-sequence expands the mode-line prefix and switches to the
+    # clicked buffer's keymaps for synthesized events too.
+    data = mouse_sess.semantic().eval_form(
+        "(list (get 'mouse-1 'event-kind) (get 'down-mouse-3 'event-kind)"
+        " (get 'drag-mouse-2 'event-kind) (get 'wheel-down 'event-kind))")
+    assert data["value"] == "(mouse-click mouse-click mouse-click mouse-click)"
+
+
+def test_mouse_modeline_click_runs_mode_line_binding(
+        mouse_sess: S.Session) -> None:
+    # The [mode-line mouse-1] binding of the CLICKED buffer fires -- not
+    # the selected buffer's plain mouse-1.
+    data = mouse_sess.semantic().eval_form(
+        '(progn (delete-other-windows) (switch-to-buffer "*scratch*")'
+        ' (split-window-below) (setq el-ml-hit nil)'
+        ' (with-current-buffer (get-buffer-create "ml-buf")'
+        '  (setq mode-line-format "plain mode line")'  # no construct local-maps
+        '  (use-local-map (make-sparse-keymap))'
+        '  (local-set-key [mode-line mouse-1]'
+        '   (lambda (e) (interactive "e")'
+        '    (setq el-ml-hit (buffer-name (window-buffer'
+        '                                  (posn-window (event-start e))))))))'
+        ' (set-window-buffer (next-window) "ml-buf")'
+        ' (buffer-name (window-buffer (selected-window))))')
+    assert data["value"] == '"*scratch*"'
+    result = S.mouse_event(mouse_sess, action="click", button=1,
+                           buffer="ml-buf", part="mode-line", col=3)
+    assert result["area"] == "mode-line" and result["events"] == 2
+    assert mouse_sess.semantic().eval_form("el-ml-hit")["value"] == '"ml-buf"'
+    mouse_sess.semantic().eval_form(
+        '(progn (delete-other-windows) (switch-to-buffer "*scratch*"))')
+
+
+AREA_SETUP = (
+    '(progn (switch-to-buffer "areas") (delete-other-windows) (erase-buffer)'
+    ' (dotimes (i 20) (insert (format "line %02d 0123456789abcdef\\n" i)))'
+    ' (setq header-line-format "HDR") (set-window-margins nil 3 2)'
+    ' (goto-char (point-min)) (setq el-area-hit nil)'
+    ' (use-local-map (make-sparse-keymap))'
+    ' (dolist (a (quote (header-line left-margin left-fringe right-fringe)))'
+    '  (local-set-key (vector a (quote mouse-1))'
+    '   (lambda (e) (interactive "e")'
+    '    (setq el-area-hit (list (posn-area (event-start e))'
+    '                            (posn-point (event-start e)))))))'
+    ' (split-window-below)'
+    ' (set-window-buffer (next-window) (get-buffer-create "below"))'
+    ' (redisplay) t)'
+)
+
+
+def _area_hit(sess: S.Session) -> Any:
+    return sess.semantic().eval_form("el-area-hit", json_result=True)["value"]
+
+
+def test_mouse_area_header_line_runs_its_binding(mouse_sess: S.Session) -> None:
+    assert mouse_sess.semantic().eval_form(AREA_SETUP)["error"] is None
+    result = S.mouse_event(mouse_sess, action="click", buffer="areas",
+                           part="header-line", col=2)
+    assert result["area"] == "header-line" and result["buffer"] == "areas"
+    assert _area_hit(mouse_sess) == ["header-line", None]
+
+
+def test_mouse_area_margin_and_fringe(mouse_sess: S.Session) -> None:
+    assert mouse_sess.semantic().eval_form(AREA_SETUP)["error"] is None
+    # The row is the one of --line; the posn carries that line's position.
+    result = S.mouse_event(mouse_sess, action="click", buffer="areas",
+                           part="left-margin", line=3)
+    assert result["area"] == "left-margin" and result["pos"] == 51
+    assert _area_hit(mouse_sess) == ["left-margin", 51]
+    if mouse_sess.ui == "gui":
+        result = S.mouse_event(mouse_sess, action="click", buffer="areas",
+                               part="right-fringe", line=2)
+        assert result["area"] == "right-fringe"
+        assert _area_hit(mouse_sess)[0] == "right-fringe"
+    else:
+        with pytest.raises(RpcError, match="TTY frames have none"):
+            S.mouse_event(mouse_sess, action="click", buffer="areas",
+                          part="right-fringe", line=2)
+
+
+def test_mouse_area_missing_is_actionable(mouse_sess: S.Session) -> None:
+    assert mouse_sess.semantic().eval_form(AREA_SETUP)["error"] is None
+    with pytest.raises(RpcError, match="header-line-format is nil"):
+        S.mouse_event(mouse_sess, action="click", buffer="below",
+                      part="header-line")
+    with pytest.raises(RpcError, match="set-window-margins"):
+        S.mouse_event(mouse_sess, action="click", buffer="below",
+                      part="right-margin")
+
+
+def test_mouse_pixel_offsets(mouse_sess: S.Session) -> None:
+    assert mouse_sess.semantic().eval_form(AREA_SETUP)["error"] is None
+    cw, ch = mouse_sess.semantic().eval_form(
+        "(list (frame-char-width) (frame-char-height))",
+        json_result=True)["value"]
+    # x/y are text-area pixels: the origin is the window start.
+    result = S.mouse_event(mouse_sess, action="click", buffer="areas",
+                           x=0, y=0)
+    assert result["pos"] == 1
+    # dx/dy offset the glyph's top-left: two cells right, bottom of the row
+    # (on a TTY a cell is the unit, so dy=ch-1 is 0 there).
+    result = S.mouse_event(mouse_sess, action="click", buffer="areas",
+                           line=3, col=4, dx=2 * cw, dy=ch - 1)
+    assert result["pos"] == 55 + 2
+    assert result["y"] == S.mouse_event(
+        mouse_sess, action="click", buffer="areas", line=3, col=4)["y"] + ch - 1
+
+
+def test_mouse_drag_to_other_window_and_outside(mouse_sess: S.Session) -> None:
+    assert mouse_sess.semantic().eval_form(AREA_SETUP)["error"] is None
+    setup = DRAG_MAP_SETUP.replace('"dragmap"', '"areas"').replace(
+        "(delete-other-windows)", "").replace(
+        " (erase-buffer) (dotimes (i 12) (insert (format \"line %02d abcdef\\n\" i)))",
+        "")
+    setup = setup.replace(
+        "(setq el-drag-end (posn-point (event-end e)))",
+        "(setq el-drag-end (let ((w (posn-window (event-end e))))"
+        " (if (windowp w) (buffer-name (window-buffer w)) \"frame\")))")
+    assert mouse_sess.semantic().eval_form(setup)["error"] is None
+    result = S.mouse_event(mouse_sess, action="drag", buffer="areas", line=2,
+                           col=1, to_buffer="below", to_line=1, to_col=0,
+                           steps=3)
+    assert result["to"]["buffer"] == "below" and result["events"] == 5
+    assert mouse_sess.semantic().eval_form("el-drag-end")["value"] == '"below"'
+    result = S.mouse_event(mouse_sess, action="drag", buffer="areas", line=2,
+                           col=1, to_part="outside")
+    assert result["to"] == {"buffer": None, "area": "outside", "pos": None,
+                            "x": -1, "y": 0}
+    assert mouse_sess.semantic().eval_form("el-drag-end")["value"] == '"frame"'
+
+
+def test_mouse_modeline_default_column_on_side_by_side_split(
+        mouse_sess: S.Session) -> None:
+    # The rightmost cell of a non-rightmost window's mode line is the
+    # vertical-line grab zone, and on a 45-column window the major-mode
+    # construct (a menu keymap) reaches the edge; the default column
+    # skips both.
+    data = mouse_sess.semantic().eval_form(
+        '(progn (delete-other-windows) (switch-to-buffer "*scratch*")'
+        ' (split-window-right)'
+        ' (set-window-buffer (next-window) (get-buffer-create "ml-right"))'
+        ' (redisplay) t)')
+    assert data["error"] is None
+    result = S.mouse_event(mouse_sess, action="click", part="mode-line")
+    assert result["area"] == "mode-line" and result["buffer"] == "*scratch*"
+    mouse_sess.semantic().eval_form('(progn (delete-other-windows) t)')
+
+
+def test_mouse_header_line_under_tab_line(mouse_sess: S.Session) -> None:
+    assert mouse_sess.semantic().eval_form(AREA_SETUP)["error"] is None
+    mouse_sess.semantic().eval_form(
+        '(with-current-buffer "areas" (setq tab-line-format "TAB")'
+        ' (local-set-key [tab-line mouse-1] #\'ignore) (redisplay) t)')
+    hdr = S.mouse_event(mouse_sess, action="click", buffer="areas",
+                        part="header-line", col=1)
+    tab = S.mouse_event(mouse_sess, action="click", buffer="areas",
+                        part="tab-line", col=1)
+    assert hdr["area"] == "header-line" and tab["area"] == "tab-line"
+    assert tab["y"] < hdr["y"]
+
+
+def test_mouse_offset_off_frame_is_reported(mouse_sess: S.Session) -> None:
+    assert mouse_sess.semantic().eval_form(AREA_SETUP)["error"] is None
+    with pytest.raises(RpcError, match="left of or above the frame"):
+        S.mouse_event(mouse_sess, action="click", buffer="areas", line=1,
+                      col=0, dx=-500)
+
+
+def test_mouse_unbound_area_click_names_the_target(mouse_sess: S.Session) -> None:
+    assert mouse_sess.semantic().eval_form(AREA_SETUP)["error"] is None
+    # No [right-margin mouse-1] binding anywhere: Emacs dings (undefined
+    # key), which would surface as "macro terminated by ringing the bell".
+    with pytest.raises(RpcError, match=r"rang the bell.*right-margin.*areas"):
+        S.mouse_event(mouse_sess, action="click", buffer="areas",
+                      part="right-margin", line=2)
+
+
+def test_mouse_target_validation(gui_sess: S.Session) -> None:
+    with pytest.raises(ElateError, match="x and y go together"):
+        S.mouse_event(gui_sess, action="click", x=3)
+    with pytest.raises(ElateError, match="replace pos/line"):
+        S.mouse_event(gui_sess, action="click", x=3, y=3, pos=1)
+    with pytest.raises(ElateError, match="x/y replace part"):
+        S.mouse_event(gui_sess, action="click", x=3, y=3, part="mode-line")
+    with pytest.raises(ElateError, match=r"to_\* only applies to drag"):
+        S.mouse_event(gui_sess, action="click", to_buffer="x")
+    with pytest.raises(ElateError, match="unknown mouse to_part"):
+        S.mouse_event(gui_sess, action="drag", pos=1, to_part="roof")
+
+
 def test_mouse_modeline_click_selects_window(mouse_sess: S.Session) -> None:
     data = mouse_sess.semantic().eval_form(
         '(progn (delete-other-windows) (switch-to-buffer "*scratch*")'
@@ -431,8 +685,12 @@ def test_mouse_modeline_click_selects_window(mouse_sess: S.Session) -> None:
         ' (buffer-name (window-buffer (selected-window))))'
     )
     assert data["value"] == '"*scratch*"'
+    # The default column is the rightmost one whose construct has no
+    # keymap: there the global [mode-line mouse-1] (mouse-select-window)
+    # applies. Low columns sit on constructs with their own local-map
+    # (coding system, buffer name), which win -- as for a real click.
     result = S.mouse_event(mouse_sess, action="click", button=1,
-                           buffer="other-buf", part="mode-line", col=3)
+                           buffer="other-buf", part="mode-line")
     assert result["area"] == "mode-line"
     data = mouse_sess.semantic().eval_form(
         "(buffer-name (window-buffer (selected-window)))")
@@ -682,6 +940,113 @@ def test_screenshot_ansi_rejected_on_gui(gui_sess: S.Session,
 
 
 # -- window-info and the real pointer ------------------------------------------
+
+def test_lines_geometry(mouse_sess: S.Session) -> None:
+    data = mouse_sess.semantic().eval_form(
+        '(progn (switch-to-buffer "lines") (delete-other-windows)'
+        ' (erase-buffer)'
+        ' (dotimes (i 60) (insert (format "line %02d " i))'
+        '  (when (= i 3) (insert (propertize "TALL" (quote face)'
+        '                                     (quote (:height 2.0)))))'
+        '  (when (= i 5) (insert (make-string 300 ?x))) (insert "\\n"))'
+        ' (goto-char (point-min)) (redisplay) t)')
+    assert data["error"] is None
+    info = S.window_lines(mouse_sess, buffer="lines")
+    assert info["buffer"] == "lines" and info["start"] == 1
+    rows = info["lines"]
+    assert [r["index"] for r in rows] == list(range(len(rows)))
+    # Contiguous coverage from window-start; each row's end starts the next.
+    assert rows[0]["start"] == 1
+    assert all(a["end"] == b["start"] for a, b in zip(rows, rows[1:]))
+    assert all(r["y"] == rows[i - 1]["y"] + rows[i - 1]["height"]
+               for i, r in enumerate(rows) if i)
+    gui = mouse_sess.ui == "gui"
+    assert info["units"] == ("pixels" if gui else "chars")
+    cell = info["char-height"]
+    assert rows[0]["height"] == cell and rows[0]["line"] == 1
+    # The TALL face doubles row 3's height on a GUI frame.
+    assert rows[3]["line"] == 4 and (rows[3]["height"] > cell) is gui
+    # The 300-x line wraps: several screen lines share buffer line 6.
+    wrapped = [r for r in rows if r["line"] == 6]
+    assert len(wrapped) >= 3 and wrapped[0]["start"] == 50
+    assert rows[-1]["end"] >= info["end"]
+    if rows[-1]["partial"]:  # height is the visible part at the bottom too
+        assert rows[-1]["height"] + rows[-1]["clipped-bottom"] == cell
+    # Rows cover the body exactly: no clamped phantom row past the last.
+    assert rows[-1]["y"] + rows[-1]["height"] <= info["body-height"]
+    assert rows[-1]["y"] + rows[-1]["height"] + rows[-1]["clipped-bottom"] \
+        >= info["body-height"]
+    assert info["body-height"] <= info["text-area"][3] - info["text-area"][1]
+    with pytest.raises(RpcError, match="not displayed"):
+        S.window_lines(mouse_sess, buffer="no-such-buffer")
+
+
+def test_lines_y_is_text_area_relative(mouse_sess: S.Session) -> None:
+    # A header line shifts the text area down; y stays 0 for the first row
+    # (the frame mouse --y uses), and the body height shrinks accordingly.
+    data = mouse_sess.semantic().eval_form(
+        '(progn (switch-to-buffer "lines-hdr") (delete-other-windows)'
+        ' (erase-buffer) (insert "a\\nb\\nc\\n")'
+        ' (setq header-line-format "HDR") (redisplay) t)')
+    assert data["error"] is None
+    info = S.window_lines(mouse_sess, buffer="lines-hdr")
+    assert info["header-line-height"] > 0
+    assert info["lines"][0]["y"] == 0
+    assert info["body-height"] == info["text-area"][3] - info["text-area"][1]
+    # mouse --y 0 lands on the first row, below the header line.
+    hit = S.mouse_event(mouse_sess, action="click", buffer="lines-hdr",
+                        x=0, y=0)
+    assert hit["pos"] == 1 and hit["area"] is None
+
+
+def test_lines_skips_rows_of_multiline_display_strings(
+        mouse_sess: S.Session) -> None:
+    data = mouse_sess.semantic().eval_form(
+        '(progn (switch-to-buffer "lines-disp") (delete-other-windows)'
+        ' (erase-buffer) (insert "aaa\\nbbb\\nccc\\nddd\\n")'
+        ' (put-text-property 6 7 (quote display) "X\\nY\\nZ")'
+        ' (goto-char (point-min)) (redisplay) t)')
+    assert data["error"] is None
+    rows = S.window_lines(mouse_sess, buffer="lines-disp")["lines"]
+    by_start = {r["start"]: r for r in rows}
+    # "bbb" occupies three screen rows: index jumps by 3, y by 3 rows, and
+    # "ccc" is where pos-visible-in-window-p puts it.
+    cell = rows[0]["height"]
+    assert by_start[5]["index"] == 1 and by_start[9]["index"] == 4
+    assert by_start[9]["y"] == 4 * cell
+    y = mouse_sess.semantic().eval_form(
+        '(cadr (pos-visible-in-window-p 9 (get-buffer-window "lines-disp") t))')
+    assert int(y["value"]) == by_start[9]["y"]
+
+
+def test_lines_vscroll_partial_row(gui_sess: S.Session) -> None:
+    # vscroll hides the top 5px of the first row: y goes negative, the
+    # visible height shrinks, and the row is flagged partial.
+    data = gui_sess.semantic().eval_form(
+        '(progn (switch-to-buffer "lines-vs") (delete-other-windows)'
+        ' (erase-buffer) (dotimes (i 60) (insert (format "line %02d\\n" i)))'
+        ' (goto-char (point-min)) (forward-line 10) (redisplay)'
+        ' (set-window-vscroll nil 5 t) (redisplay) (window-vscroll nil t))')
+    assert data["value"] == "5", data
+    info = S.window_lines(gui_sess, buffer="lines-vs")
+    first = info["lines"][0]
+    assert info["vscroll"] == 5
+    assert first["y"] == -5 and first["clipped-top"] == 5
+    assert first["partial"] is True
+    assert first["height"] == info["char-height"] - 5
+    gui_sess.semantic().eval_form("(set-window-vscroll nil 0 t)")
+
+
+def test_lines_cli(gui_sess: S.Session,
+                   capsys: pytest.CaptureFixture[str]) -> None:
+    reset_scratch(gui_sess)
+    code = cli.main(["--human", "-s", NAME, "lines"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert out.startswith("*scratch*: window-start 1 window-end")
+    assert "  idx  start..end     line     y  height  note" in out
+    assert "    0      1..1          1     0  " in out
+
 
 def test_window_info_gui(gui_sess: S.Session) -> None:
     reset_scratch(gui_sess)

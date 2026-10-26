@@ -455,13 +455,18 @@ def test_reap_group_and_count_group_tolerate_no_pgid() -> None:
 
 def _eval_args(**kw) -> object:
     import argparse
-    base = {"form": None, "source_file": None}
+    base = {"form": None, "source_file": None, "defun": None, "rev": None}
     base.update(kw)
     return argparse.Namespace(**base)
 
 
+def _src(args: object) -> str:
+    """The resolved source (no session needed: nothing here uses --defun/--rev)."""
+    return cli._eval_source(args, None)[0]
+
+
 def test_eval_source_positional_form() -> None:
-    assert cli._eval_source(_eval_args(form="(+ 1 2)")) == "(+ 1 2)"
+    assert _src(_eval_args(form="(+ 1 2)")) == "(+ 1 2)"
 
 
 def test_eval_source_from_file(tmp_path: Path) -> None:
@@ -470,41 +475,49 @@ def test_eval_source_from_file(tmp_path: Path) -> None:
     src = "(list #'car 'private \"it's\")\n(+ 1 2)\n"
     p = tmp_path / "forms.el"
     p.write_text(src, encoding="utf-8")
-    assert cli._eval_source(_eval_args(source_file=str(p))) == src
+    assert _src(_eval_args(source_file=str(p))) == src
 
 
 def test_eval_source_from_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
     import io
     monkeypatch.setattr(sys, "stdin", io.StringIO("#'identity"))
-    assert cli._eval_source(_eval_args(source_file="-")) == "#'identity"
+    assert _src(_eval_args(source_file="-")) == "#'identity"
 
 
 def test_eval_source_form_and_file_conflict(tmp_path: Path) -> None:
     from elate.errors import UsageError
     with pytest.raises(UsageError, match="not both"):
-        cli._eval_source(_eval_args(form="(+ 1 2)", source_file="x.el"))
+        _src(_eval_args(form="(+ 1 2)", source_file="x.el"))
 
 
 def test_eval_source_neither_errors() -> None:
     from elate.errors import UsageError
     with pytest.raises(UsageError, match="FORM argument or --file"):
-        cli._eval_source(_eval_args())
+        _src(_eval_args())
 
 
 def test_eval_source_missing_file_errors() -> None:
     from elate.errors import ElateError
     with pytest.raises(ElateError, match="cannot read --file"):
-        cli._eval_source(_eval_args(source_file="/nonexistent/forms.el"))
+        _src(_eval_args(source_file="/nonexistent/forms.el"))
 
 
 def test_eval_source_cap(tmp_path: Path,
                          monkeypatch: pytest.MonkeyPatch) -> None:
     p = tmp_path / "big.el"
     p.write_text("x" * 100, encoding="utf-8")
-    monkeypatch.setattr(cli, "_EVAL_SOURCE_CAP", 10)
+    monkeypatch.setattr(S, "EVAL_SOURCE_CAP", 10)
     from elate.errors import ElateError
     with pytest.raises(ElateError, match="KiB cap"):
-        cli._eval_source(_eval_args(source_file=str(p)))
+        _src(_eval_args(source_file=str(p)))
+
+
+def test_eval_source_defun_and_rev_need_a_file() -> None:
+    from elate.errors import UsageError
+    with pytest.raises(UsageError, match="need --file"):
+        _src(_eval_args(form="(+ 1 2)", defun="f"))
+    with pytest.raises(UsageError, match="not stdin"):
+        _src(_eval_args(source_file="-", rev="HEAD"))
 
 
 # -- interrupt: GUI default must be the non-fatal recovery -------------------

@@ -15,7 +15,8 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   subcommand. Stopped sessions keep an inert sandbox (and a `stopped`
   list entry) at `~/.cache/elate/sessions/<name>` for their transcripts —
   `elate purge NAME…`/`elate purge --all` deletes them (never running
-  sessions; `prune` is an alias); `elate purge --stopped-older-than 1h`
+  sessions; `prune` is an alias; `stop --purge` stops and deletes in one
+  call); `elate purge --stopped-older-than 1h`
   GCs only stale ones (`elate list --older-than 1h` previews them).
   `start` auto-names when `--name` is omitted; `start --name X --replace`
   recreates a live `X`; `stop` is idempotent (missing session = no-op) and
@@ -58,6 +59,16 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   `records` (`{fn, depth, args, ret, error}` per call, completion order;
   assert on those, never regex the raw text). `faces-at --pos N` /
   `--run K` reads cells by position / a run at once.
+- `state` reports `windows-appeared` (buffers newly shown since the
+  previous `state` on this session) and `alerts` (visible `*Warnings*`/
+  `*Backtrace*`), so
+  a layout that changed under you is named.
+- `mouse` targets any window part (`--area header-line|left-fringe|…|
+  outside`, `--mode-line`), takes pixel offsets (`--dx/--dy`, raw `--x/--y`
+  in the text area), and `drag --steps N` emits real `mouse-movement`
+  events; `--to-buffer`/`--to-area` end a drag elsewhere. `lines` gives
+  per-screen-line geometry (buffer start/end, y, height, partial rows,
+  vscroll) — the input for row-precise clicks and any scrolling check.
 - Below the command loop (GUI only): `window-info` returns per-frame X11
   window ids **as ints** + absolute pixel edges per window; `pointer
   warp/query` drives the REAL pointer (`mouse` synthesizes command-loop
@@ -78,7 +89,9 @@ RECIPES.md, SCRIPTING.md); README has the human-oriented tour.
   error), or the global `--field NAME` (one envelope field bare) — never
   regex a printed plist. Quote-heavy source (`#'fn`, `'sym`) that shell
   single-quoting would mangle: `eval --file forms.el` (or `--file -` for
-  stdin) runs it verbatim.
+  stdin) runs it verbatim. `eval --file pkg.el --defun NAME [--rev REV]`
+  evaluates one definition only, optionally as it is at a git revision;
+  rerun without `--rev` to restore the working-tree version.
 - Crashes/hangs: a form that crashes Emacs comes back as `session_died`
   with the fatal `signal` + OS `crash_report` path (also via `wait dead` /
   `info` / `list`, which renders `dead (SIGABRT)`); `eval --on-timeout

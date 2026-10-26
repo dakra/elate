@@ -1129,9 +1129,161 @@ def test_focus_set_focus_state_shim(sess: S.Session) -> None:
     assert sess.semantic().eval_form("(frame-focus-state)")["value"] == "t"
 
 
+def test_send_events_scripted_drag_path(sess: S.Session) -> None:
+    sess.semantic().eval_form(
+        '(progn (switch-to-buffer "dragpath") (delete-other-windows)'
+        ' (erase-buffer) (dotimes (i 6) (insert "0123456789\\n"))'
+        ' (goto-char (point-min)) (deactivate-mark) t)')
+    # down, two motions, drag: the drag starts at the down location, so
+    # stock mouse-drag-track selects down..drag-end.
+    data = S.send_events(sess, ["down-mouse-1@1,2", "mouse-movement@2,4",
+                                "mouse-movement@3,1", "drag-mouse-1@4,5"],
+                         buffer="dragpath")
+    assert data["queued"] == 4 and data["batches"] == 1
+    S.wait_idle(sess, timeout=5.0)
+    data = sess.semantic().eval_form(
+        '(with-current-buffer "dragpath"'
+        ' (list (region-active-p) (region-beginning) (region-end)))')
+    assert data["value"] == "(t 3 39)"
+
+
+def test_eval_defun_swaps_one_definition_by_git_revision(
+        sess: S.Session, tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
+    import subprocess
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    el = repo / "pkg.el"
+    v1 = (";;; pkg.el --- t -*- lexical-binding: t; -*-\n"
+          "(defun pkg-answer () \"Old.\" (let ((x 1)) (lambda () x)))\n"
+          "(defun pkg-other () 'other)\n"
+          "(defvar pkg-var)\n"
+          "(define-key global-map (kbd \"C-c C-z\") 'ignore)\n"
+          "(defvar pkg-var 'v1 \"Real.\")\n"
+          "(defvar global-map 'shadow)\n")
+    el.write_text(v1, encoding="utf-8")
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
+           "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t"}
+    git = ["git", "-C", str(repo)]
+    subprocess.run([*git, "init", "-q"], check=True, env=env)
+    subprocess.run([*git, "add", "pkg.el"], check=True, env=env)
+    subprocess.run([*git, "commit", "-q", "-m", "v1"], check=True, env=env)
+    el.write_text(v1.replace("Old.", "New.").replace("'other", "'changed"),
+                  encoding="utf-8")
+
+    def run_file(path, *extra: str) -> dict:
+        code = cli.main(["--json", "-s", NAME, "eval", "--file", str(path),
+                         *extra])
+        out = json.loads(capsys.readouterr().out)
+        return {**out, "code": code}
+
+    def run(*extra: str) -> dict:
+        return run_file(el, *extra)
+
+    # Working tree: only pkg-answer, nothing else from the file.
+    out = run("--defun", "pkg-answer")
+    assert out["code"] == 0 and out["defun"] == "pkg-answer"
+    assert out["value"] == {"name": "pkg-answer", "type": "defun", "line": 2,
+                            "lexical": True}
+    doc = sess.semantic().eval_form(
+        "(list (documentation 'pkg-answer) (fboundp 'pkg-other)"
+        " (boundp 'pkg-var))")
+    assert doc["value"] == '("New." nil nil)'
+    # The lexical-binding cookie was honored: the closure captured x.
+    assert sess.semantic().eval_form("(funcall (pkg-answer))")["value"] == "1"
+    # Same name at HEAD swaps the old definition in; without --rev restores.
+    out = run("--defun", "pkg-answer", "--rev", "HEAD")
+    assert out["code"] == 0 and out["rev"] == "HEAD"
+    assert out["source_path"].endswith("rev-HEAD-pkg.el")
+    assert sess.semantic().eval_form(
+        "(documentation 'pkg-answer)")["value"] == '"Old."'
+    run("--defun", "pkg-answer")
+    assert sess.semantic().eval_form(
+        "(documentation 'pkg-answer)")["value"] == '"New."'
+    # The last definer wins (a forward (defvar pkg-var) does not shadow
+    # the real one), and non-definer forms such as define-key are never
+    # taken for a definition.
+    out = run("--defun", "pkg-var")
+    assert out["value"]["line"] == 6
+    assert sess.semantic().eval_form("pkg-var")["value"] == "v1"
+    out = run("--defun", "global-map")
+    assert out["value"] == {"name": "global-map", "type": "defvar",
+                            "line": 7, "lexical": True}
+    assert sess.semantic().eval_form(
+        "(key-binding (kbd \"C-c C-z\"))")["value"] == "nil"
+    # No cookie: dynamic binding, flagged as such; evaluated in --buffer.
+    dyn = repo / "dyn.el"
+    dyn.write_text("(defvar dyn-where (buffer-name))\n", encoding="utf-8")
+    out = run_file(dyn, "--defun", "dyn-where", "--buffer", "*Messages*")
+    assert not out["value"]["lexical"]  # nil -> null
+    assert sess.semantic().eval_form("dyn-where")["value"] == '"*Messages*"'
+    # Whole file at a revision.
+    out = run("--rev", "HEAD")
+    assert out["code"] == 0 and sess.semantic().eval_form(
+        "(pkg-other)")["value"] == "other"
+    # Failure modes are plain errors, not tracebacks.
+    out = run("--defun", "pkg-nope")
+    assert out["code"] == 1 and "no top-level definition of pkg-nope" in out["error"]
+    bad = repo / "bad.el"
+    bad.write_text("(defun bad-fn (\n", encoding="utf-8")
+    out = run_file(bad, "--defun", "bad-fn")
+    assert out["code"] == 1 and "cannot read the definition at" in out["error"]
+    code = cli.main(["--json", "-s", NAME, "eval", "--file", str(el),
+                     "--rev", "nope-rev"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and "git show nope-rev" in out["error"]
+
+
 def test_send_events_bad_token_raises(sess: S.Session) -> None:
     with pytest.raises(ElateError, match="unknown event token"):
         S.send_events(sess, ["definitely-bogus"])
+
+
+def test_state_reports_windows_that_appeared(sess: S.Session) -> None:
+    sess.semantic().eval_form(
+        '(progn (delete-other-windows) (switch-to-buffer "*scratch*")'
+        ' (dolist (b (list "*Warnings*" "*Backtrace*"))'
+        '  (when (get-buffer b) (kill-buffer b))) t)')
+    sess.semantic().rpc("state")  # baseline: whatever earlier tests left
+    base = sess.semantic().rpc("state")
+    assert base["windows-appeared"] == [] and base["alerts"] == []
+    # A stray warning splits the frame -- exactly the layout change that
+    # went unnoticed for two tasks in the field.
+    sess.semantic().eval_form('(display-warning (quote elate) "stray")')
+    S.wait_idle(sess, timeout=5.0)
+    # Internal snapshots (a failed wait's error report, wait-prompt
+    # polling) peek at the news without consuming it.
+    with pytest.raises(WaitTimeout):
+        S.wait_prompt(sess, timeout=0.3)
+    S.state_dump(sess)
+    data = sess.semantic().rpc("state")
+    assert data["windows-appeared"] == ["*Warnings*"]
+    assert data["alerts"] == ["*Warnings*"]
+    human = cli._human_state(data)
+    assert "windows appeared since last state: *Warnings*" in human
+    assert "!! *Warnings* window is showing" in human
+    # The baseline moved: nothing is new, the alert stays while it is up.
+    again = sess.semantic().rpc("state")
+    assert again["windows-appeared"] == [] and again["alerts"] == ["*Warnings*"]
+    # A delta since the baseline carries both (and counts as a change).
+    delta = sess.semantic().rpc("state", base["token"])
+    assert delta["mode"] == "delta" and delta["alerts"] == ["*Warnings*"]
+    # Alerts alone (nothing else moved) are not "no change" to a human.
+    quiet = sess.semantic().rpc("state", again["token"])
+    assert quiet["changed"] is False and quiet["alerts"] == ["*Warnings*"]
+    assert "!! *Warnings* window is showing" in cli._human_delta(quiet)
+    sess.semantic().eval_form(
+        '(progn (delete-other-windows) (switch-to-buffer "*scratch*")'
+        ' (split-window-below) (set-window-buffer (next-window)'
+        '  (get-buffer-create "appeared-buf")) t)')
+    delta = sess.semantic().rpc("state", again["token"])
+    assert delta["changed"] is True
+    assert delta["windows-appeared"] == ["appeared-buf"]
+    assert "alerts" not in delta
+    assert "windows appeared since last state: appeared-buf" in \
+        cli._human_delta(delta)
+    sess.semantic().eval_form('(progn (delete-other-windows) t)')
 
 
 def test_stop_session(sess: S.Session) -> None:

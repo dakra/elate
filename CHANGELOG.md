@@ -2,6 +2,65 @@
 
 ## Unreleased
 
+Mouse and geometry round, from agents regression-testing a terminal
+emulator's mouse handling with elate 0.15.0:
+
+- **Drags now move**: `mouse drag --steps N` (MCP `steps`, scenario
+  `steps`) emits N `mouse-movement` events spread along the path between
+  the down and the drag event — so transient drag maps and
+  `mouse-drag-track` motion handlers run on the real dispatch path
+  instead of being called by hand. `send-events` gains `mouse-movement`
+  and `drag-mouse-N` tokens for scripting a drag path explicitly (the
+  drag event starts at the batch's latest down-mouse location).
+- **Mouse targets beyond buffer text**: `mouse --area header-line|
+  tab-line|left-fringe|right-fringe|left-margin|right-margin|outside`
+  (`--mode-line` stays as the alias of `--area mode-line`; MCP/scenario
+  `part`) on click, double, drag and wheel, and `--to-area` /
+  `--to-buffer` for a drag end in another window part or window --
+  including a frame posn off every window (`outside`), what a drag that
+  leaves the frame reports. Pixel control: `--dx`/`--dy` offset the
+  resolved point (e.g. the bottom of a tall row), `--x`/`--y` give raw
+  pixels relative to the window's text area; both have `--to-` twins.
+  Results now carry the resolved posn (`buffer`, `area`, `pos`, frame
+  pixel `x`/`y`) and, for drags, the same under `to`. An unbound key at
+  the target (Emacs rings the bell, aborting the macro) is reported with
+  the target instead of "Keyboard macro terminated by a command ringing
+  the bell".
+- **`lines`** (CLI, MCP `elate_lines`): per-screen-line display geometry
+  of a window — for each visible row its buffer start/end (a wrapped
+  buffer line yields several rows), buffer line number, y and visible
+  height relative to the text area, hidden pixels at the top/bottom and
+  a partial flag; plus window-start/end, vscroll, hscroll, text-area
+  size and frame edges, cell size and tab/header/mode line heights.
+  Cells on a TTY. Replaces the `window-line-height` loop every
+  row-height check used to start with, and feeds `mouse --y`/`--dy`.
+- **`eval --file F --defun NAME [--rev REV]`** (MCP `defun`/`rev`):
+  evaluate one top-level definition from a file — the last `(def...
+  NAME` form, as under `load`, read by the Lisp reader and run under the file's
+  lexical-binding cookie, nothing else loading — optionally as it is at
+  a git revision (`git show REV:F`); rerun without `--rev` to restore
+  the working-tree version. `--rev` alone evaluates the whole file at
+  that revision. The old-vs-new comparison every A/B check hand-rolled
+  with `git show | extract | load`, without the stale restore file.
+- **`state` names layout changes**: `windows-appeared` lists buffers
+  newly shown in a window since the previous `state` call (a `*Warnings*`
+  split from a stray warning, a popup, a `*Backtrace*`) and `alerts`
+  lists visible `*Warnings*`/`*Backtrace*` windows as long as they are
+  up; both in full snapshots and (when non-empty) in `--since` deltas,
+  and called out in the human output.
+- **`stop --purge`** (MCP `elate_stop` `purge`): stop and delete the
+  sandbox in one call, also with the bulk selectors.
+- **Mode-line clicks dispatch like real ones** (fix): a sandbox Emacs that
+  never saw a real click lacks the `event-kind` property on the mouse
+  symbols, and `read-key-sequence` keys both the `mode-line` prefix
+  expansion and the switch to the clicked buffer's keymaps on it. Every
+  synthesized click used to dispatch as a plain `mouse-N` looked up in the
+  selected buffer; the agent now seeds the property, so `[mode-line
+  mouse-1]` bindings fire and `--buffer` clicks use that buffer's keymaps.
+  Visible change: a mode-line click runs the construct's own map at that
+  column (buffer name, coding system); the filler columns select the
+  window as before. The down event is now sent for mode-line clicks too.
+
 - **`purge --stopped-older-than` works standalone**: the age bound is now
   a selector in its own right — `elate purge --stopped-older-than 1h`
   sweeps every session inert at least that long, exactly the command the
