@@ -1,9 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.16.0
 
-Mouse and geometry round, from agents regression-testing a terminal
-emulator's mouse handling with elate 0.15.0:
+Mouse and display-geometry round, from agents regression-testing a
+terminal emulator's mouse handling with elate 0.15.0: drags that never
+moved, window parts that could not be targeted, clicks pinned to a
+row's top edge, a row-height loop every check started with, a stale
+restore file in every A/B comparison, and a `*Warnings*` split that
+went unnoticed for two tasks. Each round was adversarially reviewed;
+that review surfaced the `event-kind` dispatch bug below.
 
 - **Drags now move**: `mouse drag --steps N` (MCP `steps`, scenario
   `steps`) emits N `mouse-movement` events spread along the path between
