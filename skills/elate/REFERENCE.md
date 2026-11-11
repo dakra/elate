@@ -27,6 +27,7 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 - [`elate purge`](#elate-purge)
 - [`elate prune`](#elate-prune)
 - [`elate info`](#elate-info)
+- [`elate ps`](#elate-ps)
 - [`elate path`](#elate-path)
 - [`elate keys`](#elate-keys)
 - [`elate type`](#elate-type)
@@ -85,8 +86,9 @@ start a new sandboxed session
 - `--home-seed DIR` -- copy this fixture tree into the sandbox's fake $HOME before launch (rc files in place before any subprocess spawns; keeps sandbox isolation)
 - `--env KEY=VALUE` (repeatable) -- set an environment variable for the Emacs process and the subprocesses it spawns (repeatable); cannot override the sandbox's HOME/XDG_* isolation vars
 - `--size COLSxROWS` (default: 120x36)
-- `--owner NAME` -- tag the session with an owner (e.g. an agent id); list/stop/purge can then select by --owner, so concurrent agents manage only their own sessions
+- `--owner NAME` -- tag the session with an owner (e.g. an agent id); list/stop/purge can then select by --owner, so concurrent agents manage only their own sessions. Default: $ELATE_OWNER, else derived from the Claude Code session id (select those with --mine)
 - `--ttl DUR` -- idle time-to-live (e.g. 30m, 2h; bare number = seconds, minimum 30s): once the session has seen no commands for this long it is stopped AND purged by an opportunistic sweep any later elate command runs -- so sessions leaked by a crashed agent clean themselves up instead of accumulating
+- `--allow-init-error` -- exit 0 even when startup code (--eval, --load, --eval-file, --init-file, ...) signals; by default that exits 1, with the session left running for inspection and the error in init_error
 
 ## elate stop
 
@@ -97,6 +99,7 @@ stop a session (or --all / a filter)
 - `--glob PATTERN` -- stop running sessions whose name matches this glob (e.g. 'rx-*') -- a bulk selector like --all
 - `--name-prefix PREFIX` -- stop running sessions whose name starts with PREFIX -- a bulk selector like --all
 - `--owner NAME` -- stop running sessions started with --owner NAME; combines with --glob/--name-prefix
+- `--mine` -- same as --owner with this agent's default owner tag ($ELATE_OWNER, else the Claude Code session)
 - `--purge` -- also delete the sandbox (transcript, logs, scratch) once stopped -- `stop` + `purge NAME` in one call, for sessions nobody will look at again
 
 ## elate interrupt
@@ -125,6 +128,7 @@ list known sessions
 - `[name]` -- only this session (or use -s NAME)
 - `--status {running,stopped,all}` (default: all) -- filter by liveness: running, stopped (stopped/dead/corrupt), or all (default)
 - `--owner NAME` -- only sessions started with --owner NAME
+- `--mine` -- same as --owner with this agent's default owner tag ($ELATE_OWNER, else the Claude Code session)
 - `--older-than DUR` -- only show sessions inert at least this long (e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- running sessions are excluded; pairs with `purge --stopped-older-than`
 
 ## elate purge
@@ -139,6 +143,7 @@ Delete the sandbox directories (transcripts included) of sessions that are no lo
 - `--glob PATTERN` -- purge sessions whose name matches this glob (e.g. 'run-*') -- a bulk selector like --all; running matches are skipped
 - `--name-prefix PREFIX` -- purge sessions whose name starts with PREFIX (e.g. 'run-') -- a bulk selector like --all
 - `--owner NAME` -- purge sessions started with --owner NAME -- a bulk selector like --all; combines with the other filters
+- `--mine` -- same as --owner with this agent's default owner tag ($ELATE_OWNER, else the Claude Code session)
 
 ## elate prune
 
@@ -152,10 +157,19 @@ Alias for `purge`: delete the sandbox directories of sessions that are no longer
 - `--glob PATTERN` -- prune sessions whose name matches this glob (e.g. 'run-*') -- a bulk selector like --all
 - `--name-prefix PREFIX` -- prune sessions whose name starts with PREFIX (e.g. 'run-') -- a bulk selector like --all
 - `--owner NAME` -- prune sessions started with --owner NAME -- a bulk selector like --all
+- `--mine` -- same as --owner with this agent's default owner tag ($ELATE_OWNER, else the Claude Code session)
 
 ## elate info
 
 show session details
+
+- `[name]` -- session name (or use -s NAME)
+
+## elate ps
+
+list the processes a session's Emacs started
+
+List the session's process tree: Emacs, then every process it started, by start time -- found by parent pid and by the session's environment marker ($ELATE_SCRATCH), so daemonized children and survivors of a crashed Emacs show up as 'detached'. These are exactly the processes `stop` kills if they outlive Emacs; anything not listed is not the session's -- except, on macOS, a daemonized system binary (/bin, /usr/bin), whose environment is unreadable.
 
 - `[name]` -- session name (or use -s NAME)
 

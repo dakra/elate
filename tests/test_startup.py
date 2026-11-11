@@ -115,3 +115,19 @@ def test_require_rejects_non_symbol_feature(tmp_path):
     with pytest.raises(ElateError, match="feature name"):
         sandbox.build_sandbox(tmp_path / "sess",
                               requires=["(malicious-form)"])
+
+
+def test_relative_startup_paths_resolve_against_cwd(tmp_path, monkeypatch):
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "setup.el").write_text("(setq x 1)\n", encoding="utf-8")
+    (tmp_path / "seed").mkdir()
+    (tmp_path / "seed" / ".rc").write_text("rc\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / "sess"
+    sandbox.build_sandbox(sd, eval_files=["lib/setup.el"],
+                          profiles=["./lib/setup.el"], home_seed="seed")
+    init = _init_el(sd)
+    # Emacs's `load' searches load-path for a relative name, so the
+    # generated init must carry the absolute path.
+    assert init.count(f'(load "{tmp_path.resolve() / "lib" / "setup.el"}" nil t)') == 2
+    assert (sd / "home" / ".rc").is_file()

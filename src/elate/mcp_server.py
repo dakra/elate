@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import functools
 import json
+import os
 import re
 import sys
 import time
@@ -245,6 +246,10 @@ def elate_start(
         "later elate command stops AND purges it -- so sessions leaked by "
         "a crashed agent clean themselves up. Omit for no deadline."))]
         = None,
+    allow_init_error: Annotated[bool, Field(description=(
+        "Return ok even when startup code signals. By default a startup "
+        "error makes the call fail (ok: false, error, init_error) with the "
+        "session left running for inspection -- elate_stop it."))] = False,
 ) -> str:
     """Start a new sandboxed Emacs session (TTY or GUI).
 
@@ -252,9 +257,10 @@ def elate_start(
     emacsclient socket), boots Emacs inside it (tmux-hosted -nw for
     ui='tty'; a desktop window for ui='gui'), and waits for the in-Emacs
     agent to answer. Returns session info incl. emacs_version and the
-    sandbox path. If startup elisp signalled an error the session still
-    runs and the response carries it as "init_error" -- check it. Fails
-    if a session of that name is already running. After starting, drive
+    sandbox path. If startup elisp signalled an error the call fails
+    (ok: false) with the error in "init_error"; the session keeps running
+    for inspection (allow_init_error accepts it). Fails if a session of
+    that name is already running. After starting, drive
     it with elate_keys/elate_type/elate_mouse/elate_eval, observe with
     elate_state (or elate_screenshot for pixels), and elate_stop it when
     done. 'size' is COLSxROWS characters for both UIs (the GUI frame is
@@ -294,6 +300,10 @@ def elate_start(
             wm_warning = S.gui_wm_warning(sess)
             if wm_warning:
                 info["wm_warning"] = wm_warning
+        if info.get("init_error") and not allow_init_error:
+            return _json({"ok": False,
+                          "error": S.init_error_failure(sess, info["init_error"]),
+                          **info})
         return _ok(info)
     except Exception as exc:
         return _fail(exc)
@@ -422,6 +432,10 @@ def elate_purge(
         "Purge sessions started with this owner tag -- a bulk selector; "
         "combines with the other filters. Cannot combine with explicit "
         "names."))] = None,
+    mine: Annotated[bool, Field(description=(
+        "Same as owner set to this agent's default owner tag ($ELATE_OWNER, "
+        "else derived from the Claude Code session) -- the tag sessions "
+        "get when started without an owner."))] = False,
 ) -> str:
     """Delete the sandboxes (transcripts included) of stopped/dead sessions.
 
@@ -437,6 +451,14 @@ def elate_purge(
     """
     try:
         names = names or []
+        if mine:
+            if owner is not None:
+                raise ElateError("mine and owner are mutually exclusive")
+            owner = S.default_owner()
+            if owner is None:
+                raise ElateError(
+                    "mine needs a default owner: set $ELATE_OWNER (or run "
+                    "under Claude Code), or pass owner")
         if (not names and not all_sessions and not name_glob
                 and not name_prefix and not owner
                 and stopped_older_than is None):
@@ -481,6 +503,26 @@ def elate_info(
     """
     try:
         return _ok(S.session_info(session))
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool(annotations=_READONLY)
+@_threaded
+def elate_ps(
+    session: Annotated[str, Field(description="Session name.")],
+) -> str:
+    """The session's process tree: Emacs, then every process it started.
+
+    Found by parent pid and by the session's environment marker
+    ($ELATE_SCRATCH), so daemonized children and survivors of a crashed
+    Emacs appear too (flagged detached). These are exactly the processes
+    elate_stop kills if they outlive Emacs -- a process not listed here is
+    not the session's, even if its name matches. Works on stopped
+    sessions (lists leftovers).
+    """
+    try:
+        return _ok(S.session_ps(session))
     except Exception as exc:
         return _fail(exc)
 
@@ -2059,4 +2101,36 @@ def elate_logs(
 
 def run_stdio() -> None:
     """Run the MCP server over stdio (blocking until the client hangs up)."""
+    if S.creator_pid() is None:
+        harness = _harness_pid()
+        if harness:
+            # The sessions this server starts belong to its harness (see
+            # session.creator_pid).
+            os.environ["ELATE_AGENT_PID"] = str(harness)
     server.run("stdio")
+
+
+# Launchers between a harness and this server (`uvx elate mcp`,
+# `uv run`, a python shim): the harness is the first ancestor that is
+# none of these.
+_LAUNCHERS = {"uv", "uvx", "pipx", "python", "python3", "elate", "sh",
+              "bash", "zsh", "env"}
+
+
+def _harness_pid() -> int | None:
+    from . import procs
+
+    table = procs.process_table()
+    pid = os.getppid()
+    seen: set[int] = set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        proc = table.get(pid)
+        if proc is None:
+            return None
+        exe = proc.command.split(None, 1)[0] if proc.command else ""
+        name = os.path.basename(exe)
+        if not (name in _LAUNCHERS or name.startswith("python3.")):
+            return pid
+        pid = proc.ppid
+    return None

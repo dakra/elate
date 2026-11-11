@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import gui, sandbox
+from . import gui, procs, sandbox
 from .errors import (
     ElateError,
     EvalTimeout,
@@ -64,6 +64,8 @@ class Session:
     evals: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)  # extra process env vars
     owner: str | None = None  # who started it (an agent tag; filters stop/purge/list)
+    creator_pid: int | None = None  # long-lived agent process that started it
+    creator_identity: str | None = None  # ps start-time+comm of that process
     ttl: float | None = None  # opt-in idle TTL (secs); expired sessions get reaped
     headless: bool = False  # gui sessions: running under our own Xvfb
     display: str | None = None  # gui sessions: X11 DISPLAY (Linux)
@@ -255,6 +257,40 @@ def load_session(name: str) -> Session:
         raise ElateError(f"corrupt session registry: {path}: {exc}") from exc
 
 
+def default_owner() -> str | None:
+    """Owner tag for a session started without one: $ELATE_OWNER, else
+    one derived from the Claude Code session ($CLAUDE_CODE_SESSION_ID)."""
+    tag = os.environ.get("ELATE_OWNER", "").strip()
+    if tag:
+        return tag
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    return f"claude-{sid[:8]}" if sid else None
+
+
+def creator_pid() -> int | None:
+    """The long-lived agent process a new session is attributed to.
+
+    $ELATE_AGENT_PID, else Claude Code's $CLAUDE_PID; the MCP server sets
+    $ELATE_AGENT_PID to its harness. None when neither is known -- the
+    short-lived CLI process and its shell are useless as a liveness anchor.
+    """
+    for var in ("ELATE_AGENT_PID", "CLAUDE_PID"):
+        value = os.environ.get(var, "").strip()
+        if value.isdigit() and int(value) > 1:
+            return int(value)
+    return None
+
+
+def creator_state(sess: Session, lineage: set[int]) -> str:
+    """"self" (an ancestor of this process started it), "other" (another
+    live agent did), "gone" (its creator exited), or "unknown"."""
+    if not sess.creator_pid:
+        return "unknown"
+    if not gui.pid_alive(sess.creator_pid, sess.creator_identity):
+        return "gone"
+    return "self" if sess.creator_pid in lineage else "other"
+
+
 def _free_name() -> str:
     """A session name not currently taken under the sessions root.
 
@@ -382,13 +418,67 @@ def _orphan_count(sess: Session) -> int:
         return 0
 
 
-def list_sessions() -> list[dict[str, Any]]:
-    """Scan the sessions directory; report each session with live status."""
+def init_error_failure(sess: Session, init_error: str) -> str:
+    """The `start` failure message for startup code that signalled."""
+    return (
+        f"startup code signalled an error: {init_error}\n"
+        f"The session {sess.name!r} is still running so you can inspect it "
+        f"(elate -s {sess.name} messages / eval); stop it with "
+        f"`elate stop {sess.name}`. Start with --allow-init-error to accept "
+        "a failing startup.")
+
+
+def session_processes(sess: Session, include_emacs: bool = False,
+                      table: dict[int, procs.Proc] | None = None,
+                      ) -> list[procs.Proc]:
+    """The processes SESS's Emacs started (see :mod:`elate.procs`).
+
+    The Emacs pid seeds the walk only while the session is alive -- a dead
+    session's recorded pid may have been recycled -- so for a dead or
+    stopped session only environment-marked leftovers are found. Emacs
+    itself is excluded unless INCLUDE_EMACS.
+    """
+    table = procs.process_table() if table is None else table
+    root = sess.emacs_pid if sess.is_alive() else None
+    seeds = [root]
+    if sess.ui == "gui" and sess.emacs_pgid and root:
+        seeds += [p.pid for p in table.values() if p.pgid == sess.emacs_pgid]
+    tree = procs.session_tree(seeds, str(sess.dir / "scratch"),
+                              sess.created_at, table)
+    if not include_emacs:
+        tree = [p for p in tree if p.pid != root]
+    return tree
+
+
+def _reap_tree(sess: Session, known: list[procs.Proc]) -> list[dict[str, Any]]:
+    """Kill what is left of KNOWN plus anything else still marked as SESS's.
+
+    Called once Emacs is gone: KNOWN is the tree snapshotted while it was
+    alive (its children are reparented, and so unreachable by parent pid,
+    after it exits). Returns ``[{pid, command}]`` of what was signalled.
+    """
+    table = procs.process_table()
+    survivors = procs.still_alive(known, table)
+    extra = procs.session_tree([p.pid for p in survivors],
+                               str(sess.dir / "scratch"), sess.created_at,
+                               table)
+    targets = {p.pid: p for p in survivors + extra
+               if p.pid not in (sess.xvfb_pid,)}
+    killed = procs.kill_all(list(targets.values()))
+    return [{"pid": p.pid, "command": p.command[:200]} for p in killed]
+
+
+def list_sessions(creators: bool = True) -> list[dict[str, Any]]:
+    """Scan the sessions directory; report each session with live status.
+
+    CREATORS adds creator_state for running sessions (one process-table
+    scan); internal sweeps that only need statuses skip it."""
     root = sessions_root()
     out: list[dict[str, Any]] = []
     if not root.is_dir():
         return out
     now = time.time()
+    lineage: set[int] | None = None
     for entry in sorted(root.iterdir()):
         if not (entry / "session.json").is_file():
             continue
@@ -412,6 +502,12 @@ def list_sessions() -> list[dict[str, Any]]:
         }
         if sess.owner:
             record["owner"] = sess.owner
+        if alive and creators:
+            if lineage is None:
+                lineage = procs.own_lineage(procs.process_table())
+            record["creator_state"] = creator_state(sess, lineage)
+            if sess.creator_pid:
+                record["creator_pid"] = sess.creator_pid
         if sess.ttl:
             record["ttl"] = sess.ttl
             if alive:
@@ -470,6 +566,7 @@ def _force_cleanup(sess: Session) -> None:
         from . import record as _record  # local: keep module load light
 
         _record.reap_orphan(sess)
+    _reap_tree(sess, [])
 
 
 def start_session(
@@ -497,6 +594,8 @@ def start_session(
         raise ElateError(
             f"implausible --ttl {ttl:g}s (minimum 30s): the TTL is an idle "
             "deadline after which the session is stopped AND purged")
+    if owner is None:
+        owner = default_owner()
     if name is None:
         name = _free_name()
     if not _NAME_RE.match(name):
@@ -594,15 +693,27 @@ def start_session(
         headless=headless,
         owner=owner,
         ttl=ttl,
+        creator_pid=creator_pid(),
     )
+    sess.creator_identity = gui.proc_identity(sess.creator_pid)
     sess.save()
     sess.log("start", emacs=emacs_path, args=emacs_args, config=config,
              ui=ui, size=[cols, rows])
 
-    if ui == "gui":
-        _boot_gui(sess, emacs_args)
-    else:
-        _boot_tty(sess, emacs_args, tmux_conf)
+    try:
+        if ui == "gui":
+            _boot_gui(sess, emacs_args)
+        else:
+            _boot_tty(sess, emacs_args, tmux_conf)
+    except ElateError:
+        raise
+    except BaseException:
+        # Interrupted mid-boot (Ctrl-C, SIGTERM): the half-started Emacs
+        # must not outlive the command that started it.
+        sess.status = "failed"
+        sess.save()
+        _force_cleanup(sess)
+        raise
 
     sess.status = "running"
     sess.save()
@@ -762,6 +873,9 @@ def stop_session(name: str, via: str | None = None,
                 "reason": "corrupt registry", "purged": bool(gone["purged"]),
                 "freed_bytes": gone["freed_bytes"]}
     was_alive = sess.is_alive()
+    # Snapshot the tree while Emacs still parents it: once Emacs exits its
+    # children are reparented and only the environment marker finds them.
+    tree = session_processes(sess)
     if was_alive:
         try:
             sess.semantic().eval_raw("(kill-emacs)", timeout=3.0)
@@ -792,15 +906,18 @@ def stop_session(name: str, via: str | None = None,
         from . import record as _record  # local: keep module load light
 
         _record.reap_orphan(sess)
+    killed = _reap_tree(sess, tree)
     sess.status = "stopped"
     sess.stopped_at = time.time()
     sess.save()
     sess.log("stop", was_alive=was_alive,
-             **({"reaped": reaped} if reaped else {}),
+             **({"killed": killed} if killed else {}),
              **({"via": via} if via else {}))
     result = {"name": name, "stopped": True, "was_alive": was_alive}
     if reaped:
         result["reaped"] = reaped
+    if killed:
+        result["killed"] = killed
     if purge:
         gone = purge_sessions([name])
         result["purged"] = bool(gone["purged"])
@@ -956,7 +1073,7 @@ def purge_sessions(names: Sequence[str] | None = None,
             "purge: --glob/--name-prefix/--owner select by pattern and "
             "cannot be combined with explicit session names")
     root = sessions_root()
-    listing = {s["name"]: s for s in list_sessions()}
+    listing = {s["name"]: s for s in list_sessions(creators=False)}
     if names:
         names = list(dict.fromkeys(names))  # dedupe, keep order
         unknown = [n for n in names if n not in listing]
@@ -1051,6 +1168,28 @@ def purge_sessions(names: Sequence[str] | None = None,
 # would pay a full registry scan per command.
 REAP_THROTTLE = 60.0
 
+# Stopped/dead sandboxes older than this are purged by the same sweep.
+# $ELATE_PURGE_AFTER overrides it (30m, 12h, 7d, bare seconds; 0 = never).
+DEFAULT_PURGE_AFTER = 7 * 86400.0
+STALE_PURGE_BATCH = 50  # per sweep, so a backlog never stalls one command
+_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)([smhd]?)$")
+_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def purge_after() -> float | None:
+    """Age (secs) past which inert sandboxes are auto-purged, None = never.
+
+    An unparsable $ELATE_PURGE_AFTER disables auto-purge rather than
+    guessing: deleting sandboxes needs an unambiguous go-ahead."""
+    raw = os.environ.get("ELATE_PURGE_AFTER")
+    if raw is None:
+        return DEFAULT_PURGE_AFTER
+    m = _DURATION_RE.match(raw.strip())
+    if not m:
+        return None
+    value = float(m.group(1)) * _DURATION_UNITS[m.group(2)]
+    return value or None
+
 
 def reap_expired(exclude: str | None = None) -> list[dict[str, Any]]:
     """Stop and purge every session whose opt-in --ttl has expired.
@@ -1065,7 +1204,9 @@ def reap_expired(exclude: str | None = None) -> list[dict[str, Any]]:
     """
     reaped: list[dict[str, Any]] = []
     now = time.time()
-    for entry in list_sessions():
+    stale_after = purge_after()
+    stale: dict[str, dict[str, Any]] = {}
+    for entry in list_sessions(creators=False):
         name = entry["name"]
         if name == exclude or entry["status"] == "corrupt":
             continue
@@ -1074,6 +1215,15 @@ def reap_expired(exclude: str | None = None) -> list[dict[str, Any]]:
         except ElateError:
             continue
         if not sess.ttl:
+            # Only sandboxes elate itself put to rest: a "dead" session
+            # (crashed, or a probe that failed) keeps its post-mortem.
+            if (stale_after is not None and len(stale) < STALE_PURGE_BATCH
+                    and entry["status"] in ("stopped", "failed")):
+                inert = now - _stopped_since(sess)
+                if inert >= stale_after:
+                    stale[name] = {"name": name, "stale": True,
+                                   "idle": round(inert, 1),
+                                   "owner": sess.owner}
             continue
         idle = now - (_last_activity(sess) if entry["status"] == "running"
                       else _stopped_since(sess))
@@ -1096,6 +1246,13 @@ def reap_expired(exclude: str | None = None) -> list[dict[str, Any]]:
             continue
         reaped.append({"name": name, "ttl": sess.ttl, "idle": round(idle, 1),
                        "owner": sess.owner})
+    if stale:
+        try:
+            gone = purge_sessions(list(stale))
+            reaped += [stale[p["name"]] for p in gone["purged"]
+                       if p["name"] in stale]
+        except ElateError:
+            pass
     return reaped
 
 
@@ -1139,6 +1296,7 @@ def session_info(name: str) -> dict[str, Any]:
         except (EvalTimeout, TransportError, RpcError):
             busy = True
     status = "running" if alive else ("dead" if sess.status == "running" else sess.status)
+    table = procs.process_table()
     info = {
         "name": sess.name,
         "ui": sess.ui,
@@ -1155,6 +1313,9 @@ def session_info(name: str) -> dict[str, Any]:
         "session_dir": sess.session_dir,
         "scratch_dir": str(sess.dir / "scratch"),
         "owner": sess.owner,
+        "creator_pid": sess.creator_pid,
+        **({"creator_state": creator_state(sess, procs.own_lineage(table))}
+           if alive else {}),
         "ttl": sess.ttl,
         "tmux_socket": sess.tmux_socket or None,
         "socket_path": str(sess.socket_path),
@@ -1171,7 +1332,44 @@ def session_info(name: str) -> dict[str, Any]:
     orphans = _orphan_count(sess) if alive else 0
     if orphans:
         info["orphans"] = orphans
+    info["processes"] = [p.as_dict()
+                         for p in session_processes(sess, table=table)]
     return info
+
+
+def session_ps(name: str) -> dict[str, Any]:
+    """SESS's process tree: Emacs first, then what it started, by start time.
+
+    Each entry carries ``depth`` (0 for Emacs and for processes no longer
+    below it) and ``detached`` (reparented away from the tree -- a
+    daemonized child, or a survivor of a dead Emacs).
+    """
+    sess = load_session(name)
+    alive = sess.is_alive()
+    tree = session_processes(sess, include_emacs=True)
+    by_pid = {p.pid: p for p in tree}
+    depth: dict[int, int] = {}
+
+    def depth_of(pid: int) -> int:
+        if pid not in depth:
+            parent = by_pid[pid].ppid
+            depth[pid] = 0
+            depth[pid] = depth_of(parent) + 1 if parent in by_pid else 0
+        return depth[pid]
+
+    entries = []
+    for p in tree:
+        entry = p.as_dict()
+        entry["depth"] = depth_of(p.pid)
+        if alive and p.pid == sess.emacs_pid:
+            entry["emacs"] = True
+        elif entry["depth"] == 0:
+            entry["detached"] = True
+        entries.append(entry)
+    return {"name": sess.name, "alive": alive,
+            "emacs_pid": sess.emacs_pid if alive else None,
+            "processes": entries,
+            "count": sum(1 for e in entries if not e.get("emacs"))}
 
 
 # ---------------------------------------------------------------------------

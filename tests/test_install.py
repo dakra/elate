@@ -397,3 +397,17 @@ def test_project_install_walk_up_stops_below_home(fake_home, monkeypatch):
     assert any("no agent/project files" in n for n in result["notices"])
     assert (sub / ".claude/skills/elate/SKILL.md").is_file()
     assert not (fake_home / ".claude/skills").exists()
+
+
+def test_notice_is_shown_once_per_day(tmp_path, monkeypatch):
+    import os as _os
+    monkeypatch.setenv("ELATE_HOME", str(tmp_path))
+    assert install.throttled_notice(None) is None
+    assert install.throttled_notice("old skill") == "old skill"
+    assert install.throttled_notice("old skill") is None
+    # A different notice is news: shown right away.
+    assert install.throttled_notice("newer skill") == "newer skill"
+    stamp = tmp_path / ".last-notice"
+    day_ago = stamp.stat().st_mtime - install.NOTICE_INTERVAL - 1
+    _os.utime(stamp, (day_ago, day_ago))
+    assert install.throttled_notice("newer skill") == "newer skill"

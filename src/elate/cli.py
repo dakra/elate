@@ -8,6 +8,7 @@ import fnmatch
 import json
 import os
 import re
+import signal
 import shlex
 import subprocess
 import sys
@@ -200,7 +201,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--owner", metavar="NAME",
                     help="tag the session with an owner (e.g. an agent id); "
                          "list/stop/purge can then select by --owner, so "
-                         "concurrent agents manage only their own sessions")
+                         "concurrent agents manage only their own sessions. "
+                         "Default: $ELATE_OWNER, else derived from the "
+                         "Claude Code session id (select those with --mine)")
     sp.add_argument("--ttl", metavar="DUR", type=_parse_duration,
                     help="idle time-to-live (e.g. 30m, 2h; bare number = "
                          "seconds, minimum 30s): once the session has seen "
@@ -208,6 +211,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "by an opportunistic sweep any later elate command "
                          "runs -- so sessions leaked by a crashed agent "
                          "clean themselves up instead of accumulating")
+    sp.add_argument("--allow-init-error", action="store_true",
+                    help="exit 0 even when startup code (--eval, --load, "
+                         "--eval-file, --init-file, ...) signals; by default "
+                         "that exits 1, with the session left running for "
+                         "inspection and the error in init_error")
 
     sp = sub.add_parser("stop", help="stop a session (or --all / a filter)")
     sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
@@ -222,6 +230,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--owner", metavar="NAME",
                     help="stop running sessions started with --owner NAME; "
                          "combines with --glob/--name-prefix")
+    sp.add_argument("--mine", action="store_true",
+                    help="same as --owner with this agent's default owner "
+                         "tag ($ELATE_OWNER, else the Claude Code session)")
     sp.add_argument("--purge", action="store_true",
                     help="also delete the sandbox (transcript, logs, "
                          "scratch) once stopped -- `stop` + `purge NAME` in "
@@ -282,6 +293,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "corrupt), or all (default)")
     sp.add_argument("--owner", metavar="NAME",
                     help="only sessions started with --owner NAME")
+    sp.add_argument("--mine", action="store_true",
+                    help="same as --owner with this agent's default owner "
+                         "tag ($ELATE_OWNER, else the Claude Code session)")
     sp.add_argument("--older-than", metavar="DUR", type=_parse_duration,
                     help="only show sessions inert at least this long "
                          "(e.g. 30s, 15m, 2h, 1d; bare number = seconds) -- "
@@ -318,6 +332,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="purge sessions started with --owner NAME -- a bulk "
                          "selector like --all; combines with the other "
                          "filters")
+    sp.add_argument("--mine", action="store_true",
+                    help="same as --owner with this agent's default owner "
+                         "tag ($ELATE_OWNER, else the Claude Code session)")
 
     sp = sub.add_parser(
         "prune",
@@ -342,8 +359,24 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--owner", metavar="NAME",
                     help="prune sessions started with --owner NAME -- a "
                          "bulk selector like --all")
+    sp.add_argument("--mine", action="store_true",
+                    help="same as --owner with this agent's default owner "
+                         "tag ($ELATE_OWNER, else the Claude Code session)")
 
     sp = sub.add_parser("info", help="show session details")
+    sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
+
+    sp = sub.add_parser(
+        "ps", help="list the processes a session's Emacs started",
+        description="List the session's process tree: Emacs, then every "
+                    "process it started, by start time -- found by parent "
+                    "pid and by the session's environment marker "
+                    "($ELATE_SCRATCH), so daemonized children and survivors "
+                    "of a crashed Emacs show up as 'detached'. These are "
+                    "exactly the processes `stop` kills if they outlive "
+                    "Emacs; anything not listed is not the session's -- "
+                    "except, on macOS, a daemonized system binary (/bin, "
+                    "/usr/bin), whose environment is unreadable.")
     sp.add_argument("name", nargs="?", help="session name (or use -s NAME)")
 
     sp = sub.add_parser(
@@ -1304,23 +1337,30 @@ def cmd_start(args: argparse.Namespace) -> Result:
         f"{' headless ' + (sess.display or '') if sess.headless else ''}\n"
         f"sandbox: {sess.session_dir}"
     )
+    code = 0
     if info.get("init_error"):
-        warning = (
-            "WARNING: startup code signalled an error "
-            f"(session is up regardless):\n{info['init_error']}"
-        )
-        print(f"elate: {warning}", file=sys.stderr)
-        human += f"\n{warning}"
+        if args.allow_init_error:
+            warning = (
+                "WARNING: startup code signalled an error "
+                f"(session is up regardless):\n{info['init_error']}"
+            )
+            print(f"elate: {warning}", file=sys.stderr)
+            human += f"\n{warning}"
+        else:
+            code = 1
+            message = S.init_error_failure(sess, info["init_error"])
+            info = {"ok": False, "error": message, **info}
+            human = f"{human}\nERROR: {message}"
     if sess.ui == "gui":
         wm_warning = S.gui_wm_warning(sess)
         if wm_warning:
             info["wm_warning"] = wm_warning
             print(f"elate: WARNING: {wm_warning}", file=sys.stderr)
             human += f"\nWARNING: {wm_warning}"
-    notice = install.staleness_notice()
+    notice = install.throttled_notice(install.staleness_notice())
     if notice:
         print(notice, file=sys.stderr)
-    return info, human, 0
+    return info, human, code
 
 
 def cmd_stop(args: argparse.Namespace) -> Result:
@@ -1464,7 +1504,7 @@ def cmd_list(args: argparse.Namespace) -> Result:
     # tag, so single-agent listings keep the compact four-column table.
     owned = any(s.get("owner") for s in sessions)
     header = f"{'NAME':<20} {'UI':<4} {'STATUS':<11} {'EMACS':<10} "
-    header += f"{'OWNER':<12} AGE" if owned else "AGE"
+    header += f"{'OWNER':<16} AGE" if owned else "AGE"
     lines = [header]
     for s in sessions:
         if s.get("uptime") is not None:
@@ -1485,7 +1525,7 @@ def cmd_list(args: argparse.Namespace) -> Result:
         line = (f"{s['name']:<20} {s.get('ui') or '-':<4} {status:<11} "
                 f"{s.get('emacs_version') or '-':<10} ")
         if owned:
-            line += f"{s.get('owner') or '-':<12} "
+            line += f"{s.get('owner') or '-':<16} "
         lines.append(line + age)
     inert = sum(1 for s in sessions if s["status"] != "running")
     if inert >= 5:
@@ -1496,8 +1536,25 @@ def cmd_list(args: argparse.Namespace) -> Result:
 
 def cmd_info(args: argparse.Namespace) -> Result:
     info = S.session_info(_name_arg(args))
-    human = "\n".join(f"{k}: {v}" for k, v in info.items())
+    human = "\n".join(f"{k}: {v}" for k, v in info.items()
+                      if k != "processes")
+    if info.get("processes"):
+        human += "\nprocesses:\n" + "\n".join(
+            f"  {p['pid']:>7}  {p['command']}" for p in info["processes"])
     return info, human, 0
+
+
+def cmd_ps(args: argparse.Namespace) -> Result:
+    data = S.session_ps(_name_arg(args))
+    if not data["processes"]:
+        return data, f"session {data['name']!r}: no processes", 0
+    lines = [f"{'PID':>7} {'PPID':>7}  COMMAND"]
+    for p in data["processes"]:
+        tag = " [emacs]" if p.get("emacs") else (
+            " [detached]" if p.get("detached") else "")
+        lines.append(f"{p['pid']:>7} {p['ppid']:>7}  "
+                     f"{'  ' * p['depth']}{p['command'][:160]}{tag}")
+    return data, "\n".join(lines), 0
 
 
 def cmd_path(args: argparse.Namespace) -> Result:
@@ -3178,6 +3235,7 @@ _COMMANDS = {
     "purge": cmd_purge,
     "prune": cmd_purge,  # alias
     "info": cmd_info,
+    "ps": cmd_ps,
     "path": cmd_path,
     "logs": cmd_logs,
     "stderr": cmd_logs,  # alias
@@ -3285,17 +3343,82 @@ def main(argv: list[str] | None = None) -> int:
         except ElateError as exc:
             print(f"elate: {exc}", file=sys.stderr)
             return 1
+    # SIGTERM/SIGHUP (a wrapper script's trap, a closed terminal) unwind
+    # like Ctrl-C, so `run`/`matrix` stop their throwaway sessions and a
+    # half-booted Emacs is cleaned up instead of leaking.
+    previous = _trap_termination()
+    try:
+        return _sweep_and_dispatch(args, field)
+    except _Terminated as exc:
+        print("elate: interrupted", file=sys.stderr)
+        return 128 + exc.signum
+    except KeyboardInterrupt:
+        print("elate: interrupted", file=sys.stderr)
+        return 130
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+class _Terminated(KeyboardInterrupt):
+    """SIGTERM/SIGHUP, unwinding like Ctrl-C (so teardown runs)."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+def _sweep_and_dispatch(args: argparse.Namespace, field: str | None) -> int:
     # Opportunistic TTL sweep (throttled; only sessions started with --ttl):
     # any elate invocation reaps sessions leaked by a crashed agent. The
     # session this command targets is exempt -- it must not vanish between
     # two of its owner's own calls.
     reaped = S.maybe_reap_expired(
         exclude=args.session or getattr(args, "name", None))
-    if reaped:
-        names = ", ".join(r["name"] for r in reaped)
-        print(f"elate: reaped {len(reaped)} session(s) idle past their "
-              f"--ttl: {names}", file=sys.stderr)
+    expired = [r["name"] for r in reaped if not r.get("stale")]
+    stale = [r["name"] for r in reaped if r.get("stale")]
+    if expired:
+        print(f"elate: reaped {len(expired)} session(s) idle past their "
+              f"--ttl: {', '.join(expired)}", file=sys.stderr)
+    if stale:
+        print(f"elate: purged {len(stale)} stopped sandbox(es) older than "
+              f"{_fmt_duration(S.purge_after() or 0)} ($ELATE_PURGE_AFTER; "
+              "0 disables)", file=sys.stderr)
+    return _dispatch(args, field)
+
+
+def _raise_interrupt(signum: int, frame: Any) -> None:
+    raise _Terminated(signum)
+
+
+def _trap_termination() -> dict[int, Any]:
+    """Route SIGTERM/SIGHUP to _Terminated; return the old handlers.
+
+    An ignored signal stays ignored (`nohup elate run ...` must survive a
+    closed terminal). Only the main thread can install handlers;
+    elsewhere this is a no-op.
+    """
+    previous: dict[int, Any] = {}
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            if signal.getsignal(signum) is signal.SIG_IGN:
+                continue
+            previous[signum] = signal.signal(signum, _raise_interrupt)
+        except ValueError:
+            break
+    return previous
+
+
+def _dispatch(args: argparse.Namespace, field: str | None) -> int:
     try:
+        if getattr(args, "mine", False):
+            if args.owner is not None:
+                raise UsageError("--mine and --owner are mutually exclusive")
+            args.owner = S.default_owner()
+            if args.owner is None:
+                raise UsageError(
+                    "--mine needs a default owner: set $ELATE_OWNER (or run "
+                    "under Claude Code), or pass --owner NAME")
         result, human, code = _COMMANDS[args.command](args)
     except WaitTimeout as exc:
         # Exit 3: distinct from generic errors (1) and argparse usage (2),

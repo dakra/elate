@@ -91,6 +91,7 @@ elate start --name demo --load ./my-pkg.el --size 120x36
 
 elate list
 elate info demo
+elate ps demo          # the session's process tree (what stop would kill)
 
 # Evaluate elisp — printed value, *Messages* delta, error + backtrace
 elate -s demo eval '(+ 1 2)'
@@ -146,11 +147,14 @@ elate stop demo --purge          # stop + delete the sandbox in one call
 # done (purge never touches a running session)
 elate purge demo          # or: elate purge --all
 
-# Several agents on one machine: tag sessions and manage only your own.
-# --ttl is crash insurance -- a session idle past it is stopped AND purged
-# by an opportunistic sweep any later elate command runs.
+# Several agents on one machine: sessions are tagged with an owner
+# (--owner, else $ELATE_OWNER, else derived from the Claude Code session),
+# so each agent manages only its own. --ttl is crash insurance -- a session
+# idle past it is stopped AND purged by an opportunistic sweep any later
+# elate command runs; the same sweep purges stopped sandboxes older than
+# 7 days ($ELATE_PURGE_AFTER, 0 = never).
 elate start --name rx-a --owner agent3 --ttl 30m
-elate list --owner agent3
+elate list --owner agent3          # or --mine for this agent's default tag
 elate stop --owner agent3          # bulk stop (also: --glob / --name-prefix)
 elate purge --owner agent3
 ```
@@ -1158,8 +1162,12 @@ collide. A crashed Emacs leaves its dead pane behind
 dying screen post-mortem. GUI Emacs is spawned directly (tracked by pid;
 stdout/stderr land in `log/emacs-gui.log`).
 Errors signalled by `--eval`/`--load`/`--init-file` startup code are
-recorded and reported by `elate start` (and shown by `info` as
-`init_error`) instead of silently parking the session in the debugger.
+recorded instead of silently parking the session in the debugger: `elate
+start` exits 1 with the error as `init_error` (the session stays up for
+inspection; `--allow-init-error` accepts it), and `info` keeps it.
+Stopping a session also kills what its Emacs started and left behind —
+found by parent pid and by the session's environment marker, listed by
+`elate ps`, reported under `killed`.
 Two channels:
 
 - **semantic** — `emacsclient --eval` against the per-session socket; the

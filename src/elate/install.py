@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -399,6 +400,33 @@ def staleness_notice() -> str | None:
         return "\n".join(lines) if lines else None
     except Exception:
         return None
+
+
+NOTICE_INTERVAL = 86400.0
+
+
+def throttled_notice(notice: str | None) -> str | None:
+    """NOTICE, unless the same text was already shown within a day.
+
+    A stamp file next to the sessions root remembers the last notice and
+    when it was shown, so a matrix of many `start`s prints it once; a
+    different notice (a new version) shows immediately. Never raises.
+    """
+    if not notice:
+        return None
+    stamp = paths.sessions_root().parent / ".last-notice"
+    try:
+        if (stamp.read_text(encoding="utf-8") == notice
+                and time.time() - stamp.stat().st_mtime < NOTICE_INTERVAL):
+            return None
+    except OSError:
+        pass
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(notice, encoding="utf-8")
+    except OSError:
+        pass
+    return notice
 
 
 def update_steps(channel: str) -> list[dict]:

@@ -41,6 +41,7 @@ EXPECTED_TOOLS = {
     "elate_start", "elate_stop", "elate_interrupt", "elate_debug",
     "elate_list", "elate_info",
     "elate_path",
+    "elate_ps",
     "elate_keys", "elate_type", "elate_send_process", "elate_mouse",
     "elate_focus", "elate_send_events",
     "elate_eval", "elate_state", "elate_screenshot",
@@ -1156,3 +1157,17 @@ def test_stop_session(elate_home: str, mcp_session: dict[str, Any]) -> None:
     listed = one_call(elate_home, "elate_list", {})
     entry = {s["name"]: s for s in listed["sessions"]}[NAME]
     assert entry["status"] == "stopped"
+
+
+def test_start_tool_fails_on_init_error(elate_home: str) -> None:
+    try:
+        out = one_call(elate_home, "elate_start",
+                       {"name": "mcpie", "eval_forms": ['(error "mcp boom")']})
+        assert out["ok"] is False and "mcp boom" in out["init_error"]
+        assert out["name"] == "mcpie"  # the session handle survives
+        ok = one_call(elate_home, "elate_start",
+                      {"name": "mcpie", "replace": True, "allow_init_error": True,
+                       "eval_forms": ['(error "mcp boom")']})
+        assert ok["ok"] is True and "mcp boom" in ok["init_error"]
+    finally:
+        one_call(elate_home, "elate_stop", {"session": "mcpie"})

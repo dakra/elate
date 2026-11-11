@@ -434,3 +434,41 @@ def test_purge_lifecycle(elate_home: Path):
                     S.stop_session(name)
                 except ElateError:
                     pass
+
+
+def test_reap_purges_stale_stopped_sandboxes(elate_home: Path,
+                                            monkeypatch: pytest.MonkeyPatch):
+    import time as _time
+    root = elate_home / "sessions"
+    now = _time.time()
+    week = 7 * 86400
+    _plant_stopped_registry(root / "ancient", "ancient", stopped_at=now - week - 60)
+    _plant_stopped_registry(root / "recent", "recent", stopped_at=now - week + 3600)
+    reaped = S.reap_expired()
+    assert [r["name"] for r in reaped] == ["ancient"]
+    assert reaped[0]["stale"] is True
+    assert not (root / "ancient").exists() and (root / "recent").is_dir()
+    # $ELATE_PURGE_AFTER tunes the age; 0 (or garbage) disables it.
+    monkeypatch.setenv("ELATE_PURGE_AFTER", "0")
+    _plant_stopped_registry(root / "old2", "old2", stopped_at=now - 30 * 86400)
+    assert S.reap_expired() == []
+    monkeypatch.setenv("ELATE_PURGE_AFTER", "soon")
+    assert S.reap_expired() == []
+    monkeypatch.setenv("ELATE_PURGE_AFTER", "1h")
+    assert sorted(r["name"] for r in S.reap_expired()) == ["old2", "recent"]
+
+
+def test_auto_purge_keeps_dead_sessions(elate_home: Path):
+    import time as _time
+    root = elate_home / "sessions"
+    # A registry still saying "running" with no live Emacs reads as dead:
+    # its crash post-mortem must survive the age-based sweep.
+    _plant_stopped_registry(root / "crashed", "crashed",
+                            stopped_at=_time.time() - 30 * 86400)
+    reg = root / "crashed" / "session.json"
+    data = json.loads(reg.read_text())
+    data["status"] = "running"
+    reg.write_text(json.dumps(data))
+    assert {s["name"]: s["status"] for s in S.list_sessions()} == {"crashed": "dead"}
+    assert S.reap_expired() == []
+    assert (root / "crashed").is_dir()

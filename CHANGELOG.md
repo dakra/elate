@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased
+
+From an agent that drove elate through a 55-run scenario × variant GUI
+matrix while building a browser-in-a-buffer package.
+
+### Safety and teardown
+
+- **`elate ps NAME`** (MCP `elate_ps`) lists a session's process tree:
+  Emacs, its descendants, and every process carrying the session's
+  environment marker — so a daemonized server or a survivor of a crashed
+  Emacs shows up as `detached`. `info` carries the same list as
+  `processes`. Only processes started after the session count.
+- **`stop` kills what outlives Emacs** — the tree snapshotted before
+  Emacs exits plus anything still marked — and reports it under
+  `killed: [{pid, command}]`. Previously a subprocess in its own process
+  group (every `make-process` child) survived a GUI stop. On macOS the
+  environment of SIP-protected system binaries is unreadable, so a
+  daemonized `/bin` tool is found only while its parent chain leads to
+  Emacs.
+- **`start` exits 1 when startup code signals** (`init_error` in the
+  payload, `ok: false`); the session stays up for inspection.
+  `--allow-init-error` (MCP `allow_init_error`) restores the old
+  warn-and-continue behavior.
+- Relative `--eval-file`, `--profile` paths and `--home-seed` resolve
+  against the caller's working directory; a relative `--eval-file` used
+  to fail inside Emacs, whose `load` searches `load-path`.
+- Sessions record the agent process that started them
+  (`$ELATE_AGENT_PID`, Claude Code's `$CLAUDE_PID`, or the MCP server's
+  harness). `list` and `info` report `creator_state` (`self`, `other`,
+  `gone`, `unknown`); the plugin's session-start hook lists sessions of
+  another live agent as in use — "do not stop" — instead of as leftovers.
+- **Default owner**: `--owner` defaults to `$ELATE_OWNER`, else
+  `claude-<session id prefix>` under Claude Code; `list`/`stop`/`purge
+  --mine` select by it.
+- `run`/`matrix` stop their throwaway session on SIGTERM and SIGHUP as on
+  Ctrl-C (exit 128+signal; an ignored SIGHUP, as under `nohup`, stays
+  ignored), and a start interrupted mid-boot kills the half-started
+  Emacs.
+- Stopped sandboxes older than 7 days are purged by the opportunistic
+  sweep (`$ELATE_PURGE_AFTER`, e.g. `12h`; `0` disables), at most 50 per
+  sweep. Crashed (`dead`) sessions are kept for their post-mortem.
+- The outdated-skill notice prints at most once a day per distinct
+  notice.
+
 ## 0.16.0
 
 Mouse and display-geometry round, from agents regression-testing a

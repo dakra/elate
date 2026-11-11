@@ -32,7 +32,7 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "hooks" / "check-running.sh"
 
 # Everything the script itself needs; deliberately NOT uv/uvx/elate.
-POSIX_TOOLS = ("sh", "tr", "sed", "wc", "cat", "env")
+POSIX_TOOLS = ("sh", "tr", "sed", "wc", "cat", "env", "awk")
 
 HAVE_DEPS = bool(
     shutil.which("emacs") and shutil.which("tmux")
@@ -136,6 +136,42 @@ def test_warns_only_about_running_sessions(toolbox: Path):
 # hook is contracted to use (offline-only -- a session start/end must
 # never wait on the network), hermetically: no real uv, no network.
 
+CLASSIFIED_PAYLOAD = (
+    '{"ok": true, "sessions": ['
+    '{"name": "old", "ui": "tty", "status": "running", "uptime": 5.0, '
+    '"creator_state": "gone", "creator_pid": 11}, '
+    '{"name": "legacy", "ui": "tty", "status": "running", "uptime": 5.0}, '
+    '{"name": "busy", "ui": "gui", "status": "running", "uptime": 5.0, '
+    '"creator_state": "other", "creator_pid": 12}, '
+    '{"name": "mine", "ui": "tty", "status": "running", "uptime": 5.0, '
+    '"creator_state": "self", "creator_pid": 13}, '
+    '{"name": "done", "ui": "tty", "status": "stopped", "uptime": null}]}'
+)
+
+
+def test_start_separates_leftovers_from_sessions_in_use(toolbox: Path):
+    _fake_elate(toolbox, f"printf '%s\\n' '{CLASSIFIED_PAYLOAD}'")
+    proc = _run(toolbox, "start")
+    assert proc.returncode == 0
+    lines = proc.stdout.splitlines()
+    leftover = next(line for line in lines if "earlier work" in line)
+    assert "old" in leftover and "legacy" in leftover
+    assert "busy" not in leftover and "mine" not in leftover
+    in_use = next(line for line in lines if "another live agent" in line)
+    assert "busy" in in_use and "do NOT stop" in in_use
+    own = next(line for line in lines if "this Claude Code process" in line)
+    assert "mine" in own and "busy" not in own
+    assert "done" not in proc.stdout
+
+
+def test_end_ignores_sessions_of_other_live_agents(toolbox: Path):
+    _fake_elate(toolbox, f"printf '%s\\n' '{CLASSIFIED_PAYLOAD}'")
+    proc = _run(toolbox, "end")
+    assert proc.returncode == 1
+    assert "old" in proc.stderr and "mine" in proc.stderr
+    assert "busy" not in proc.stderr
+
+
 @pytest.mark.parametrize("mode", ["end", "start"])
 def test_uvx_offline_fallback(toolbox: Path, mode: str):
     # No `elate` on PATH; the fake uvx answers ONLY the documented
@@ -217,3 +253,17 @@ def test_real_session_warns_then_goes_quiet(toolbox: Path,
     S.purge_sessions([name])
     assert not (home / "sessions" / name).exists()
     shutil.rmtree(home, ignore_errors=True)
+
+
+def test_names_with_regex_characters_keep_their_own_state(toolbox: Path):
+    payload = (
+        '{"ok": true, "sessions": ['
+        '{"name": "a-b", "status": "running", "creator_state": "other"}, '
+        '{"name": "a.b", "status": "running", "creator_state": "gone"}]}')
+    _fake_elate(toolbox, f"printf '%s\\n' '{payload}'")
+    proc = _run(toolbox, "start")
+    lines = proc.stdout.splitlines()
+    leftover = next(line for line in lines if "earlier work" in line)
+    in_use = next(line for line in lines if "another live agent" in line)
+    assert "a.b" in leftover and "a-b" not in leftover
+    assert "a-b" in in_use and "a.b" not in in_use

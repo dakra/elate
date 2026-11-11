@@ -128,7 +128,7 @@ def _require_forms(requires: Sequence[str]) -> list[str]:
 
 def _validated_eval_file(entry: str) -> Path:
     """Resolved path of an --eval-file argument; error if it is not a file."""
-    path = Path(entry).expanduser()
+    path = Path(entry).expanduser().resolve()
     if not path.is_file():
         raise ElateError(f"--eval-file does not exist: {entry}")
     return path
@@ -143,7 +143,7 @@ def profiles_dir() -> Path:
 def _resolve_profile(name: str) -> Path:
     """File for a --profile NAME: a literal .el path, else <profiles>/NAME.el."""
     if "/" in name or name.endswith(".el"):
-        path = Path(name).expanduser()
+        path = Path(name).expanduser().resolve()
     else:
         path = profiles_dir() / f"{name}.el"
     if not path.is_file():
@@ -241,7 +241,7 @@ def build_sandbox(
         if not init_path.is_file():
             raise ElateError(f"--init-file does not exist: {init_file}")
     if home_seed is not None:
-        seed_path = Path(home_seed).expanduser()
+        seed_path = Path(home_seed).expanduser().resolve()
         if not seed_path.is_dir():
             raise ElateError(
                 f"--home-seed must be an existing directory: {home_seed}")

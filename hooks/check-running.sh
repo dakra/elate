@@ -41,22 +41,47 @@ fi
 out=$("$@" --json list 2>/dev/null) || exit 0
 
 # Single-line JSON: {"ok": true, "sessions": [{"name": "s", ...,
-# "status": "running", ...}, ...]}. Split the objects onto lines and
-# keep the names of the running ones ("name" precedes "status").
-running=$(printf '%s\n' "$out" | tr '{' '\n' \
-    | sed -n 's/^"name": "\([^"]*\)".*"status": "running".*/\1/p') || exit 0
+# "status": "running", ..., "creator_state": "gone", ...}, ...]}. Split
+# the objects onto lines and keep "name state" pairs of the running ones
+# ("name" precedes "status" precedes "creator_state"). An elate too old to
+# report creator_state yields "unknown".
+pairs=$(printf '%s\n' "$out" | tr '{' '\n' | sed -n \
+    -e 's/^"name": "\([^"]*\)".*"status": "running".*"creator_state": "\([a-z]*\)".*/\1 \2/p' \
+    -e 't' \
+    -e 's/^"name": "\([^"]*\)".*"status": "running".*/\1 unknown/p') || exit 0
 
-[ -n "$running" ] || exit 0
+[ -n "$pairs" ] || exit 0
 
-names=$(printf '%s\n' "$running" | tr '\n' ' ')
+# creator_state: self = started from this agent process (e.g. before a
+# /clear, or by one of its subagents); other = another agent that is still
+# alive (in use: never stop it); gone/unknown = leftovers.
+pick() { printf '%s\n' "$pairs" | awk -v want="$1" '
+    want == "leftover" && ($2 == "gone" || $2 == "unknown") { printf "%s ", $1 }
+    want != "leftover" && $2 == want { printf "%s ", $1 }'; }
+leftover=$(pick leftover)
+own=$(pick self)
+other=$(pick other)
 
 if [ "$mode" = "start" ]; then
-    printf 'elate sessions from earlier work are still running: %s' "$names"
-    # shellcheck disable=SC2016  # backticks are markdown for the model
-    printf -- '-- reuse them or stop them (`elate stop NAME`, or `uvx elate stop NAME`); let the user know they exist.\n'
+    if [ -n "$leftover" ]; then
+        printf 'elate sessions from earlier work are still running: %s' "$leftover"
+        # shellcheck disable=SC2016  # backticks are markdown for the model
+        printf -- '-- reuse them or stop them (`elate stop NAME`, or `uvx elate stop NAME`); let the user know they exist.\n'
+    fi
+    if [ -n "$own" ]; then
+        printf 'elate sessions started earlier from this Claude Code process (before a /clear, or by a subagent that may still be using them): %s' "$own"
+        printf -- '-- reuse them, or stop them once nothing needs them.\n'
+    fi
+    if [ -n "$other" ]; then
+        printf 'elate sessions in use by another live agent session: %s' "$other"
+        printf -- '-- leave them alone; do NOT stop them.\n'
+    fi
     exit 0
 fi
 
+# SessionEnd: only sessions this agent is responsible for.
+names="$leftover$own"
+[ -n "$names" ] || exit 0
 {
     printf 'elate: session(s) still running: %s' "$names"
     printf '\nstop with: elate stop NAME   (or: uvx elate stop NAME)\n'

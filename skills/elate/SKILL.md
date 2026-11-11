@@ -5,7 +5,7 @@
 # skill files change (tests/skill_content_version.txt pins this); `elate
 # start` compares it against installed copies to nudge about staleness.
 name: elate
-version: 0.16.0
+version: 0.17.0
 description: Spawns sandboxed Emacs sessions (terminal or GUI) and drives them
   with keys, mouse, and elisp to test Emacs Lisp interactively - run ERT tests
   in a live session, inspect faces/overlays/popups structurally, lint, profile,
@@ -70,7 +70,10 @@ Rules that prevent the most common mistakes:
   `load-path` side effects) and `--profile NAME`
   (`$XDG_CONFIG_HOME/elate/profiles/NAME.el`). Order:
   `--load` → `--eval-file` → `--profile` → `--eval` (so `--eval` overrides a
-  profile).
+  profile). Relative paths resolve against your working directory. If any
+  startup code signals, `start` **exits 1** with the error in `init_error`;
+  the session stays up for inspection (stop it), and `--allow-init-error`
+  accepts a failing startup.
 - `--load PATH`: a **file** is loaded (and its directory put on
   `load-path`); a **directory** is only added to `load-path` — nothing in
   it is loaded, so `require`/load the feature yourself or pass the `.el`
@@ -451,7 +454,7 @@ images** instead of PNG files to read. If `elate_*` MCP tools are already
 available in your session (someone registered the server — the plugin is
 CLI-first and does not register it for you), use them directly — do **not**
 register a duplicate; otherwise register it with
-`claude mcp add elate -- uvx elate mcp`. The 36 `elate_*` tools cover the core surface (`attach`, `resize`,
+`claude mcp add elate -- uvx elate mcp`. The 37 `elate_*` tools cover the core surface (`attach`, `resize`,
 `prune`, `stderr`, `export-script`, `snap`, `matrix`, `install`, and `update` stay CLI-only); `prune`
 aliases `purge` and `stderr` aliases `logs`. Sessions are shared
 between both (same names, same sandboxes), so you can mix.
@@ -462,8 +465,14 @@ between both (same names, same sandboxes), so you can mix.
 uvx elate list            # anything still running?
 uvx elate stop NAME       # stop every session you started
 ```
-`elate stop` ends the session's processes; a crashed TTY Emacs keeps a
-dead pane for post-mortem `screenshot` until stopped. A stopped session's
+`elate stop` ends the session's processes — Emacs, and whatever it
+started that outlives it (a daemonized server, a child of a crashed
+Emacs), reported under `killed`. `elate ps NAME` lists that tree before
+you act: a process it does not list is not the session's, even if its
+name matches one you see in `pgrep`. (On macOS a daemonized *system*
+binary — /bin, /usr/bin — is only attributable while its parent chain
+still leads to Emacs.) A crashed TTY Emacs keeps a dead pane for
+post-mortem `screenshot` until stopped. A stopped session's
 sandbox dir — and its `stopped` entry in `elate list` (which shows each
 one's idle age) — stays behind on purpose (transcripts outlive the Emacs).
 Stopped sandboxes are inert; when the transcripts are no longer needed,
@@ -476,18 +485,28 @@ findable: sweep them by pattern with `elate purge --glob 'run-*'` (or a
 targeted `--glob 'run-my-scen-*'`, or `--name-prefix run-`). During a
 long parallel run, GC only the stale ones with `elate
 purge --stopped-older-than 1h`, and preview which they are with
-`elate list --older-than 1h`. Sandboxes live under `~/.cache/elate/sessions/<name>`
+`elate list --older-than 1h`. Stopped sandboxes older than 7 days are
+purged automatically (`ELATE_PURGE_AFTER=12h` tunes it, `0` disables;
+crashed sessions are kept).
+Sandboxes live under `~/.cache/elate/sessions/<name>`
 (`$ELATE_HOME` overrides the base).
 
-**Several agents on one machine:** tag your sessions at start and manage
-only your own —
+**Several agents on one machine:** tag sessions with an owner and manage
+only your own. `--owner NAME` sets it; without it, sessions get
+`$ELATE_OWNER`, else (under Claude Code) a tag derived from your session,
+which `--mine` selects:
 
 ```sh
-uvx elate start --name rx-a --owner agent3 --ttl 30m
-uvx elate list --owner agent3         # just mine
-uvx elate stop --owner agent3         # stop all of mine (also: --glob/--name-prefix)
-uvx elate purge --owner agent3        # delete my stopped sandboxes
+uvx elate start --name rx-a --ttl 30m
+uvx elate list --mine                 # just mine (or --owner NAME)
+uvx elate stop --mine                 # stop all of mine (also: --glob/--name-prefix)
+uvx elate purge --mine                # delete my stopped sandboxes
 ```
+
+`elate list` also reports each running session's `creator_state`: `self`
+(started from your agent process — e.g. before a `/clear`), `other` (a
+different agent that is still alive: it is in use, never stop it), or
+`gone`/`unknown` (a leftover).
 
 `--ttl DUR` is the crash insurance: a session idle (no commands) past its
 TTL is stopped *and* purged by an opportunistic sweep that any later elate
