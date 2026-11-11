@@ -356,6 +356,11 @@ default, `run --variant NAME` picks one. `--keep`/`--keep-on-failure`
 keep the session for inspection. Scenario format, every step and
 assertion kind: see [SCRIPTING.md](SCRIPTING.md).
 
+Instead of a shell loop: `matrix tests/*.json` (one summary, `-j N`,
+`--retries N` → FLAKY, `--timeout-scale F`); `"requires"` → SKIP;
+`"templates"`/`"include"`/`.elate.json` for shared steps and setup; and
+`elate -s NAME run -` batches steps against a live session (SCRIPTING.md).
+
 ## JSON output and exit codes
 
 Output is the human table on a terminal and **JSON when stdout is not a TTY**
@@ -465,14 +470,10 @@ between both (same names, same sandboxes), so you can mix.
 uvx elate list            # anything still running?
 uvx elate stop NAME       # stop every session you started
 ```
-`elate stop` ends the session's processes — Emacs, and whatever it
-started that outlives it (a daemonized server, a child of a crashed
-Emacs), reported under `killed`. `elate ps NAME` lists that tree before
-you act: a process it does not list is not the session's, even if its
-name matches one you see in `pgrep`. (On macOS a daemonized *system*
-binary — /bin, /usr/bin — is only attributable while its parent chain
-still leads to Emacs.) A crashed TTY Emacs keeps a dead pane for
-post-mortem `screenshot` until stopped. A stopped session's
+`elate stop` ends Emacs and whatever it started that outlives it
+(reported under `killed`); `elate ps NAME` lists that tree — a process it
+does not list is not the session's, even if `pgrep` matches its name. A
+crashed TTY Emacs keeps a dead pane for post-mortem `screenshot`. A stopped session's
 sandbox dir — and its `stopped` entry in `elate list` (which shows each
 one's idle age) — stays behind on purpose (transcripts outlive the Emacs).
 Stopped sandboxes are inert; when the transcripts are no longer needed,
@@ -503,10 +504,8 @@ uvx elate stop --mine                 # stop all of mine (also: --glob/--name-pr
 uvx elate purge --mine                # delete my stopped sandboxes
 ```
 
-`elate list` also reports each running session's `creator_state`: `self`
-(started from your agent process — e.g. before a `/clear`), `other` (a
-different agent that is still alive: it is in use, never stop it), or
-`gone`/`unknown` (a leftover).
+`list` marks each running session's `creator_state`: `self` (yours),
+`other` (another live agent's — never stop it), `gone`/`unknown` (leftover).
 
 `--ttl DUR` is the crash insurance: a session idle (no commands) past its
 TTL is stopped *and* purged by an opportunistic sweep that any later elate

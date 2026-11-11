@@ -1171,3 +1171,9 @@ def test_start_tool_fails_on_init_error(elate_home: str) -> None:
         assert ok["ok"] is True and "mcp boom" in ok["init_error"]
     finally:
         one_call(elate_home, "elate_stop", {"session": "mcpie"})
+
+
+
+def test_run_script_rejects_stdin(elate_home: str) -> None:
+    out = one_call(elate_home, "elate_run_script", {"script": "-"})
+    assert out["ok"] is False and "CLI-only" in out["error"]

@@ -68,7 +68,10 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -77,7 +80,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from . import paths
+from . import compose, paths
 from . import session as S
 from .errors import ElateError, WaitTimeout
 
@@ -238,10 +241,11 @@ def declared_variants(raw: Any) -> dict[str, dict[str, str]]:
                 "(no commas/spaces; max 32 chars) -- it becomes a CLI "
                 "token and a snapshot-stem component")
         if not (isinstance(bindings, dict) and all(
-                isinstance(k, str) and isinstance(v, str)
+                isinstance(k, str) and (isinstance(v, str) or k == "requires")
                 for k, v in bindings.items())):
             raise ElateError(
-                f'variant {name!r} must be an object of string -> string')
+                f'variant {name!r} must be an object of string -> string '
+                '(plus an optional "requires" object)')
         if "variant" in bindings:
             raise ElateError(
                 f"variant {name!r} binds 'variant', which is reserved: "
@@ -290,7 +294,10 @@ def render_script(raw: Any, overrides: dict[str, str],
             raise ElateError(
                 f"unknown variant {variant!r}; the scenario declares "
                 f"{sorted(variants)}")
-        bindings.update(variants[variant])
+        bindings.update({k: v for k, v in variants[variant].items()
+                         if k != "requires"})
+        raw["requires"] = compose.merge_requires(
+            raw.get("requires"), variants[variant].get("requires"))
     if variants:
         bindings["variant"] = variant or ""
     if "variant" in overrides:
@@ -345,24 +352,37 @@ def _check_xfail_variants(rendered: dict[str, Any],
                 f'declared in "variants" (declared: {sorted(variants)})')
 
 
-def load_raw(path: str | Path) -> tuple[Any, Path]:
-    """Read a scenario file to a raw value + base_dir (no templating/validation).
+def load_raw(path: str | Path, use_config: bool = True) -> tuple[Any, Path]:
+    """Read a scenario to a raw value + base_dir (no templating/validation).
 
-    For callers that render per parameter combo (matrix): read the file
+    PATH "-" reads the scenario from stdin (base_dir: the working
+    directory). The project config, includes, and step templates are
+    applied (see :mod:`elate.compose`; USE_CONFIG=False skips the project
+    config). For callers that render per parameter combo (matrix): read
     once, then `render_script` + `validate_script` per combo.
     """
-    p = Path(path).expanduser()
-    if not p.is_file():
-        raise ElateError(f"script file does not exist: {path}")
-    try:
-        return json.loads(p.read_text(encoding="utf-8")), p.parent.resolve()
-    except (OSError, ValueError) as exc:
-        raise ElateError(f"cannot read script {path}: {exc}") from exc
+    if str(path) == "-":
+        try:
+            raw = json.loads(sys.stdin.read())
+        except ValueError as exc:
+            raise ElateError(f"cannot parse the script on stdin: {exc}") from exc
+        base = Path.cwd().resolve()
+    else:
+        p = Path(path).expanduser()
+        if not p.is_file():
+            raise ElateError(f"script file does not exist: {path}")
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ElateError(f"cannot read script {path}: {exc}") from exc
+        base = p.parent.resolve()
+    return compose.prepare(raw, base, use_config=use_config), base
 
 
 def load_script(path: str | Path,
                 overrides: dict[str, str] | None = None,
                 variant: str | None = None,
+                use_config: bool = True,
                 ) -> tuple[dict[str, Any], Path]:
     """Read, template, and validate a scenario file; return (script, base_dir).
 
@@ -371,7 +391,7 @@ def load_script(path: str | Path,
     BASE_DIR is the script file's directory: relative paths inside the
     script resolve against it.
     """
-    raw, base = load_raw(path)
+    raw, base = load_raw(path, use_config=use_config)
     script = render_script(raw, overrides or {}, variant=variant)
     validate_script(script)
     return script, base
@@ -390,6 +410,10 @@ def validate_script(script: Any) -> None:
     defaults = script.get("defaults")
     if defaults is not None:
         _validate_defaults(defaults)
+    if script.get("requires") is not None:
+        _validate_requires(script["requires"])
+    if script.get("timeout_scale") is not None:
+        timeout_scale(config=script)  # raises on a bad value
     if not steps:
         # An empty CI script "passing" vacuously is far more likely a
         # typo (or a truncated export) than intent: be loud.
@@ -398,6 +422,56 @@ def validate_script(script: Any) -> None:
             "cannot pass; add steps (or assertions)")
     for index, step in enumerate(steps, 1):
         _validate_step(step, index)
+
+
+_REQUIRES_KEYS = {"env", "executable", "command"}
+
+
+def _validate_requires(block: Any) -> None:
+    if not isinstance(block, dict):
+        raise ElateError('"requires" must be an object of env/executable/command')
+    unknown = sorted(set(block) - _REQUIRES_KEYS)
+    if unknown:
+        raise ElateError(f'"requires": unknown key(s) {unknown}; known: '
+                         f"{sorted(_REQUIRES_KEYS)}")
+    for key, val in block.items():
+        items = val if isinstance(val, list) else [val]
+        if not items or not all(isinstance(v, str) and v for v in items):
+            raise ElateError(f'"requires" {key!r} must be a non-empty string '
+                             "or a list of them")
+
+
+def unmet_requirement(script: dict[str, Any], base: Path) -> str | None:
+    """Why SCRIPT cannot run here (its "requires"), or None when it can.
+
+    env: each variable is set and non-empty; executable: each is on PATH
+    (or an executable path); command: each shell command exits 0 within
+    30s, run in BASE. Checked before any session boots.
+    """
+    block = script.get("requires") or {}
+    as_list = lambda v: v if isinstance(v, list) else [v]  # noqa: E731
+    for var in as_list(block.get("env", [])):
+        if not os.environ.get(var):
+            return f"environment variable {var} is not set"
+    for exe in as_list(block.get("executable", [])):
+        # A path names a file relative to the scenario; a bare name is
+        # looked up on PATH.
+        target = str((base / exe).resolve()) if "/" in exe else exe
+        if shutil.which(target) is None:
+            return f"executable {exe!r} not found"
+    for command in as_list(block.get("command", [])):
+        try:
+            proc = subprocess.run(["sh", "-c", command], cwd=base,
+                                  stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True,
+                                  errors="replace", timeout=30)
+        except subprocess.TimeoutExpired:
+            return f"command `{command}` timed out after 30s"
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout).strip().splitlines()
+            detail = f": {tail[-1]}" if tail else ""
+            return f"command `{command}` exited {proc.returncode}{detail}"
+    return None
 
 
 def _check_bool(obj: dict[str, Any], key: str, where: str) -> None:
@@ -495,7 +569,7 @@ def _check_size(size: Any, what: str) -> None:
         raise ElateError(f"{what} {size} is implausible (minimum 10x4)")
 
 
-_DEFAULTS_KEYS = {"timeout", "min_idle"}
+_DEFAULTS_KEYS = {"timeout", "min_idle", "keys_delivery", "mouse_delivery"}
 
 
 def _validate_defaults(defaults: Any) -> None:
@@ -509,6 +583,15 @@ def _validate_defaults(defaults: Any) -> None:
     _check_timeout(defaults, 'script "defaults"')
     _check_number(defaults, "min_idle", 'script "defaults"',
                   minimum=0, maximum=60)
+    if defaults.get("keys_delivery", "semantic") not in (
+            "semantic", "events", "raw"):
+        raise ElateError(
+            'script "defaults": keys_delivery must be semantic/events/raw, '
+            f"got {defaults['keys_delivery']!r}")
+    if defaults.get("mouse_delivery", "macro") not in ("macro", "events"):
+        raise ElateError(
+            'script "defaults": mouse_delivery must be macro/events, '
+            f"got {defaults['mouse_delivery']!r}")
 
 
 def _validate_session_config(cfg: Any) -> None:
@@ -879,6 +962,9 @@ def run_script(
     snapshot_dir: Path | None = None,
     snapshot_stem: str | None = None,
     variant: str | None = None,
+    timeout_scale: float = 1.0,
+    on_session: Callable[[S.Session], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Execute SCRIPT; return the structured run result.
 
@@ -902,7 +988,11 @@ def run_script(
     streaming output). ORIGIN tags the transcript's run-script events
     (e.g. "mcp") for forensics. VARIANT names the "variants" entry the
     script was rendered with: it tags the result and is what a map-form
-    "xfail" (variant name -> reason) matches against.
+    "xfail" (variant name -> reason) matches against. TIMEOUT_SCALE
+    multiplies every step timeout. ON_SESSION is called with a fresh
+    session as soon as it is up (a parallel matrix tracks them so an
+    interrupt can stop them); SHOULD_STOP, polled before each step, ends
+    the run like a blown DEADLINE when it returns true.
     """
     validate_script(script)
     if session is not None and emacs:
@@ -920,6 +1010,8 @@ def run_script(
         # `purge --glob 'run-evil-ghostel-*'`) instead of an opaque hex.
         run_hint = snapshot_stem or _safe_stem(script.get("name"))
         sess = _start_for(script, base, emacs, keep_as_name, run_hint)
+        if on_session is not None:
+            on_session(sess)
     else:
         sess = session
         sess.require_alive()
@@ -954,7 +1046,8 @@ def run_script(
     sess.log("run-script", name=script.get("name"), steps=len(steps),
              **({"origin": origin} if origin else {}))
 
-    ctx: dict[str, Any] = {"_defaults": script.get("defaults") or {}}
+    ctx: dict[str, Any] = {"_defaults": {**(script.get("defaults") or {}),
+                                         "_scale": timeout_scale}}
     snap_root = (Path(snapshot_dir) if snapshot_dir is not None
                  else base / "__snapshots__")
     ctx["_snapshot"] = {
@@ -990,6 +1083,11 @@ def run_script(
                                 "raise the run timeout or split the script")
                 gate_failed = True
                 stopped = True  # every later step would also be past the wall
+            elif should_stop is not None and should_stop():
+                rec["status"] = "failed"
+                rec["error"] = "run cancelled before this step"
+                gate_failed = True
+                stopped = True
             else:
                 t0 = time.monotonic()
                 internal = False  # controller bug: never waived (see below)
@@ -1105,6 +1203,86 @@ def run_script(
         except ElateError as exc:
             result["teardown_error"] = str(exc)
     return result
+
+
+def run_scenario(script: dict[str, Any], *, base_dir: Path | None = None,
+                 retries: int = 0, scale: float | None = None,
+                 session: S.Session | None = None,
+                 **kwargs: Any) -> dict[str, Any]:
+    """:func:`run_script` under the run policy; the result gains "status".
+
+    status is "pass", "fail", "skip" (the script's "requires" is unmet:
+    nothing boots, "skip_reason" says why, and it does not fail the run),
+    or "flaky" (failed, then passed on one of up to RETRIES fresh
+    attempts; every attempt is listed under "attempts" and each failed
+    attempt's sandbox is kept). SCALE multiplies every step timeout (see
+    :func:`timeout_scale`, which supplies the default).
+    """
+    base = Path(base_dir) if base_dir is not None else Path.cwd()
+    if retries and session is not None:
+        raise ElateError("retries need fresh sessions; they cannot apply to "
+                         "an existing session (-s NAME)")
+    if retries and kwargs.get("keep"):
+        raise ElateError("retries cannot keep a session (--keep): each "
+                         "attempt needs a fresh one")
+    factor = timeout_scale(scale, script)
+    reason = unmet_requirement(script, base)
+    if reason is not None:
+        return {"name": script.get("name"),
+                **({"variant": kwargs["variant"]} if kwargs.get("variant")
+                   else {}),
+                "status": "skip", "success": True, "skip_reason": reason,
+                "passed": 0, "failed": 0, "xfail": 0, "xpass": 0,
+                "skipped": 0, "not_run": len(script.get("steps") or []),
+                "duration": 0.0, "groups": [], "steps": []}
+    attempts: list[dict[str, Any]] = []
+    deadline = kwargs.get("deadline")
+    should_stop = kwargs.get("should_stop")
+    keep_on_failure = kwargs.pop("keep_on_failure", False)
+    while True:
+        final = len(attempts) >= retries
+        # Only the last attempt may stay running on failure; earlier
+        # failed attempts are stopped (their sandboxes stay on disk).
+        result = run_script(script, base_dir=base, session=session,
+                            timeout_scale=factor,
+                            keep_on_failure=keep_on_failure and final,
+                            **kwargs)
+        attempts.append({
+            "attempt": len(attempts) + 1,
+            "success": result["success"],
+            "duration": result["duration"],
+            "session_dir": result.get("session_dir"),
+            "failed_step": first_failed_step(result),
+            **({"error": result["error"]} if result.get("error") else {}),
+        })
+        if result["success"] or len(attempts) > retries:
+            break
+        if ((deadline is not None and time.monotonic() >= deadline)
+                or (should_stop is not None and should_stop())):
+            break  # no budget left for another attempt
+    if len(attempts) > 1:
+        result["attempts"] = attempts
+    if factor != 1.0:
+        result["timeout_scale"] = factor
+    result["status"] = ("fail" if not result["success"]
+                        else "flaky" if len(attempts) > 1 else "pass")
+    return result
+
+
+def first_failed_step(result: dict[str, Any]) -> str | None:
+    """Summary of the step that failed RESULT (a gating failure or xpass)."""
+    return next((r["summary"] for r in result.get("steps") or []
+                 if (r["status"] == "failed" and not r.get("optional"))
+                 or r["status"] == "xpass"), None)
+
+
+def failed_steps(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every gating failure of RESULT: index, summary, error."""
+    return [{"index": r["index"], "summary": r["summary"],
+             **({"error": r["error"]} if r.get("error") else {})}
+            for r in result.get("steps") or []
+            if (r["status"] == "failed" and not r.get("optional"))
+            or r["status"] == "xpass"]
 
 
 _SANE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -1287,16 +1465,44 @@ def _summary(step: dict[str, Any], verb: str | None) -> str:
 
 def _step_timeout(step: dict[str, Any], verb: str,
                   defaults: dict[str, Any]) -> float:
-    """A step's timeout: its own, else the scenario default, else the builtin."""
+    """A step's timeout: its own, else the scenario default, else the
+    builtin -- times the run's timeout scale (see :func:`timeout_scale`)."""
     return float(step.get("timeout",
-                          defaults.get("timeout", _DEFAULT_TIMEOUTS[verb])))
+                          defaults.get("timeout", _DEFAULT_TIMEOUTS[verb]))) \
+        * float(defaults.get("_scale", 1.0))
+
+
+def timeout_scale(explicit: float | None = None,
+                  config: dict[str, Any] | None = None) -> float:
+    """The factor every step and wait timeout is multiplied by.
+
+    EXPLICIT (--timeout-scale) wins, then $ELATE_TIMEOUT_SCALE, then the
+    scenario's (or its project config's) "timeout_scale", else 1. For
+    loaded machines and CI.
+    """
+    raw: Any = explicit
+    where = "--timeout-scale"
+    if raw is None and os.environ.get("ELATE_TIMEOUT_SCALE"):
+        raw, where = os.environ["ELATE_TIMEOUT_SCALE"], "$ELATE_TIMEOUT_SCALE"
+    if raw is None and config and config.get("timeout_scale") is not None:
+        raw, where = config["timeout_scale"], '"timeout_scale"'
+    if raw is None:
+        return 1.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ElateError(f"{where} must be a number, got {raw!r}") from None
+    if not 0.1 <= value <= 20:
+        raise ElateError(f"{where} must be between 0.1 and 20, got {value:g}")
+    return value
 
 
 def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
                base: Path, ctx: dict[str, Any]) -> dict[str, Any]:
     defaults = ctx.get("_defaults") or {}
     if verb == "keys":
-        delivery = step.get("delivery", "semantic")
+        delivery = step.get("delivery",
+                            defaults.get("keys_delivery", "semantic"))
         timeout = _step_timeout(step, verb, defaults)
         sess.log("keys", keys=step["keys"],
                  channel="raw" if delivery == "raw" else "semantic",
@@ -1362,7 +1568,8 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
             direction=step.get("direction", "down"),
             count=int(step.get("count", 1)),
             steps=int(step.get("steps", 0)),
-            delivery=step.get("delivery", "macro"),
+            delivery=step.get("delivery",
+                              defaults.get("mouse_delivery", "macro")),
         )
         sess.log("mouse", via="script", **kwargs)
         return S.mouse_event(
@@ -1639,8 +1846,9 @@ def _eval_assert(sess: S.Session, spec: dict[str, Any],
         return _eval_snapshot(sess, val, ctx)
 
     # kind == "eval": passes when the form evaluates without error to non-nil
-    timeout = float(spec.get("timeout",
-                             (ctx.get("_defaults") or {}).get("timeout", 10.0)))
+    defaults = ctx.get("_defaults") or {}
+    timeout = float(spec.get("timeout", defaults.get("timeout", 10.0))) \
+        * float(defaults.get("_scale", 1.0))
     data = sess.semantic().eval_form(val, timeout=timeout,
                                      buffer=spec.get("buffer"))
     if data.get("error"):

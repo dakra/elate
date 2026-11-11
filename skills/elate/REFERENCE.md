@@ -502,7 +502,10 @@ run a scenario script: fresh session, steps, assertions, exit 0/1 (CI)
 
 Execute a JSON scenario script: create a fresh sandboxed session from the script's "session" config (or target an existing one with -s NAME, in which case that config is ignored and nothing is torn down), run the steps in order, evaluate the assertions, then stop the fresh session. Exits 0 when every step and assertion passed, 1 otherwise; a failed step embeds a state snapshot. Fresh sessions are the default deliberately: lint executes compile-time code and lint/test results depend on session history, so only a throwaway session gives reproducible verdicts.
 
-- `script` -- path to the scenario file (JSON)
+- `script` -- path to the scenario file (JSON); '-' reads it from stdin (relative paths then resolve against the working directory)
+- `--retries N` (default: 0) -- rerun a failing scenario up to N more times in fresh sessions; one that then passes is reported FLAKY (not FAIL), with every attempt's sandbox kept and listed under attempts
+- `--timeout-scale F` -- multiply every step and wait timeout by F (0.1-20) for loaded machines and CI; default $ELATE_TIMEOUT_SCALE, else the project config's timeout_scale, else 1
+- `--no-config` -- ignore the project config (the nearest .elate.json at or above the scenario's directory)
 - `--keep` -- keep the fresh session running afterwards (named from the scenario's "name", or --name)
 - `--name NAME` -- name for a kept session (default with --keep: the scenario's "name"); a running name collision is an error
 - `--no-purge` -- on success, keep the throwaway sandbox on disk (stopped) instead of removing it; failed runs are always kept for post-mortem
@@ -549,17 +552,22 @@ Capture a frame every INTERVAL seconds into frame-NNNN.png/.txt plus a manifest.
 
 run a scenario across Emacs binaries, variants, and parameter axes
 
-Run SCRIPT once per combination of the Emacs binary axis, the scenario's "variants" (every declared variant by default; a variant is a NAMED set of co-varying {{var}} bindings), and any --param axes -- their Cartesian product -- each in a fresh session, and aggregate the verdicts into one grid. Each --param NAME=v1,v2 binds the scenario's {{NAME}} template per combo, so one file drives many shells/configs x Emacs versions. Exits 0 only when every combo passed (xfail honored).
+Run each SCRIPT once per combination of the Emacs binary axis (default: the scenario's own emacs), the scenario's "variants" (every declared variant by default; a variant is a NAMED set of co-varying {{var}} bindings), and any --param axes -- their Cartesian product -- each in a fresh session, and aggregate the verdicts into one grid. Each --param NAME=v1,v2 binds the scenario's {{NAME}} template per combo, so one file drives many shells/configs x Emacs versions. Each combo is pass, FAIL, SKIP (a "requires" precondition is unmet) or FLAKY (passed on a --retries attempt). Exits 0 unless a combo FAILed (xfail honored).
 
 - `--emacs PATHS` (repeatable) -- emacs binary, or comma-separated list (repeatable)
 - `--emacs-glob GLOB` -- glob matching emacs binaries, e.g. '/opt/emacs-*/bin/emacs'
 - `--param NAME=V1,V2` (repeatable) -- a parameter axis: bind {{NAME}} to each comma-separated value in turn (repeatable; every axis is crossed with the Emacs axis)
 - `--variant NAMES` (repeatable) -- filter the variant axis to these "variants" entries (comma-separated, repeatable); default: every declared variant
 - `--set-file NAME=PATH` (repeatable) -- bind a {{NAME}} template variable to PATH's contents verbatim (one trailing newline stripped), constant across every combo -- not an axis
-- `--format {json,human}` -- output format: 'human' (default) the grid, 'json' the structured results. Overrides --json/--human.
+- `--format {json,human,junit}` -- output format: 'human' (default) the grid with failing steps, reasons, and log paths; 'json' the structured results; 'junit' JUnit XML (a testsuite per scenario, a testcase per combo). Overrides --json/--human.
 - `--update-snapshots` -- write/overwrite golden snapshots (per Emacs version and param combo) instead of comparing
 - `--snapshot-dir DIR` -- base directory for golden snapshots (default: <scenario-dir>/__snapshots__)
-- `script` -- path to the scenario file (JSON)
+- `--jobs, -j N` (default: 1) -- run up to N combos at once (tty and headless sessions; combos that open a window on your display stay serial unless --parallel-gui)
+- `--parallel-gui` -- with --jobs, also run windowed GUI combos in parallel
+- `--retries N` (default: 0) -- rerun a failing scenario up to N more times in fresh sessions; one that then passes is reported FLAKY (not FAIL), with every attempt's sandbox kept and listed under attempts
+- `--timeout-scale F` -- multiply every step and wait timeout by F (0.1-20) for loaded machines and CI; default $ELATE_TIMEOUT_SCALE, else the project config's timeout_scale, else 1
+- `--no-config` -- ignore the project config (the nearest .elate.json at or above the scenario's directory)
+- `SCRIPT...` (repeatable) -- scenario file(s) (JSON); several form a scenario axis, each crossed only with the --param axes it references; '-' reads one from stdin
 
 ## elate install
 

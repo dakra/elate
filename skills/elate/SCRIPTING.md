@@ -53,9 +53,84 @@ runs nothing and takes no other keys.
 
 A top-level `"defaults"` block sets fallbacks for options every step would
 otherwise repeat: `"timeout"` (seconds, the fallback for any verb's step
-timeout) and `"min_idle"` (the fallback for `wait: "idle"`). A step's own
-`timeout`/`min_idle` still wins; the defaults just replace the built-in
-per-verb baseline.
+timeout), `"min_idle"` (the fallback for `wait: "idle"`), and
+`"keys_delivery"` / `"mouse_delivery"` (the default `delivery` of `keys`
+steps — `semantic`, `events`, `raw` — and of `mouse` steps — `macro`,
+`events`). A step's own option still wins; the defaults just replace the
+built-in per-verb baseline. Use `"keys_delivery": "events"` when the code
+under test reads keys itself (`read-key`, a `ding`, an echo-area check):
+macro delivery runs the whole sequence inside one command, so a bell aborts
+the rest and `read-key` sees the next macro key as input.
+
+### Reusable steps: `templates`, `use`, `include`
+
+A `"templates"` block defines parameterized step groups; a `use` step
+expands one in place:
+
+```json
+{"templates": {
+   "press-and-wait": {"params": {"key": null, "pred": "t"},
+                      "steps": [{"keys": "{{key}}"},
+                                {"wait": "until", "pred": "{{pred}}"}]}},
+ "steps": [
+   {"use": "press-and-wait", "with": {"key": "C-c C-o",
+                                      "pred": "(my-hints-visible-p)"}},
+   {"use": "press-and-wait", "with": {"key": "q"}, "group": "close"}]}
+```
+
+`params` maps each parameter to a default (`null` = required) or is a list
+of required names; `with` binds them (an unknown or missing parameter is an
+error). Other `{{var}}`s in a template are left for the scenario's own
+templating, so templates compose with `params`/`variants`. A `use` step
+takes only `use`, `with`, `comment`, and `group` (the group starts at the
+first expanded step); templates may `use` other templates. Paths inside
+template steps resolve against the scenario, like its own steps.
+`"include": ["lib/steps.json"]` reads templates from shared files (paths
+relative to the including file; an include file holds `templates` and may
+`include` more). Precedence, lowest first: project-config templates, its
+includes, the scenario's includes, the scenario's own templates.
+
+### Project config: `.elate.json`
+
+The nearest `.elate.json` in the scenario's directory or above it supplies
+project-wide defaults, so every scenario stops repeating its setup. The
+search stops at a repository root (a directory with `.git`) and at
+`$HOME`, and never enters a directory other users can write to (`/tmp`) —
+a config's session code runs as you, so one owned by someone else is
+ignored:
+
+```json
+{"session": {"ui": "gui", "eval_file": ["lib/test-helpers.el"],
+             "env": {"MY_PKG_DEBUG": "1"}},
+ "defaults": {"timeout": 15},
+ "timeout_scale": 1.5,
+ "include": ["lib/steps.json"],
+ "requires": {"executable": "my-server"}}
+```
+
+The scenario's own values win; list options (`load`, `require`, `eval`,
+`eval_file`, `profile`) are concatenated config-first and `env` is merged.
+Relative paths in the config (session paths, includes, `requires`
+executables) resolve against the config's directory, and its `requires`
+commands run there. A scenario may set `"timeout_scale"` itself too.
+`run`/`matrix --no-config` (or `ELATE_NO_PROJECT_CONFIG=1`) ignore it.
+
+### Preconditions: `requires` → SKIP
+
+`"requires"` (top level, or inside a variant) names what a run needs:
+`{"env": "REMOTE_HOST", "executable": ["ssh"], "command": "ssh -o
+BatchMode=yes {{host}} true"}` — each key takes a string or a list;
+`command` must exit 0 within 30s (run with `sh -c` in the scenario's
+directory). When one is unmet, nothing boots: the run's `status` is
+`"skip"` with a `skip_reason`, it exits 0, and `matrix` reports `SKIP`
+next to `pass`/`FAIL`/`FLAKY`. A variant's `requires` adds to the
+top-level one:
+
+```json
+{"variants": {"local":  {"host": "localhost"},
+              "remote": {"host": "build1",
+                         "requires": {"env": "SSH_AUTH_SOCK"}}}}
+```
 
 Relative paths (session `load`/`init_file`, test `load_files`, `lint`
 files, `screenshot` output) resolve against the **script file's
@@ -249,7 +324,33 @@ elate run scenario.json --keep-on-failure
 elate run scenario.json --emacs /opt/emacs-29/bin/emacs
 elate -s existing run scenario.json      # against an existing session:
                                          # session block ignored, no teardown
+elate run scenario.json --retries 2      # FAIL then PASS => FLAKY, logs kept
+elate run scenario.json --timeout-scale 2   # loaded machine / CI
 ```
+
+`run -` reads the scenario from stdin (relative paths then resolve against
+the working directory) — with `-s NAME` that batches inline steps against
+a live session in one call, instead of a chain of separate commands with
+`sleep`s between them:
+
+```sh
+elate -s demo run - <<'JSON'
+{"steps": [{"keys": "C-c C-o"},
+           {"wait": "until", "pred": "(my-hints-visible-p)"},
+           {"eval": "(my-hint-count)"},
+           {"screenshot": "hints.png"}]}
+JSON
+```
+
+The result's `status` is `pass`, `fail`, `skip` (unmet `requires`), or
+`flaky` (failed, then passed on a `--retries` attempt — every attempt is
+listed under `attempts` and each failed attempt's sandbox stays on disk;
+`--keep-on-failure` keeps only the last attempt running, and `--keep`
+cannot combine with `--retries`).
+`--timeout-scale F` (or `$ELATE_TIMEOUT_SCALE`, or the project config's
+`timeout_scale`) multiplies every step and wait timeout. Ctrl-C, SIGTERM,
+and SIGHUP stop the run's throwaway session before elate exits
+(128+signal).
 
 Fresh sessions per run are the default **on purpose**: lint executes
 compile-time code and lint/test results depend on session history, so only
@@ -262,11 +363,21 @@ loud error (an existing session already runs its own binary).
 elate matrix --emacs /opt/e29/bin/emacs,/opt/e30/bin/emacs scenario.json
 elate matrix --emacs-glob '/opt/emacs-*/bin/emacs' scenario.json
 elate matrix --emacs emacs scenario.json   # bare names resolve via PATH
+elate matrix tests/*.json                  # scenario x variant, own emacs
+elate matrix -j 4 --retries 1 tests/*.json --format junit > junit.xml
 ```
 
-One fresh session per binary; duplicates (symlink/relative/PATH spellings)
-run once; one broken binary records a failure but does not abort the rest.
-Exit 0 only when every version passed.
+One fresh session per combo; duplicate binaries (symlink/relative/PATH
+spellings) run once; one broken combo records a failure but does not abort
+the rest. Without `--emacs`, each scenario runs on its own session `emacs`
+(else PATH's). Several scenario files form a scenario axis, each crossed
+with its variants and only the `--param` axes it references. The summary
+has one line per combo (`pass`/`FAIL`/`SKIP`/`FLAKY`), every failing step
+quoted under a failure, the skip reason, the kept sandbox (`log:`), and
+totals with wall time; `--format junit` writes a testsuite per scenario.
+`--jobs N` runs N combos at once — TTY and headless ones; combos that open
+a window on your display stay serial unless `--parallel-gui`. Exit 0 unless
+a combo FAILed.
 
 ## Transcript export
 

@@ -1393,6 +1393,15 @@ def elate_run_script(
         "--variant`; running every variant crossed with Emacs binaries is "
         "the CLI-only `matrix` verb -- call this once per variant "
         "instead."))] = None,
+    retries: Annotated[int, Field(ge=0, le=10, description=(
+        "Rerun a failing scenario up to this many more times in fresh "
+        "sessions; one that then passes reports status 'flaky' (every "
+        "attempt listed under 'attempts', failed attempts' sandboxes "
+        "kept). All attempts share the 'timeout' budget."))] = 0,
+    timeout_scale: Annotated[float | None, Field(ge=0.1, le=20, description=(
+        "Multiply every step and wait timeout by this factor (loaded "
+        "machines, CI). Default: $ELATE_TIMEOUT_SCALE, else the project "
+        "config's timeout_scale, else 1."))] = None,
 ) -> str:
     """Execute a whole scenario script in one call: fresh session, steps,
     assertions, teardown.
@@ -1411,15 +1420,21 @@ def elate_run_script(
     anyway). ok=false means the script could not run at all
     (unreadable/invalid script file, session boot failure). Use this
     instead of many single-step calls when a scenario is already written
-    down -- one round-trip runs it all.
+    down -- one round-trip runs it all. "status" is pass / fail / flaky /
+    skip -- skip when the script's (or the selected variant's) "requires"
+    is unmet; nothing boots then and "skip_reason" says why.
     """
     try:
         from . import script as SC
 
+        if script.strip() == "-":
+            # stdin is this server's JSON-RPC transport.
+            raise ElateError("script must be a file path ('-' is CLI-only)")
         sc, base = SC.load_script(script, params or {}, variant=variant)
         sdir = (base / snapshot_dir) if snapshot_dir else None
         stem = Path(script).stem + (f"+variant-{variant}" if variant else "")
-        result = SC.run_script(sc, base_dir=base, emacs=emacs,
+        result = SC.run_scenario(sc, base_dir=base, emacs=emacs,
+                               retries=retries, scale=timeout_scale,
                                keep_on_failure=keep_on_failure,
                                keep_going=keep_going,
                                purge=not no_purge,

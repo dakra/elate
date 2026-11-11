@@ -44,6 +44,44 @@ matrix while building a browser-in-a-buffer package.
 - The outdated-skill notice prints at most once a day per distinct
   notice.
 
+### Scenarios and matrices
+
+- **`matrix` takes several scenario files** — a scenario axis, each
+  crossed with its own variants and only the `--param` axes it
+  references — and no longer requires `--emacs` (each scenario then runs
+  on its own session `emacs`). The summary lists every failing step under
+  a failure, the skip reason, the kept sandbox (`log:`), and totals with
+  wall time; results carry `status`, `failed_steps`, `session_dir`, and a
+  `totals` block. `--format junit` writes a testsuite per scenario.
+- **`--jobs N`** (`-j`) runs matrix combos in parallel; combos that open a
+  window on the user's display stay serial unless `--parallel-gui`, and
+  `--update-snapshots` runs serially. An interrupt stops every session
+  the matrix started and cancels the rest; a `wait` whose session is
+  stopped under it now fails at once instead of polling to its timeout.
+- Matrix results' `axes` carry every axis of the run (`scenario` with
+  several files, `variant`, each `--param`), `null` where a combo's
+  scenario does not use one.
+- **`requires` → SKIP**: a top-level or per-variant `"requires"` block
+  (`env`, `executable`, `command`) is checked before anything boots; an
+  unmet one makes the run `status: "skip"` with a `skip_reason`, exit 0.
+- **`--retries N` → FLAKY** (`run`, `matrix`, MCP `retries`): a failing
+  scenario reruns in fresh sessions; one that then passes is `flaky`, with
+  every attempt under `attempts` and failed attempts' sandboxes kept.
+- **`--timeout-scale F`** (`$ELATE_TIMEOUT_SCALE`, project
+  `timeout_scale`, MCP `timeout_scale`) multiplies every step and wait
+  timeout.
+- **Step templates**: `"templates"` defines parameterized step groups,
+  `{"use": NAME, "with": {...}}` expands one, `"include"` reads templates
+  from shared files.
+- **Project config** `.elate.json` (nearest at or above the scenario; the
+  search stops at a `.git` root, at `$HOME`, and at directories other
+  users can write to, and ignores configs owned by someone else): shared
+  `session`, `defaults`, `requires`, `timeout_scale`, `include`,
+  `templates`; `--no-config` or `$ELATE_NO_PROJECT_CONFIG` ignores it.
+- `"defaults"` takes `keys_delivery` and `mouse_delivery`.
+- `run -` reads the scenario from stdin — with `-s NAME`, a one-call batch
+  of steps against a live session.
+
 ## 0.16.0
 
 Mouse and display-geometry round, from agents regression-testing a

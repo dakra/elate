@@ -1895,10 +1895,12 @@ def test_matrix_failure_and_bad_binary(elate_home: str, tmp_path: Path,
     code = cli.main(["--json", "matrix", "--emacs", "/no/such/emacs", path])
     out = json.loads(capsys.readouterr().out)
     assert code == 1 and "not an executable" in out["error"]
-    # No binaries at all is a usage-style error.
+    # No --emacs: the scenario's own emacs (here: PATH's), once.
     code = cli.main(["--json", "matrix", path])
     out = json.loads(capsys.readouterr().out)
-    assert code == 1 and "--emacs" in out["error"]
+    assert code == 1 and len(out["results"]) == 1
+    assert out["results"][0]["emacs"] is None
+    assert out["results"][0]["version"]
 
 
 def test_matrix_bare_name_and_dedup(elate_home: str, tmp_path: Path,

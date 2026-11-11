@@ -74,6 +74,23 @@ def _read_set_files(pairs: list[tuple[str, str]],
 _DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
+def _add_policy_args(sp: argparse.ArgumentParser) -> None:
+    """Run-policy flags shared by `run` and `matrix`."""
+    sp.add_argument("--retries", type=int, default=0, metavar="N",
+                    help="rerun a failing scenario up to N more times in "
+                         "fresh sessions; one that then passes is reported "
+                         "FLAKY (not FAIL), with every attempt's sandbox "
+                         "kept and listed under attempts")
+    sp.add_argument("--timeout-scale", type=float, metavar="F",
+                    help="multiply every step and wait timeout by F (0.1-20) "
+                         "for loaded machines and CI; default "
+                         "$ELATE_TIMEOUT_SCALE, else the project config's "
+                         "timeout_scale, else 1")
+    sp.add_argument("--no-config", action="store_true",
+                    help="ignore the project config (the nearest "
+                         ".elate.json at or above the scenario's directory)")
+
+
 def _parse_duration(value: str) -> float:
     """A duration like '30s', '15m', '2h', '1d', or a bare number, in seconds."""
     m = re.match(r"^(\d+(?:\.\d+)?)([smhd]?)$", value.strip())
@@ -1053,7 +1070,11 @@ def build_parser() -> argparse.ArgumentParser:
                     "executes compile-time code and lint/test results "
                     "depend on session history, so only a throwaway "
                     "session gives reproducible verdicts.")
-    sp.add_argument("script", help="path to the scenario file (JSON)")
+    sp.add_argument("script", help="path to the scenario file (JSON); "
+                                   "'-' reads it from stdin (relative paths "
+                                   "then resolve against the working "
+                                   "directory)")
+    _add_policy_args(sp)
     sp.add_argument("--keep", action="store_true",
                     help="keep the fresh session running afterwards (named "
                          "from the scenario's \"name\", or --name)")
@@ -1162,15 +1183,18 @@ def build_parser() -> argparse.ArgumentParser:
         "matrix",
         help="run a scenario across Emacs binaries, variants, and parameter "
              "axes",
-        description="Run SCRIPT once per combination of the Emacs binary "
-                    "axis, the scenario's \"variants\" (every declared "
+        description="Run each SCRIPT once per combination of the Emacs binary "
+                    "axis (default: the scenario's own emacs), the "
+                    "scenario's \"variants\" (every declared "
                     "variant by default; a variant is a NAMED set of "
                     "co-varying {{var}} bindings), and any --param axes -- "
                     "their Cartesian product -- each in a fresh session, "
                     "and aggregate the verdicts into one grid. Each --param "
                     "NAME=v1,v2 binds the scenario's {{NAME}} template per "
                     "combo, so one file drives many shells/configs x Emacs "
-                    "versions. Exits 0 only when every combo passed (xfail "
+                    "versions. Each combo is pass, FAIL, SKIP (a \"requires\" "
+                    "precondition is unmet) or FLAKY (passed on a --retries "
+                    "attempt). Exits 0 unless a combo FAILed (xfail "
                     "honored).")
     sp.add_argument("--emacs", action="append", default=[], metavar="PATHS",
                     help="emacs binary, or comma-separated list (repeatable)")
@@ -1191,16 +1215,30 @@ def build_parser() -> argparse.ArgumentParser:
                     help="bind a {{NAME}} template variable to PATH's "
                          "contents verbatim (one trailing newline stripped), "
                          "constant across every combo -- not an axis")
-    sp.add_argument("--format", choices=("json", "human"),
-                    help="output format: 'human' (default) the grid, 'json' "
-                         "the structured results. Overrides --json/--human.")
+    sp.add_argument("--format", choices=("json", "human", "junit"),
+                    help="output format: 'human' (default) the grid with "
+                         "failing steps, reasons, and log paths; 'json' the "
+                         "structured results; 'junit' JUnit XML (a "
+                         "testsuite per scenario, a testcase per combo). "
+                         "Overrides --json/--human.")
     sp.add_argument("--update-snapshots", action="store_true",
                     help="write/overwrite golden snapshots (per Emacs "
                          "version and param combo) instead of comparing")
     sp.add_argument("--snapshot-dir", metavar="DIR",
                     help="base directory for golden snapshots "
                          "(default: <scenario-dir>/__snapshots__)")
-    sp.add_argument("script", help="path to the scenario file (JSON)")
+    sp.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
+                    help="run up to N combos at once (tty and headless "
+                         "sessions; combos that open a window on your "
+                         "display stay serial unless --parallel-gui)")
+    sp.add_argument("--parallel-gui", action="store_true",
+                    help="with --jobs, also run windowed GUI combos in "
+                         "parallel")
+    _add_policy_args(sp)
+    sp.add_argument("scripts", nargs="+", metavar="SCRIPT",
+                    help="scenario file(s) (JSON); several form a scenario "
+                         "axis, each crossed only with the --param axes it "
+                         "references; '-' reads one from stdin")
 
     sp = sub.add_parser(
         "install",
@@ -2576,6 +2614,8 @@ def _step_line(rec: dict[str, Any], total: int) -> str:
 
 
 def _run_summary(result: dict[str, Any]) -> str:
+    if result.get("status") == "skip":
+        return f"SKIP: {result['skip_reason']}"
     bits = [f"{result['passed']} passed"]
     # result["failed"] counts every failed-status step; optional failures
     # are broken out so a passing run never reads "PASS ... 1 failed".
@@ -2590,8 +2630,14 @@ def _run_summary(result: dict[str, Any]) -> str:
             ("not_run", "not run", result.get("not_run", 0))):
         if val:
             bits.append(f"{val} {label}")
-    line = (("PASS" if result["success"] else "FAIL")
-            + f": {', '.join(bits)} in {result['duration']:.2f}s")
+    verdict = ("FLAKY" if result.get("status") == "flaky"
+               else "PASS" if result["success"] else "FAIL")
+    line = f"{verdict}: {', '.join(bits)} in {result['duration']:.2f}s"
+    for attempt in result.get("attempts") or []:
+        if not attempt["success"]:
+            line += (f"\n  attempt {attempt['attempt']} failed"
+                     f"{': ' + attempt['failed_step'] if attempt.get('failed_step') else ''}"
+                     f" (sandbox {attempt['session_dir']})")
     if result.get("groups"):
         line += "\n" + " · ".join(
             f"{g['name']}: {g['status']}" for g in result["groups"])
@@ -2664,6 +2710,9 @@ def _testcases(result: dict[str, Any]) -> list[tuple[str, str, str]]:
     ungrouped, non-comment step becomes its own case. Comment/marker steps
     are annotations, not tests.
     """
+    if result.get("status") == "skip":
+        return [(f"scenario: {result.get('name') or 'elate'}", "skip",
+                 result["skip_reason"])]
     groups = result.get("groups") or []
     first = {g["steps"][0]: g for g in groups if g.get("steps")}
     grouped = {i for g in groups for i in g.get("steps", [])}
@@ -2719,7 +2768,7 @@ def _format_tap(result: dict[str, Any]) -> str:
             # A tolerated failure: "not ok" (it failed) but TODO (non-gating),
             # mirroring JUnit's <skipped> -- a plain "ok" would read as a pass.
             "optfail": ("not ok", "TODO optional failure"),
-            "skip": ("ok", "SKIP"),
+            "skip": ("ok", f"SKIP {msg}" if msg else "SKIP"),
             "notrun": ("ok", "SKIP not run"),
         }.get(outcome, ("ok", ""))
         # '#' would start a spurious directive; a newline would split the line
@@ -2747,10 +2796,20 @@ def cmd_run(args: argparse.Namespace) -> Result:
         # A name is only meaningful for a session that survives the run;
         # otherwise it just leaves a non-run-* leftover on failure.
         raise ElateError("--name requires --keep (it names the kept session)")
+    if args.retries < 0:
+        raise UsageError("--retries must be >= 0")
+    if args.retries and args.session:
+        raise ElateError("--retries needs fresh sessions; drop -s NAME")
+    if args.retries and args.keep:
+        raise ElateError("--retries cannot be combined with --keep: each "
+                         "attempt needs a fresh session")
+    if args.timeout_scale is not None:
+        SC.timeout_scale(args.timeout_scale)
     overrides = {**_read_set_files(args.set_file_vars, args.set_vars),
                  **dict(args.set_vars)}
     script, base = SC.load_script(args.script, overrides,
-                                  variant=args.variant)
+                                  variant=args.variant,
+                                  use_config=not args.no_config)
     target = None
     if args.session:
         target = S.load_session(args.session)
@@ -2769,8 +2828,10 @@ def cmd_run(args: argparse.Namespace) -> Result:
     # "name". Purge the throwaway sandbox on a successful run unless kept or
     # --no-purge.
     keep_as_name = args.name or (script.get("name") if args.keep else None)
-    result = SC.run_script(
+    stem = "stdin" if args.script == "-" else Path(args.script).stem
+    result = SC.run_scenario(
         script, base_dir=base, session=target, emacs=args.emacs,
+        retries=args.retries, scale=args.timeout_scale,
         keep=args.keep, keep_on_failure=args.keep_on_failure,
         keep_going=args.keep_going,
         keep_as_name=keep_as_name,
@@ -2781,7 +2842,7 @@ def cmd_run(args: argparse.Namespace) -> Result:
                       if args.snapshot_dir else None),
         # Fold the variant into the stem so `--variant a --update-snapshots`
         # and `--variant b` never share goldens (matches matrix's stems).
-        snapshot_stem=Path(args.script).stem
+        snapshot_stem=stem
         + (f"+variant-{args.variant}" if args.variant else ""),
         variant=args.variant,
     )
@@ -2879,19 +2940,19 @@ def _safe_param(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-") or "x"
 
 
-def _matrix_label(emacs: str, params: dict[str, str],
-                  version: str | None = None) -> str:
-    head = f"emacs {version}" if version else Path(emacs).name
+def _matrix_label(emacs: str | None, params: dict[str, str],
+                  version: str | None = None,
+                  scenario: str | None = None) -> str:
+    head = (f"emacs {version}" if version
+            else Path(emacs).name if emacs else "emacs")
     tail = "  ".join(f"{k}={v}" for k, v in params.items())
-    return f"{head}  {tail}".rstrip()
+    return "  ".join(x for x in (scenario, head, tail) if x)
 
 
-def cmd_matrix(args: argparse.Namespace) -> Result:
+def _resolve_binaries(args: argparse.Namespace) -> list[str | None]:
+    """The Emacs axis: --emacs/--emacs-glob, deduped; [None] = the script's."""
     import glob as globlib
-    import itertools
     import shutil
-
-    from . import script as SC
 
     binaries: list[str] = []
     for spec in args.emacs:
@@ -2902,7 +2963,7 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
             raise ElateError(f"--emacs-glob matched nothing: {args.emacs_glob}")
         binaries.extend(matches)
     seen: set[str] = set()
-    uniq: list[str] = []
+    uniq: list[str | None] = []
     for b in binaries:  # resolve + fail fast before booting anything
         resolved = str(Path(b).expanduser())
         if not (Path(resolved).is_file() and os.access(resolved, os.X_OK)):
@@ -2919,12 +2980,13 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
         if key not in seen:
             seen.add(key)
             uniq.append(resolved)
-    if not uniq:
-        raise ElateError("matrix needs at least one --emacs PATH "
-                         "(or --emacs-glob)")
+    # No Emacs axis given: each scenario runs on its own session "emacs"
+    # (else the emacs on PATH), once.
+    return uniq or [None]
 
-    # Parameter axes: --param NAME=v1,v2 (repeatable), crossed with the
-    # Emacs axis into a Cartesian product.
+
+def _parse_axes(args: argparse.Namespace) -> dict[str, list[str]]:
+    """--param NAME=v1,v2 axes (repeatable)."""
     axes: dict[str, list[str]] = {}
     for spec in args.param:
         name, sep, vals = spec.partition("=")
@@ -2946,7 +3008,186 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
         if not values:
             raise ElateError(f"--param {name!r} lists no values")
         axes[name] = values
+    return axes
 
+
+def _matrix_plan(script_path: str, args: argparse.Namespace,
+                 binaries: list[str | None], axes: dict[str, list[str]],
+                 file_vars: dict[str, str], selected: list[str],
+                 multi: bool,
+                 ) -> tuple[list[dict[str, Any]], set[str], set[str]]:
+    """Combos for one scenario file, the variable names it references, and
+    the variant names it declares."""
+    import hashlib
+    import itertools
+    from collections import Counter
+
+    from . import script as SC
+
+    raw, base = SC.load_raw(script_path, use_config=not args.no_config)
+    if not isinstance(raw, dict):
+        raise ElateError(f"{script_path}: a script must be a JSON object "
+                         'with a "steps" list')
+    variants = SC.declared_variants(raw)
+    referenced = SC.template_vars({k: v for k, v in raw.items()
+                                   if k not in ("params", "variants")})
+    # A variant's own "requires" is templated too (e.g. its command).
+    for bindings in variants.values():
+        referenced |= SC.template_vars(bindings.get("requires") or {})
+    if selected and variants:
+        variant_axis: list[str | None] = [v for v in selected if v in variants]
+        if not variant_axis:
+            # None of the selected variants is declared here.
+            return [], referenced, set(variants)
+    else:
+        variant_axis = list(variants) or [None]
+    # Only the axes this scenario references multiply its runs; with one
+    # scenario an unreferenced axis is an error (checked by the caller).
+    my_axes = {n: v for n, v in axes.items() if n in referenced}
+    my_files = {n: v for n, v in file_vars.items() if n in referenced}
+    if not multi:
+        dead_files = sorted(n for n in file_vars if n not in referenced)
+        if dead_files:
+            raise ElateError(
+                f"--set-file name(s) {dead_files} are never referenced by a "
+                "{{name}} template in the scenario")
+    for vname in variant_axis:
+        if vname is None:
+            continue
+        dead = [k for k in variants[vname]
+                if k != "requires" and k not in referenced]
+        if dead:
+            raise ElateError(
+                f"{script_path}: variant {vname!r} binds {dead} never "
+                "referenced by a {{name}} template in the scenario")
+        # A --param axis crossing a variant-bound variable would silently
+        # mask that binding in EVERY variant (documented precedence),
+        # making the variant columns identical -- loud, never silent.
+        clash = [n for n in my_axes if n in variants[vname]]
+        if clash:
+            raise ElateError(
+                f"--param axis/axes {clash} collide with binding(s) of "
+                f"variant {vname!r}: a variant's bindings co-vary -- drop "
+                "the --param axis or the variant key")
+    names = list(my_axes)
+    points = list(itertools.product(binaries, variant_axis,
+                                    *(my_axes[n] for n in names)))
+    # Fail once per VARIANT, up front, on a combo-independent template
+    # error instead of the same error N times.
+    first_params = {**my_files, **{n: my_axes[n][0] for n in names}}
+    for vname in variant_axis:
+        SC.render_script(raw, first_params, variant=vname)
+
+    # Snapshot stems fold in the variant + param combo (the Emacs axis is
+    # separated by @<version> in the filename). _safe_param is lossy, so two
+    # distinct combos can sanitize to the same suffix -- disambiguate only
+    # the ones that collide with a short hash. The variant name goes in
+    # verbatim: its charset is filename-safe by construction, and `run
+    # --variant NAME` appends it verbatim too.
+    def combo_key(vname: str | None,
+                  params: dict[str, str]) -> tuple[tuple[str, str], ...]:
+        merged = {**params, **({"variant": vname} if vname else {})}
+        return tuple(sorted(merged.items()))
+
+    raw_suffix: dict[tuple, str] = {}
+    for point in points:
+        params = {n: point[i + 2] for i, n in enumerate(names)}
+        key = combo_key(point[1], params)
+        raw_suffix.setdefault(key, "".join(
+            f"+{k}-{v if k == 'variant' else _safe_param(v)}"
+            for k, v in key))
+    dupes = Counter(raw_suffix.values())
+    stem_name = "stdin" if script_path == "-" else Path(script_path).stem
+    combos = []
+    for point in points:
+        emacs_bin, vname = point[0], point[1]
+        params = {n: point[i + 2] for i, n in enumerate(names)}
+        key = combo_key(vname, params)
+        suf = raw_suffix[key]
+        if suf and dupes[suf] > 1:
+            suf += "-" + hashlib.sha1(repr(key).encode()).hexdigest()[:6]
+        combos.append({
+            "script": script_path, "raw": raw, "base": base,
+            "emacs": emacs_bin, "variant": vname, "params": params,
+            "file_vars": my_files, "stem": stem_name + suf,
+            "scenario": stem_name if multi else None,
+        })
+    return combos, set(referenced), set(variants)
+
+
+def _gui_combo(rendered: dict[str, Any]) -> bool:
+    """True for a combo that opens a window on the user's display."""
+    cfg = rendered.get("session") or {}
+    return cfg.get("ui") == "gui" and not cfg.get("headless")
+
+
+def _matrix_entry(combo: dict[str, Any], run: dict[str, Any] | None,
+                  error: str | None) -> dict[str, Any]:
+    from . import script as SC
+
+    # Every axis name of the whole matrix is a key here (None where this
+    # combo's scenario does not use it), so consumers can index uniformly.
+    axes_out: dict[str, Any] = {"emacs": combo["emacs"]}
+    if combo.get("scenario") is not None:
+        axes_out["scenario"] = combo["scenario"]
+    if combo.get("any_variant") or combo["variant"]:
+        axes_out["variant"] = combo["variant"]
+    for name in combo.get("all_axes") or combo["params"]:
+        axes_out[name] = combo["params"].get(name)
+    entry: dict[str, Any] = {
+        "script": combo["script"],
+        "axes": axes_out,
+        "emacs": combo["emacs"],
+    }
+    if error is not None:
+        entry.update({"version": None, "status": "fail", "success": False,
+                      "error": error})
+        return entry
+    assert run is not None
+    entry.update({
+        "version": run.get("emacs_version"),
+        "status": run["status"],
+        "success": run["success"],
+        "passed": run["passed"],
+        "failed": run["failed"],
+        "xpass": run.get("xpass", 0),
+        "xfail": run.get("xfail", 0),
+        "duration": run["duration"],
+        # The step that caused the FAIL: a real (non-optional) failure, or
+        # an xpass -- both gate; an optional failure and a plain xfail do
+        # not.
+        "failed_step": SC.first_failed_step(run),
+        "failed_steps": SC.failed_steps(run),
+    })
+    if run.get("skip_reason"):
+        entry["skip_reason"] = run["skip_reason"]
+    if run.get("error"):
+        entry["error"] = run["error"]
+    if run.get("attempts"):
+        entry["attempts"] = run["attempts"]
+    if run.get("session_dir") and not run.get("purged"):
+        entry["session_dir"] = run["session_dir"]
+    return entry
+
+
+def cmd_matrix(args: argparse.Namespace) -> Result:
+    import threading
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from . import script as SC
+
+    if args.retries < 0:
+        raise UsageError("--retries must be >= 0")
+    if args.jobs < 1:
+        raise UsageError("--jobs must be >= 1")
+    if args.timeout_scale is not None:
+        SC.timeout_scale(args.timeout_scale)  # one usage error, not N failures
+    if args.scripts.count("-") > 1 or ("-" in args.scripts
+                                       and len(args.scripts) > 1):
+        raise UsageError("'-' (stdin) must be the only scenario")
+    binaries = _resolve_binaries(args)
+    axes = _parse_axes(args)
     # --set-file vars are constant bindings, identical in every combo (the
     # counterpart of run's --set/--set-file; matrix's per-combo bindings are
     # the axes). A name on both sides would make the axis silently dead.
@@ -2956,193 +3197,284 @@ def cmd_matrix(args: argparse.Namespace) -> Result:
         raise ElateError(
             f"--set-file name(s) {fclash} collide with a --param axis of "
             "the same name -- a constant binding cannot also be an axis")
-
-    raw, base = SC.load_raw(args.script)
-    if not isinstance(raw, dict):
-        raise ElateError('a script must be a JSON object with a "steps" list')
-    total = len(raw.get("steps") or [])
-
-    # The variant axis: every declared "variants" entry by default (the
-    # whole point is "one file, one command, out pops the grid");
-    # --variant filters. [None] when the scenario declares none.
-    variants = SC.declared_variants(raw)
     selected: list[str] = []
     for spec in args.variant:
         selected.extend(v for v in (s.strip() for s in spec.split(",")) if v)
+    if len(set(selected)) != len(selected):
+        dup = sorted({n for n in selected if selected.count(n) > 1})
+        raise ElateError(f"--variant name(s) {dup} given more than once")
+
+    multi = len(args.scripts) > 1
+    combos: list[dict[str, Any]] = []
+    used: set[str] = set()
+    declared: set[str] = set()
+    for path in args.scripts:
+        plan, referenced, names = _matrix_plan(
+            path, args, binaries, axes, file_vars, selected, multi)
+        combos += plan
+        used |= referenced
+        declared |= names
     if selected:
-        if not variants:
-            raise ElateError(
-                '--variant given but the scenario declares no "variants" '
-                "block")
-        unknown_v = [n for n in selected if n not in variants]
+        if not declared:
+            raise ElateError('--variant given but the scenario declares no '
+                             '"variants" block')
+        unknown_v = [n for n in selected if n not in declared]
         if unknown_v:
             raise ElateError(
-                f"unknown --variant name(s) {unknown_v}; the scenario "
-                f"declares {sorted(variants)}")
-        if len(set(selected)) != len(selected):
-            dup = sorted({n for n in selected if selected.count(n) > 1})
-            raise ElateError(f"--variant name(s) {dup} given more than once")
-    variant_axis: list[str | None] = list(selected or variants) or [None]
-
-    # An axis the scenario never references is almost certainly a mistake (a
+                f"unknown --variant name(s) {unknown_v}; the scenario(s) "
+                f"declare {sorted(declared)}")
+    # An axis no scenario references is almost certainly a mistake (a
     # typo'd name, or a spurious axis silently multiplying the run). A
-    # deliberate "repeat" axis can reference {{name}} in a comment. The
-    # same goes for a variant binding a never-referenced variable.
-    referenced = SC.template_vars({k: v for k, v in raw.items()
-                                   if k not in ("params", "variants")})
-    unused = [n for n in axes if n not in referenced]
+    # deliberate "repeat" axis can reference {{name}} in a comment.
+    unused = [n for n in axes if n not in used]
     if unused:
         raise ElateError(
             f"--param axis/axes {sorted(unused)} are never referenced by a "
-            "{{name}} template in the scenario")
-    dead_files = sorted(n for n in file_vars if n not in referenced)
-    if dead_files:
-        raise ElateError(
-            f"--set-file name(s) {dead_files} are never referenced by a "
-            "{{name}} template in the scenario")
-    for vname in variant_axis:
-        if vname is None:
-            continue
-        dead = [k for k in variants[vname] if k not in referenced]
-        if dead:
+            "{{name}} template in the scenario" + ("s" if multi else ""))
+    if multi:
+        dead_files = sorted(n for n in file_vars if n not in used)
+        if dead_files:
             raise ElateError(
-                f"variant {vname!r} binds {dead} never referenced by a "
-                "{{name}} template in the scenario")
-        # A --param axis crossing a variant-bound variable would silently
-        # mask that binding in EVERY variant (documented precedence),
-        # making the variant columns identical -- loud, never silent.
-        clash = [n for n in axes if n in variants[vname]]
-        if clash:
+                f"--set-file name(s) {dead_files} are never referenced by a "
+                "{{name}} template in any scenario")
+
+    # Scenario labels: the file stem, or the path where stems collide.
+    if multi:
+        stems = [("stdin" if p == "-" else Path(p).stem) for p in args.scripts]
+        for combo in combos:
+            stem = combo["scenario"]
+            if stems.count(stem) > 1:
+                combo["scenario"] = combo["script"]
+        if args.snapshot_dir and Path(args.snapshot_dir).is_absolute() and \
+                len(set(stems)) != len(stems):
             raise ElateError(
-                f"--param axis/axes {clash} collide with binding(s) of "
-                f"variant {vname!r}: a variant's bindings co-vary -- drop "
-                "the --param axis or the variant key")
-
-    axis_names = list(axes)
-    combos: list[tuple[str, str | None, dict[str, str]]] = []
-    for point in itertools.product(uniq, variant_axis,
-                                   *(axes[n] for n in axis_names)):
-        params = {n: point[i + 2] for i, n in enumerate(axis_names)}
-        combos.append((point[0], point[1], params))
-
-    # Fail once per VARIANT, up front, on a combo-independent
-    # template/params error (an unknown {{var}} depends only on the axis
-    # NAMES plus the variant's binding keys, identical across that
-    # variant's combos) instead of the same error N times.
-    if combos:
-        first_params = {**file_vars,
-                        **{n: axes[n][0] for n in axis_names}}
-        for vname in variant_axis:
-            SC.render_script(raw, first_params, variant=vname)
-
-    # Snapshot stems fold in the variant + param combo (the Emacs axis is
-    # separated by @<version> in the filename). _safe_param is lossy, so two
-    # distinct param combos can sanitize to the same suffix -- disambiguate
-    # only the ones that actually collide with a short hash, keeping clean
-    # stems for the common (no-collision) case, including no params at all.
-    # The variant rides the same machinery as a pseudo-param ("variant" is
-    # reserved, so it can never clash with a real axis), yielding
-    # "+variant-nu". The name goes in verbatim, NOT through _safe_param:
-    # its charset is already filename-safe by construction, and _safe_param's
-    # edge-stripping would make a name like "nu-" produce a stem that `run
-    # --variant nu-` (which appends the name verbatim) could never match.
-    import hashlib
-    from collections import Counter
-
-    def combo_key(vname: str | None,
-                  params: dict[str, str]) -> tuple[tuple[str, str], ...]:
-        merged = {**params, **({"variant": vname} if vname else {})}
-        return tuple(sorted(merged.items()))
-
-    raw_suffix: dict[tuple, str] = {}
-    for _, vname, params in combos:
-        key = combo_key(vname, params)
-        raw_suffix.setdefault(key, "".join(
-            f"+{k}-{v if k == 'variant' else _safe_param(v)}"
-            for k, v in key))
-    dupes = Counter(raw_suffix.values())
-    suffix = {
-        key: (suf + "-" + hashlib.sha1(repr(key).encode()).hexdigest()[:6]
-              if suf and dupes[suf] > 1 else suf)
-        for key, suf in raw_suffix.items()
-    }
+                "scenarios with the same file name would share golden "
+                "snapshots in an absolute --snapshot-dir; rename one or drop "
+                "--snapshot-dir")
+    all_axes = list(axes)
+    any_variant = any(c["variant"] for c in combos)
+    for combo in combos:
+        combo["all_axes"] = all_axes
+        combo["any_variant"] = any_variant
+        try:
+            combo["rendered"] = SC.render_script(
+                combo["raw"], {**combo["file_vars"], **combo["params"]},
+                variant=combo["variant"])
+            SC.validate_script(combo["rendered"])
+            combo["error"] = None
+        except ElateError as exc:
+            combo["rendered"], combo["error"] = None, str(exc)
 
     fmt = args.format
-    stream = (fmt == "human" or (fmt is None and not args.json)) \
-        and not getattr(args, "field_mode", False)
-    on_step = None
-    if stream:
-        def on_step(rec: dict[str, Any]) -> None:
-            print(_step_line(rec, total), flush=True)
+    quiet = getattr(args, "field_mode", False)
+    stream = (fmt == "human" or (fmt is None and not args.json)) and not quiet
     if len(combos) > 1:
         # To stderr so it surfaces even in --json/CI mode without dirtying
         # the machine-readable stdout.
-        print(f"matrix: running {len(combos)} combo(s)", file=sys.stderr,
-              flush=True)
+        print(f"matrix: running {len(combos)} combo(s)"
+              + (f", {args.jobs} at a time" if args.jobs > 1 else ""),
+              file=sys.stderr, flush=True)
 
-    base_stem = Path(args.script).stem
-    results: list[dict[str, Any]] = []
-    for emacs_bin, vname, params in combos:
-        # The variant leads in labels/axes: it names the whole binding set
-        # the params merely refine.
-        shown = {**({"variant": vname} if vname else {}), **params}
-        if stream:
-            print(f"=== {_matrix_label(emacs_bin, shown)} ===", flush=True)
-        stem = base_stem + suffix[combo_key(vname, params)]
-        axes_out = {"emacs": emacs_bin, **shown}
+    def label_of(combo: dict[str, Any], version: str | None = None) -> str:
+        shown = {**({"variant": combo["variant"]} if combo["variant"] else {}),
+                 **combo["params"]}
+        return _matrix_label(combo["emacs"], shown, version,
+                             scenario=combo["scenario"])
+
+    live: set[str] = set()
+    live_lock = threading.Lock()
+    cancel = threading.Event()
+
+    def track(sess: S.Session) -> None:
+        with live_lock:
+            live.add(sess.name)
+        if cancel.is_set():
+            # Booted after the interrupt: stop it right away.
+            S.stop_session(sess.name)
+            raise ElateError("matrix interrupted")
+
+    def stop_live() -> None:
+        # Interrupted: stop every session a combo started, so in-flight
+        # workers' steps fail fast, and cancel the rest.
+        cancel.set()
+        with live_lock:
+            names = sorted(live)
+        for name in names:
+            try:
+                S.stop_session(name)
+            except ElateError:
+                pass
+
+    def run_one(combo: dict[str, Any], on_step: Any) -> dict[str, Any]:
+        if combo["error"] is not None:
+            return _matrix_entry(combo, None, combo["error"])
+        if cancel.is_set():
+            return _matrix_entry(combo, None, "matrix interrupted")
         try:
-            rendered = SC.render_script(raw, {**file_vars, **params},
-                                        variant=vname)
-            run = SC.run_script(
-                rendered, base_dir=base, emacs=emacs_bin, on_step=on_step,
+            run = SC.run_scenario(
+                combo["rendered"], base_dir=combo["base"],
+                emacs=combo["emacs"], on_step=on_step,
+                retries=args.retries, scale=args.timeout_scale,
                 purge=True,  # purge a passing combo; failed combos are kept
-                variant=vname,
+                variant=combo["variant"],
                 update_snapshots=args.update_snapshots,
-                snapshot_dir=(base / Path(args.snapshot_dir).expanduser()
+                snapshot_dir=(combo["base"] / Path(args.snapshot_dir).expanduser()
                               if args.snapshot_dir else None),
-                snapshot_stem=stem)
-            entry = {
-                "axes": axes_out,
-                "emacs": emacs_bin,
-                "version": run.get("emacs_version"),
-                "success": run["success"],
-                "passed": run["passed"],
-                "failed": run["failed"],
-                "xpass": run.get("xpass", 0),
-                "xfail": run.get("xfail", 0),
-                "duration": run["duration"],
-                # The step that caused the FAIL: a real (non-optional)
-                # failure, or an xpass -- both gate; an optional failure and a
-                # plain xfail do not.
-                "failed_step": next(
-                    (r["summary"] for r in run["steps"]
-                     if (r["status"] == "failed" and not r.get("optional"))
-                     or r["status"] == "xpass"), None),
-            }
+                snapshot_stem=combo["stem"], on_session=track,
+                should_stop=cancel.is_set)
         except ElateError as exc:
             # One broken combo must not abort the rest of the matrix.
-            entry = {"axes": axes_out, "emacs": emacs_bin, "version": None,
-                     "success": False, "error": str(exc)}
-        results.append(entry)
+            return _matrix_entry(combo, None, str(exc))
+        return _matrix_entry(combo, run, None)
 
-    success = all(r["success"] for r in results)
-    passed = sum(1 for r in results if r["success"])
+    t0 = _time.monotonic()
+    results: list[dict[str, Any] | None] = [None] * len(combos)
+    # --update-snapshots runs serially: two combos of the same Emacs
+    # version can share a golden file.
+    serial = [i for i, c in enumerate(combos)
+              if args.jobs == 1 or args.update_snapshots
+              or (c["rendered"] is not None and _gui_combo(c["rendered"])
+                  and not args.parallel_gui)]
+    pooled = [i for i in range(len(combos)) if i not in serial]
+    try:
+        for i in serial:
+            combo = combos[i]
+            total = len((combo["rendered"] or {}).get("steps") or [])
+            on_step = None
+            if stream:
+                print(f"=== {label_of(combo)} ===", flush=True)
+                on_step = (lambda rec, total=total:
+                           print(_step_line(rec, total), flush=True))
+            results[i] = run_one(combo, on_step)
+        if pooled:
+            pool = ThreadPoolExecutor(max_workers=args.jobs)
+            futures = {pool.submit(run_one, combos[i], None): i
+                       for i in pooled}
+            try:
+                for fut in futures:
+                    i = futures[fut]
+                    results[i] = fut.result()
+                    if stream:
+                        print(_matrix_line(results[i],
+                                           label_of(combos[i],
+                                                    results[i].get("version"))),
+                              flush=True)
+            except BaseException:
+                stop_live()
+                # Workers notice the cancel within a step and their stopped
+                # sessions fail fast; do not block the exit on them.
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            pool.shutdown(wait=True)
+    except BaseException:
+        stop_live()
+        raise
+
+    final = [r for r in results if r is not None]
+    counts = {k: sum(1 for r in final if r["status"] == k)
+              for k in ("pass", "fail", "skip", "flaky")}
+    wall = round(_time.monotonic() - t0, 3)
+    success = counts["fail"] == 0
+    data = {"success": success, "scripts": list(args.scripts),
+            "script": args.scripts[0],
+            "axes": (["scenario"] if multi else [])
+            + (["variant"] if any(c["variant"] for c in combos) else [])
+            + list(axes),
+            "totals": counts, "duration": wall, "results": final}
+    if fmt == "junit":
+        return data, _matrix_junit(final, combos, label_of), \
+            0 if success else 1
     lines = [f"{'RESULT':<6} {'TIME':>7}  COMBO"]
-    for r in results:
-        took = f"{r['duration']:.1f}s" if r.get("duration") is not None else "-"
-        params = {k: v for k, v in r["axes"].items() if k != "emacs"}
-        lines.append(
-            f"{'pass' if r['success'] else 'FAIL':<6} {took:>7}  "
-            f"{_matrix_label(r['emacs'], params, r.get('version'))}")
-        if r.get("error"):
-            lines.append(f"    error: {r['error']}")
-        elif r.get("failed_step"):
-            lines.append(f"    failed at: {r['failed_step']}")
-    lines.append(f"{passed}/{len(results)} combo(s) passed")
-    return ({"success": success, "script": args.script,
-             "axes": (["variant"] if variants else []) + axis_names,
-             "results": results},
-            "\n".join(lines), 0 if success else 1)
+    for r, combo in zip(final, combos):
+        lines.append(_matrix_line(r, label_of(combo, r.get("version"))))
+    words = {"fail": "failed", "skip": "skipped", "flaky": "flaky"}
+    extra = ", ".join(f"{counts[k]} {words[k]}"
+                      for k in ("fail", "skip", "flaky") if counts[k])
+    lines.append(
+        f"{counts['pass']}/{len(final)} combo(s) passed"
+        f"{' (' + extra + ')' if extra else ''} in {wall:.1f}s")
+    return data, "\n".join(lines), 0 if success else 1
+
+
+_MATRIX_VERDICT = {"pass": "pass", "fail": "FAIL", "skip": "SKIP",
+                   "flaky": "FLAKY"}
+
+
+def _matrix_line(r: dict[str, Any], label: str) -> str:
+    """One result row plus its indented details (failures, reasons, logs)."""
+    took = f"{r['duration']:.1f}s" if r.get("duration") is not None else "-"
+    out = [f"{_MATRIX_VERDICT[r['status']]:<6} {took:>7}  {label}"]
+    if r.get("skip_reason"):
+        out.append(f"    reason: {r['skip_reason']}")
+    if r["status"] == "fail":
+        if r.get("error") and not r.get("failed_steps"):
+            out.append(f"    error: {r['error']}")
+        for f in r.get("failed_steps") or []:
+            out.append(f"    failed step {f['index']}: {f['summary']}")
+            if f.get("error"):
+                out.append(f"      {f['error'].splitlines()[0][:300]}")
+    for a in r.get("attempts") or []:
+        if not a["success"] and r["status"] == "flaky":
+            out.append(f"    attempt {a['attempt']} failed"
+                       f"{': ' + a['failed_step'] if a.get('failed_step') else ''}"
+                       f" (log: {a['session_dir']})")
+    if r.get("session_dir"):
+        out.append(f"    log: {r['session_dir']}")
+    return "\n".join(out)
+
+
+def _matrix_junit(results: list[dict[str, Any]], combos: list[dict[str, Any]],
+                  label_of: Any) -> str:
+    """JUnit XML: a testsuite per scenario file, a testcase per combo."""
+    from xml.sax.saxutils import escape, quoteattr
+
+    suites: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for r, c in zip(results, combos):
+        suites.setdefault(r["script"], []).append((r, c))
+    body: list[str] = []
+    for script_path, rows in suites.items():
+        fails = sum(1 for r, _ in rows if r["status"] == "fail")
+        skips = sum(1 for r, _ in rows if r["status"] == "skip")
+        took = sum(r.get("duration") or 0 for r, _ in rows)
+        name = "stdin" if script_path == "-" else Path(script_path).stem
+        body.append(f"  <testsuite name={quoteattr(_xml_safe(name))} "
+                    f'tests="{len(rows)}" failures="{fails}" '
+                    f'skipped="{skips}" time="{took:.3f}">')
+        for r, c in rows:
+            label = label_of(c, r.get("version"))
+            attr = (f"name={quoteattr(_xml_safe(label))} "
+                    f'time="{(r.get("duration") or 0):.3f}"')
+            if r["status"] == "pass":
+                body.append(f"    <testcase {attr}/>")
+                continue
+            body.append(f"    <testcase {attr}>")
+            if r["status"] == "fail":
+                steps = r.get("failed_steps") or []
+                msg = (steps[0]["summary"] if steps
+                       else r.get("error") or "failed")
+                detail = "\n".join(
+                    f"step {f['index']}: {f['summary']}"
+                    + (f"\n  {f['error']}" if f.get("error") else "")
+                    for f in steps) or r.get("error") or ""
+                body.append(f"      <failure message={quoteattr(_xml_safe(msg))}>"
+                            f"{escape(_xml_safe(detail))}</failure>")
+            elif r["status"] == "skip":
+                body.append("      <skipped message="
+                            f"{quoteattr(_xml_safe(r['skip_reason']))}/>")
+            else:  # flaky: passed on a retry
+                notes = "\n".join(
+                    f"attempt {a['attempt']} failed: {a.get('failed_step')} "
+                    f"(log: {a['session_dir']})"
+                    for a in r.get("attempts") or [] if not a["success"])
+                body.append(f"      <system-out>FLAKY\n"
+                            f"{escape(_xml_safe(notes))}</system-out>")
+            if r.get("session_dir"):
+                body.append(f"      <system-err>log: "
+                            f"{escape(_xml_safe(r['session_dir']))}</system-err>")
+            body.append("    </testcase>")
+        body.append("  </testsuite>")
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n'
+            + "\n".join(body) + "\n</testsuites>")
 
 
 def cmd_install(args: argparse.Namespace) -> Result:

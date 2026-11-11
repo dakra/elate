@@ -1773,6 +1773,15 @@ def _compact_state(state: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _still_running(sess: Session) -> bool:
+    """Whether SESS is still running, re-reading its registry (another
+    process or thread may have stopped it since SESS was loaded)."""
+    try:
+        return load_session(sess.name).is_alive()
+    except ElateError:
+        return False
+
+
 def _wait_loop(sess: Session, timeout: float, what: str, probe) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     last_err: str | None = None
@@ -1786,6 +1795,11 @@ def _wait_loop(sess: Session, timeout: float, what: str, probe) -> dict[str, Any
             # Busy Emacs, or a condition that cannot hold *yet* (e.g. the
             # waited-for buffer does not exist): keep polling until the
             # deadline; the timeout dump carries the last probe error.
+            # A session stopped or dead meanwhile can never satisfy it.
+            if isinstance(exc, TransportError) and not _still_running(sess):
+                raise SessionDead(
+                    f"session {sess.name!r} stopped while waiting for "
+                    f"{what}") from None
             last_err = str(exc)
             result = None
         if result is not None:

@@ -707,6 +707,21 @@ snapshot, and `--keep-on-failure` plus
 `elate -s <name> screenshot` can capture more before teardown. Within a
 single job you can also run several local binaries via `elate matrix`.
 
+
+### Many scenarios, one report
+
+`elate matrix tests/*.json` runs every scenario × variant (on each
+scenario's own emacs when `--emacs` is omitted) and prints one line per
+combo — `pass`, `FAIL` (with every failing step quoted and the kept
+sandbox path), `SKIP` (an unmet `"requires"` precondition, e.g. a variant
+that needs `$REMOTE_HOST`), or `FLAKY` (failed, then passed under
+`--retries N`) — plus totals and wall time. `-j N` runs TTY/headless
+combos in parallel (windowed GUI combos stay serial unless
+`--parallel-gui`), `--timeout-scale F` stretches every timeout on a loaded
+machine, and `--format junit` feeds CI. Shared setup lives in a project
+`.elate.json` next to (or above) the scenarios; repeated step sequences
+become `"templates"` (see `skills/elate/SCRIPTING.md`).
+
 ## Recipes
 
 Three worked examples. Every command below is also committed as a
