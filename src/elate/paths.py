@@ -25,6 +25,11 @@ def agent_el_path() -> Path:
     return Path(__file__).resolve().parent / "elisp" / "elate-agent.el"
 
 
+def scenario_el_path() -> Path:
+    """Path to the bundled elate-scenario.el (the .eld scenario reader)."""
+    return Path(__file__).resolve().parent / "elisp" / "elate-scenario.el"
+
+
 def _bundled_or_repo(rel: str) -> Path:
     """Resolve a packaged data path, tolerating editable/dev checkouts.
 

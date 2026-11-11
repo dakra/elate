@@ -63,6 +63,7 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 - [`elate wait`](#elate-wait)
 - [`elate run`](#elate-run)
 - [`elate export-script`](#elate-export-script)
+- [`elate convert`](#elate-convert)
 - [`elate record`](#elate-record)
 - [`elate snap`](#elate-snap)
 - [`elate matrix`](#elate-matrix)
@@ -528,9 +529,9 @@ Block until a condition holds. `wait idle` fails immediately (rather than timing
 
 run a scenario script: fresh session, steps, assertions, exit 0/1 (CI)
 
-Execute a JSON scenario script: create a fresh sandboxed session from the script's "session" config (or target an existing one with -s NAME, in which case that config is ignored and nothing is torn down), run the steps in order, evaluate the assertions, then stop the fresh session. Exits 0 when every step and assertion passed, 1 otherwise; a failed step embeds a state snapshot. Fresh sessions are the default deliberately: lint executes compile-time code and lint/test results depend on session history, so only a throwaway session gives reproducible verdicts.
+Execute a scenario script (JSON, or an s-expression .eld file): create a fresh sandboxed session from the script's "session" config (or target an existing one with -s NAME, in which case that config is ignored and nothing is torn down), run the steps in order, evaluate the assertions, then stop the fresh session. Exits 0 when every step and assertion passed, 1 otherwise; a failed step embeds a state snapshot. Fresh sessions are the default deliberately: lint executes compile-time code and lint/test results depend on session history, so only a throwaway session gives reproducible verdicts.
 
-- `script` -- path to the scenario file (JSON); '-' reads it from stdin (relative paths then resolve against the working directory)
+- `script` -- path to the scenario file (JSON or .eld); '-' reads it from stdin (relative paths then resolve against the working directory)
 - `--retries N` (default: 0) -- rerun a failing scenario up to N more times in fresh sessions; one that then passes is reported FLAKY (not FAIL), with every attempt's sandbox kept and listed under attempts
 - `--timeout-scale F` -- multiply every step and wait timeout by F (0.1-20) for loaded machines and CI; default $ELATE_TIMEOUT_SCALE, else the project config's timeout_scale, else 1
 - `--no-config` -- ignore the project config (the nearest .elate.json at or above the scenario's directory)
@@ -554,7 +555,19 @@ convert a session's transcript into a best-effort scenario script
 Turn the session's JSONL transcript into a scenario file for `elate run`: inputs become steps, observations become skipped assertion stubs ("skip": true). A starting point for editing, not a faithful recording. Works on stopped sessions too.
 
 - `-o, --output FILE` -- write the script here (default: stdout)
+- `--eld` -- write an s-expression scenario (.eld) instead of JSON (default with -o FILE.eld)
 - `--clean` -- prune transient temp-path references so the export replays elsewhere: drop session load/eval entries under a temp root, and mark an eval step that references one "skip" with a comment
+
+## elate convert
+
+convert a scenario between JSON and s-expression (.eld)
+
+Rewrite a scenario file as .eld or as JSON. The target is --to, else OUT's extension (.eld -> .eld, anything else -> JSON), else the other format than FILE's. The converted text goes to stdout (also when piped; --json wraps it in a result object) or to OUT, which must not be FILE. Converting to .eld writes eval/pred strings as bare forms when they read back as the same text, and the result is read back to check it is the same scenario. Comments in an .eld file do not survive the conversion to JSON, except inside forms. Includes and templates are converted as written, not expanded. Reading .eld runs a batch Emacs.
+
+- `FILE` -- the scenario to convert ('-' reads stdin)
+- `-o, --output OUT` -- write the result here (default: stdout)
+- `--to {eld,json}` -- target format (default: by OUT's extension, else the other format than FILE's)
+- `--emacs PATH` -- Emacs that reads .eld (default: emacs on PATH)
 
 ## elate record
 
@@ -595,7 +608,7 @@ Run each SCRIPT once per combination of the Emacs binary axis (default: the scen
 - `--retries N` (default: 0) -- rerun a failing scenario up to N more times in fresh sessions; one that then passes is reported FLAKY (not FAIL), with every attempt's sandbox kept and listed under attempts
 - `--timeout-scale F` -- multiply every step and wait timeout by F (0.1-20) for loaded machines and CI; default $ELATE_TIMEOUT_SCALE, else the project config's timeout_scale, else 1
 - `--no-config` -- ignore the project config (the nearest .elate.json at or above the scenario's directory)
-- `SCRIPT...` (repeatable) -- scenario file(s) (JSON); several form a scenario axis, each crossed only with the --param axes it references; '-' reads one from stdin
+- `SCRIPT...` (repeatable) -- scenario file(s) (JSON or .eld); several form a scenario axis, each crossed only with the --param axes it references; '-' reads one from stdin
 
 ## elate install
 

@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import __version__, install, session as S
+from . import __version__, eld, install, session as S
 from .errors import (
     ElateError,
     EvalTimeout,
@@ -1142,7 +1142,8 @@ def build_parser() -> argparse.ArgumentParser:
         "run",
         help="run a scenario script: fresh session, steps, assertions, "
              "exit 0/1 (CI)",
-        description="Execute a JSON scenario script: create a fresh "
+        description="Execute a scenario script (JSON, or an s-expression "
+                    ".eld file): create a fresh "
                     "sandboxed session from the script's \"session\" "
                     "config (or target an existing one with -s NAME, in "
                     "which case that config is ignored and nothing is "
@@ -1154,7 +1155,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "executes compile-time code and lint/test results "
                     "depend on session history, so only a throwaway "
                     "session gives reproducible verdicts.")
-    sp.add_argument("script", help="path to the scenario file (JSON); "
+    sp.add_argument("script", help="path to the scenario file (JSON or "
+                                   ".eld); "
                                    "'-' reads it from stdin (relative paths "
                                    "then resolve against the working "
                                    "directory)")
@@ -1225,11 +1227,40 @@ def build_parser() -> argparse.ArgumentParser:
                     "a faithful recording. Works on stopped sessions too.")
     sp.add_argument("-o", "--output", metavar="FILE",
                     help="write the script here (default: stdout)")
+    sp.add_argument("--eld", action="store_true",
+                    help="write an s-expression scenario (.eld) instead of "
+                         "JSON (default with -o FILE.eld)")
     sp.add_argument("--clean", action="store_true",
                     help="prune transient temp-path references so the export "
                          "replays elsewhere: drop session load/eval entries "
                          "under a temp root, and mark an eval step that "
                          "references one \"skip\" with a comment")
+
+    sp = sub.add_parser(
+        "convert",
+        help="convert a scenario between JSON and s-expression (.eld)",
+        description="Rewrite a scenario file as .eld or as JSON. The "
+                    "target is --to, else OUT's extension (.eld -> .eld, "
+                    "anything else -> JSON), else the other format than "
+                    "FILE's. The converted text goes to stdout (also when "
+                    "piped; --json wraps it in a result object) or to "
+                    "OUT, which must not be FILE. "
+                    "Converting to .eld writes eval/pred strings as bare "
+                    "forms when they read back as the same text, and the "
+                    "result is read back to check it is the same scenario. "
+                    "Comments in an .eld file do not survive the conversion "
+                    "to JSON, except inside forms. Includes and templates "
+                    "are converted as written, not expanded. Reading .eld "
+                    "runs a batch Emacs.")
+    sp.add_argument("file", metavar="FILE",
+                    help="the scenario to convert ('-' reads stdin)")
+    sp.add_argument("-o", "--output", metavar="OUT",
+                    help="write the result here (default: stdout)")
+    sp.add_argument("--to", choices=("eld", "json"),
+                    help="target format (default: by OUT's extension, else "
+                         "the other format than FILE's)")
+    sp.add_argument("--emacs", metavar="PATH",
+                    help="Emacs that reads .eld (default: emacs on PATH)")
 
     sp = sub.add_parser(
         "record",
@@ -1320,7 +1351,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "parallel")
     _add_policy_args(sp)
     sp.add_argument("scripts", nargs="+", metavar="SCRIPT",
-                    help="scenario file(s) (JSON); several form a scenario "
+                    help="scenario file(s) (JSON or .eld); several form a "
+                         "scenario "
                          "axis, each crossed only with the --param axes it "
                          "references; '-' reads one from stdin")
 
@@ -2939,7 +2971,8 @@ def cmd_run(args: argparse.Namespace) -> Result:
                  **dict(args.set_vars)}
     script, base = SC.load_script(args.script, overrides,
                                   variant=args.variant,
-                                  use_config=not args.no_config)
+                                  use_config=not args.no_config,
+                                  emacs=args.emacs)
     target = None
     if args.session:
         target = S.load_session(args.session)
@@ -2992,7 +3025,12 @@ def cmd_export_script(args: argparse.Namespace) -> Result:
     # crashed sessions export fine).
     sess = _get_session(args)
     script = SC.export_script(sess, clean=args.clean)
-    text = json.dumps(script, indent=2, ensure_ascii=False) + "\n"
+    as_eld = args.eld or bool(args.output and eld.is_eld(args.output))
+    if as_eld:
+        with eld.reading_with(sess.emacs):
+            text = eld.dumps(script)
+    else:
+        text = json.dumps(script, indent=2, ensure_ascii=False) + "\n"
     steps = len(script["steps"])
     stubs = sum(1 for s in script["steps"] if s.get("skip"))
     if args.output:
@@ -3006,8 +3044,53 @@ def cmd_export_script(args: argparse.Namespace) -> Result:
                  "Best-effort export: edit the stubs into real assertions "
                  "before trusting it as a regression test.")
         return {"written": str(path), "steps": steps, "stubs": stubs}, human, 0
-    return ({"script": script, "steps": steps, "stubs": stubs},
+    return ({"script": script, "steps": steps, "stubs": stubs,
+             **({"eld": text} if as_eld else {})},
             text.rstrip("\n"), 0)
+
+
+def cmd_convert(args: argparse.Namespace) -> Result:
+    src, out = args.file, args.output
+    stdin = src == "-"
+    text = sys.stdin.read() if stdin else None
+    if stdin:
+        from_eld = eld.looks_like_eld(text or "")
+    else:
+        if not Path(src).expanduser().is_file():
+            raise ElateError(f"file does not exist: {src}")
+        from_eld = eld.is_eld(src)
+    target = args.to or ("json" if from_eld else "eld")
+    if out and not args.to:
+        target = "eld" if eld.is_eld(out) else "json"
+    if from_eld and target == "eld":
+        # Re-printing an .eld file would only drop its comments and layout.
+        raise ElateError(f"{src} is already an .eld scenario")
+    if out and not stdin and Path(out).expanduser().resolve() \
+            == Path(src).expanduser().resolve():
+        raise ElateError("OUT must not be the input file")
+    with eld.reading_with(args.emacs):
+        if from_eld:
+            value = (eld.loads(text or "") if stdin
+                     else eld.load(Path(src).expanduser(), name=src))
+        else:
+            try:
+                value = json.loads(text if stdin else
+                                   Path(src).expanduser().read_text(
+                                       encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ElateError(f"cannot read {src} as JSON: {exc}") from exc
+        result_text = (eld.dumps(value) if target == "eld"
+                       else json.dumps(value, indent=2, ensure_ascii=False)
+                       + "\n")
+    if out:
+        path = Path(out).expanduser()
+        try:
+            path.write_text(result_text, encoding="utf-8")
+        except OSError as exc:
+            raise ElateError(f"cannot write {out}: {exc}") from exc
+        return ({"written": str(path), "to": target},
+                f"wrote {target} to {path}", 0)
+    return {"to": target, "text": result_text}, result_text.rstrip("\n"), 0
 
 
 def cmd_record(args: argparse.Namespace) -> Result:
@@ -3154,7 +3237,8 @@ def _matrix_plan(script_path: str, args: argparse.Namespace,
 
     from . import script as SC
 
-    raw, base = SC.load_raw(script_path, use_config=not args.no_config)
+    raw, base = SC.load_raw(script_path, use_config=not args.no_config,
+                            emacs=next((b for b in binaries if b), None))
     if not isinstance(raw, dict):
         raise ElateError(f"{script_path}: a script must be a JSON object "
                          'with a "steps" list')
@@ -3731,6 +3815,7 @@ _COMMANDS = {
     "wait": cmd_wait,
     "run": cmd_run,
     "export-script": cmd_export_script,
+    "convert": cmd_convert,
     "record": cmd_record,
     "snap": cmd_snap,
     "matrix": cmd_matrix,
@@ -3780,6 +3865,9 @@ def main(argv: list[str] | None = None) -> int:
         # warn and let --field/--raw own the output as documented.
         print("elate: --field/--raw already choose the output; "
               "ignoring --json/--human", file=sys.stderr)
+    if args.command == "convert" and not args.json and not args.output:
+        # `elate convert a.json > a.eld` must write the converted text.
+        args.human = True
     args.json = args.json or (not args.human and not sys.stdout.isatty())
     if field is not None:
         # Failures must keep stdout empty -- an error blob inside $(...)

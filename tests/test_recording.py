@@ -1382,6 +1382,15 @@ def test_export_script_roundtrip(elate_home: str, tmp_path: Path,
     assert code == 0, out
     assert out["success"] is True
     assert out["skipped"] == 2
+    # The same export as an s-expression scenario replays too.
+    as_eld = tmp_path / "exported.eld"
+    assert cli.main(["-s", name, "export-script", "-o", str(as_eld)]) == 0
+    capsys.readouterr()
+    assert as_eld.read_text().startswith("(:name ")
+    code = cli.main(["--json", "run", str(as_eld)])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    assert out["skipped"] == 2
     assert running_run_sessions() == []
 
 

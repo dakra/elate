@@ -16,7 +16,8 @@ Applied to a raw scenario before {{var}} templating and validation:
   the config file's directory, and its ``requires`` commands run there.
 - **Includes** -- ``"include": ["lib/steps.json"]`` reads template
   definitions from other files (relative to the including file; an
-  included file holds ``templates`` and may ``include`` further files).
+  included file holds ``templates`` and may ``include`` further files;
+  a ``.eld`` include is an s-expression file).
 - **Templates** -- ``"templates": {"open-hints": {"params": {"key":
   "f"}, "steps": [...]}}`` defines a parameterized step group, used as
   ``{"use": "open-hints", "with": {"key": "g"}}``. ``params`` maps each
@@ -41,6 +42,7 @@ import stat
 from pathlib import Path
 from typing import Any
 
+from . import eld
 from .errors import ElateError
 
 CONFIG_NAME = ".elate.json"
@@ -88,6 +90,11 @@ def find_config(start: Path) -> Path | None:
 
 
 def _read_json(path: Path, what: str) -> dict[str, Any]:
+    if eld.is_eld(path) and path.is_file():
+        data = eld.load(path)
+        if not isinstance(data, dict):
+            raise ElateError(f"{what} {path} must be a plist")
+        return data
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:

@@ -80,7 +80,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from . import compose, paths
+from . import compose, eld, paths
 from . import session as S
 from .errors import ElateError, WaitTimeout
 
@@ -372,46 +372,61 @@ def _check_xfail_variants(rendered: dict[str, Any],
                 f'declared in "variants" (declared: {sorted(variants)})')
 
 
-def load_raw(path: str | Path, use_config: bool = True) -> tuple[Any, Path]:
+def load_raw(path: str | Path, use_config: bool = True,
+             emacs: str | None = None) -> tuple[Any, Path]:
     """Read a scenario to a raw value + base_dir (no templating/validation).
 
     PATH "-" reads the scenario from stdin (base_dir: the working
-    directory). The project config, includes, and step templates are
-    applied (see :mod:`elate.compose`; USE_CONFIG=False skips the project
-    config). For callers that render per parameter combo (matrix): read
-    once, then `render_script` + `validate_script` per combo.
+    directory). A ``.eld`` file (or stdin text starting with "(" or ";")
+    is an s-expression scenario, read by EMACS (default: emacs on PATH);
+    see :mod:`elate.eld`. The project config, includes, and step
+    templates are applied (see :mod:`elate.compose`; USE_CONFIG=False
+    skips the project config). For callers that render per parameter
+    combo (matrix): read once, then `render_script` + `validate_script`
+    per combo.
     """
-    if str(path) == "-":
-        try:
-            raw = json.loads(sys.stdin.read())
-        except ValueError as exc:
-            raise ElateError(f"cannot parse the script on stdin: {exc}") from exc
-        base = Path.cwd().resolve()
-    else:
-        p = Path(path).expanduser()
-        if not p.is_file():
-            raise ElateError(f"script file does not exist: {path}")
-        try:
-            raw = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ElateError(f"cannot read script {path}: {exc}") from exc
-        base = p.parent.resolve()
-    return compose.prepare(raw, base, use_config=use_config), base
+    with eld.reading_with(emacs):
+        if str(path) == "-":
+            text = sys.stdin.read()
+            if eld.looks_like_eld(text):
+                raw = eld.loads(text)
+            else:
+                try:
+                    raw = json.loads(text)
+                except ValueError as exc:
+                    raise ElateError(
+                        f"cannot parse the script on stdin: {exc}") from exc
+            base = Path.cwd().resolve()
+        else:
+            p = Path(path).expanduser()
+            if not p.is_file():
+                raise ElateError(f"script file does not exist: {path}")
+            if eld.is_eld(p):
+                raw = eld.load(p, name=str(path))
+            else:
+                try:
+                    raw = json.loads(p.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    raise ElateError(
+                        f"cannot read script {path}: {exc}") from exc
+            base = p.parent.resolve()
+        return compose.prepare(raw, base, use_config=use_config), base
 
 
 def load_script(path: str | Path,
                 overrides: dict[str, str] | None = None,
                 variant: str | None = None,
                 use_config: bool = True,
+                emacs: str | None = None,
                 ) -> tuple[dict[str, Any], Path]:
     """Read, template, and validate a scenario file; return (script, base_dir).
 
     OVERRIDES bind {{var}} templates (over any scenario "params" defaults);
     VARIANT selects one named "variants" binding set (between the two).
     BASE_DIR is the script file's directory: relative paths inside the
-    script resolve against it.
+    script resolve against it. EMACS reads a ``.eld`` scenario.
     """
-    raw, base = load_raw(path, use_config=use_config)
+    raw, base = load_raw(path, use_config=use_config, emacs=emacs)
     script = render_script(raw, overrides or {}, variant=variant)
     validate_script(script)
     return script, base

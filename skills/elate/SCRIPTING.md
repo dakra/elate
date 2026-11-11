@@ -1,7 +1,8 @@
 # elate scenario scripts
 
 A scenario script is a **JSON** file (deliberately not YAML: zero extra
-dependency, every other elate surface already speaks JSON) describing a
+dependency, every other elate surface already speaks JSON), or the same
+structure as an s-expression `.eld` file (below), describing a
 whole interaction — session config, steps, assertions — that `elate run`
 executes against a fresh throwaway session and turns into an exit code.
 That makes a script a regression test and the CI entry point.
@@ -61,6 +62,55 @@ built-in per-verb baseline. Use `"keys_delivery": "events"` when the code
 under test reads keys itself (`read-key`, a `ding`, an echo-area check):
 macro delivery runs the whole sequence inside one command, so a bell aborts
 the rest and `read-key` sees the next macro key as input.
+
+### S-expression scenarios: `.eld`
+
+A scenario may instead be an **`.eld` file**: one plist, read by Emacs
+itself, so forms are written as Lisp instead of escaped JSON strings.
+`run`, `matrix`, MCP `elate_run_script`, and `include` accept `.eld`
+files; `run -` reads one from stdin when the text starts with `(` or `;`.
+
+```elisp
+;; my-pkg smoke test
+(:name "my-pkg smoke test"
+ :session (:ui "tty" :size "100x30" :load ("./my-pkg.el")
+           :eval ((setq my-pkg-verbose t)))
+ :params (:word "hello")
+ :steps ((:keys "M-x my-pkg-mode RET")
+         (:wait "until" :pred (bound-and-true-p my-pkg-mode))
+         (:eval (with-current-buffer "*scratch*"
+                  (insert "{{word}}")))       ; a form, kept as written
+         (:assert (:eval (featurep 'my-pkg)))))
+```
+
+| `.eld` | JSON |
+|---|---|
+| `(:key VALUE ...)` — a list starting with a keyword | object; key names verbatim (`:buffer_contains`, `:with-hyphen`) |
+| `(SYMBOL ...)`, `'x`, `` `x ``, `#'f` | a form: its source text as a string, comments inside included |
+| `(A B ...)` (not headed by a symbol), `[A B ...]` | array |
+| `"s"`, `1`, `2.5` | string, number |
+| `t` / `:false` / `nil`, `()`, `:null` | `true` / `false` / `null` |
+| `idle`, `:idle` (any other symbol or keyword) | its name, a string (`"idle"`) |
+| `#s(hash-table)` | `{}` |
+
+Gotchas: a list of strings is an array, but a list headed by a symbol is
+a form — write `:require ("my-pkg")`, not `(my-pkg)`; a list that starts
+with any keyword (`:false`, `:null` included) is an object, and one that
+starts with `t`/`nil` is no form, so write such arrays as vectors
+(`[:idle :busy]`, `[t nil]`); `:pred t` is the boolean, `:pred "t"` the
+form; `?a` outside a form is the number 97; comments outside forms are
+not part of the scenario. `{{var}}` templating works inside forms
+(`(setq n {{n}})` reads `{{n}}` as a symbol and the text is substituted
+before the form runs); outside a form, quote a placeholder with spaces
+(`"{{ n }}"`). Reading needs an `emacs` (PATH's, or `--emacs`); syntax
+errors name the line (`s.eld:12: duplicate key :steps`). The project
+config stays `.elate.json`.
+
+`elate convert FILE [-o OUT] [--to eld|json]` rewrites a scenario in the
+other format, to stdout or OUT (`eval`/`pred` strings become bare forms
+when they read back as the same text; the result is checked by reading
+it back; includes and templates are converted as written).
+`export-script -o FILE.eld` (or `--eld`) exports to `.eld`.
 
 ### Reusable steps: `templates`, `use`, `include`
 
@@ -398,6 +448,7 @@ a combo FAILed.
 
 ```sh
 elate -s NAME export-script -o scenario.json   # stopped sessions work too
+elate -s NAME export-script -o scenario.eld    # as an s-expression scenario
 ```
 
 Best-effort starting point, not a faithful recorder: inputs become steps in

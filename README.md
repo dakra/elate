@@ -585,6 +585,26 @@ transcript) already speaks it. What YAML comments would give you is
 covered explicitly: every step accepts a `"comment"` key, and
 `"skip": true` disables a step without deleting it.
 
+The same scenario can be an **s-expression `.eld` file**, read by Emacs
+itself: forms are plain Lisp instead of escaped strings, and `;`
+comments work. A list starting with a keyword is an object, a list
+headed by a symbol is a form (kept as its source text), other lists and
+vectors are arrays; `t`/`:false`/`nil` are true/false/null:
+
+```elisp
+(:name "my-pkg smoke test"
+ :session (:ui "tty" :size "100x30" :load ("./my-pkg.el"))
+ :steps ((:keys "M-x my-pkg-mode RET")
+         (:wait "until" :pred (bound-and-true-p my-pkg-mode))
+         (:assert (:eval (featurep 'my-pkg)))))   ; a real form
+```
+
+`elate run`/`matrix` and MCP `elate_run_script` take either format;
+`elate convert FILE [-o OUT]` rewrites one as the other, and
+`export-script -o FILE.eld` exports to `.eld`. Reading `.eld` needs an
+`emacs` on PATH (or `--emacs`). The mapping and its gotchas are in
+[SCRIPTING.md](skills/elate/SCRIPTING.md).
+
 ```json
 {
   "name": "my-pkg smoke test",
@@ -663,6 +683,7 @@ scenario file:
 ```sh
 elate -s demo export-script              # to stdout
 elate -s demo export-script -o demo.json # then: elate run demo.json
+elate -s demo export-script -o demo.eld  # the same as an s-expression
 ```
 
 This is a **best-effort starting point for editing, not a faithful

@@ -31,7 +31,7 @@ mid-session the CLI is the live path.
 Supporting files (read on demand):
 - [REFERENCE.md](REFERENCE.md) — every command, option, default (generated from the CLI)
 - [RECIPES.md](RECIPES.md) — worked examples: transient menus, font-lock, dired, clean-install
-- [SCRIPTING.md](SCRIPTING.md) — scenario JSON format, assertions, `run`/`matrix`/`export-script`, CI
+- [SCRIPTING.md](SCRIPTING.md) — scenario format (JSON or `.eld`), assertions, `run`/`matrix`/`export-script`, CI
 
 ## Quickstart
 
@@ -356,10 +356,10 @@ default, `run --variant NAME` picks one. `--keep`/`--keep-on-failure`
 keep the session for inspection. Scenario format, every step and
 assertion kind: see [SCRIPTING.md](SCRIPTING.md).
 
-Instead of a shell loop: `matrix tests/*.json` (one summary, `-j N`,
-`--retries N` → FLAKY, `--timeout-scale F`); `"requires"` → SKIP;
-`"templates"`/`"include"`/`.elate.json` for shared steps and setup; and
-`elate -s NAME run -` batches steps against a live session (SCRIPTING.md).
+Instead of a shell loop: `matrix tests/*.json` (one summary, `-j N`, `--retries N`
+→ FLAKY, `--timeout-scale F`); `"requires"` → SKIP; `"templates"`/`"include"`/
+`.elate.json` for shared setup; `elate -s NAME run -` batches steps against a
+live session; `.eld` scenarios hold real Lisp forms (`elate convert`; SCRIPTING.md).
 
 ## JSON output and exit codes
 
@@ -462,7 +462,7 @@ available in your session (someone registered the server — the plugin is
 CLI-first and does not register it for you), use them directly — do **not**
 register a duplicate; otherwise register it with
 `claude mcp add elate -- uvx elate mcp`. The 39 `elate_*` tools cover the core surface (`attach`, `resize`,
-`prune`, `stderr`, `export-script`, `snap`, `matrix`, `install`, and `update` stay CLI-only); `prune`
+`prune`, `stderr`, `export-script`, `convert`, `snap`, `matrix`, `install`, and `update` stay CLI-only); `prune`
 aliases `purge` and `stderr` aliases `logs`. Sessions are shared
 between both (same names, same sandboxes), so you can mix.
 

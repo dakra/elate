@@ -1352,8 +1352,9 @@ def elate_trace(
 @_threaded
 def elate_run_script(
     script: Annotated[str, Field(description=(
-        "Path to a JSON scenario file (see the README's 'Scenario "
-        "scripts' section): {\"name\": ..., \"session\": {ui, size, "
+        "Path to a scenario file, JSON or s-expression .eld (see the "
+        "README's 'Scenario scripts' section): {\"name\": ..., "
+        "\"session\": {ui, size, "
         "config, load, eval}, \"steps\": [...]}. Steps mirror the other "
         "tools (keys/type/eval/wait/mouse/focus/send_events/test/lint/"
         "screenshot/resize) "
@@ -1445,7 +1446,8 @@ def elate_run_script(
         if script.strip() == "-":
             # stdin is this server's JSON-RPC transport.
             raise ElateError("script must be a file path ('-' is CLI-only)")
-        sc, base = SC.load_script(script, params or {}, variant=variant)
+        sc, base = SC.load_script(script, params or {}, variant=variant,
+                                  emacs=emacs)
         sdir = (base / snapshot_dir) if snapshot_dir else None
         stem = Path(script).stem + (f"+variant-{variant}" if variant else "")
         result = SC.run_scenario(sc, base_dir=base, emacs=emacs,

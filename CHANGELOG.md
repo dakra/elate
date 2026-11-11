@@ -81,6 +81,11 @@ matrix while building a browser-in-a-buffer package.
 - `"defaults"` takes `keys_delivery` and `mouse_delivery`.
 - `run -` reads the scenario from stdin — with `-s NAME`, a one-call batch
   of steps against a live session.
+- **S-expression scenarios (`.eld`)**: a scenario (or an include) may be
+  one plist read by Emacs, with forms written as Lisp and kept as their
+  source text; `run`, `matrix`, `run -`, and MCP `elate_run_script`
+  accept it. **`elate convert`** rewrites a scenario between JSON and
+  `.eld`; `export-script -o FILE.eld` (or `--eld`) exports to `.eld`.
 
 ### GUI and visuals
 
