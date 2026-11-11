@@ -213,6 +213,8 @@ def build_sandbox(
     ui: str = "tty",
     cols: int = 120,
     rows: int = 36,
+    monitor: str | int | None = None,
+    position: tuple[int, int] | None = None,
 ) -> list[str]:
     """Build the sandbox and return the Emacs argument vector (sans binary).
 
@@ -266,6 +268,14 @@ def build_sandbox(
     set_session_dir = f"(setq elate-session-dir {elisp_string(str(session_dir))})"
 
     ui_args = ["-nw"] if ui == "tty" else []
+    # GUI placement (--monitor/--position): set up before the initial frame
+    # is shown; inside elate-guard so an unknown monitor is an init error.
+    placement = None
+    if ui == "gui" and (monitor is not None or position is not None):
+        x, y = position or (0, 0)
+        target = ("nil" if monitor is None else str(monitor)
+                  if isinstance(monitor, int) else elisp_string(monitor))
+        placement = f"(elate-guard (elate-place-initial-frame {target} {x} {y}))"
     # GUI frames are titled "elate:<session>" so a tiling window manager
     # can be configured to float just elate's windows (see the README).
     frame_title = f"elate:{session_dir.name}"
@@ -276,6 +286,8 @@ def build_sandbox(
         # silently dropping the session into the debugger.
         args = [*ui_args, "-Q", "--eval", set_session_dir,
                 "-l", str(agent), "--eval", "(elate-agent-init)"]
+        if placement:
+            args += ["--eval", placement]
         if ui == "gui":
             # Command-line --eval runs before frame-notice-user-settings
             # applies the user frame settings, so the alists set here
@@ -306,6 +318,8 @@ def build_sandbox(
         f"(load {elisp_string(str(agent))} nil t)",
         "(elate-agent-init)",
     ]
+    if placement:
+        lines.append(placement)
     # User-supplied startup code runs inside elate-guard: errors land in
     # <session>/init-error for `elate start` to report, instead of leaving
     # the session in the debugger with a green "started" message.

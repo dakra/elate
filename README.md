@@ -439,6 +439,83 @@ macOS notes:
   that runs elate (your terminal): System Settings → Privacy & Security →
   Screen Recording, then restart the terminal. elate probes the permission
   first and returns an actionable error instead of triggering prompts.
+### Placement, scale, and region captures
+
+```sh
+elate start --name g --ui gui --monitor 1 --position 40,40   # second monitor
+elate start --name g --ui gui --monitor "Built-in" --background
+elate info g                                  # screen: monitor, scale-factor, monitors
+elate -s g screenshot -o win.png --window '*scratch*'   # one window's body
+elate -s g screenshot -o box.png --region 0,0,200,80 --points
+elate -s g pixel 5 5 --window                 # {"rgb": "#123456", ...}
+```
+
+- `--monitor NAME|INDEX` opens the frame on that monitor (the index into
+  Emacs's monitor list, or a name — exact, else a unique substring) and
+  `--position X,Y` at that offset in its work area; both are set before
+  the frame is shown (a negative offset needs the `=` form:
+  `--position=-20,30`). An unknown monitor fails `start`, listing the
+  monitors. `--background` (or `ELATE_GUI_BACKGROUND=1`, handy for a
+  whole matrix) hands the focus back to the app that had it once the
+  frame is up (macOS). A tiling window manager may still move the frame.
+- `info` reports `screen`: the frame's monitor, `scale_factor` (2 on a
+  Retina display), its global position, and every monitor.
+- Every GUI screenshot result states `scale` (device pixels per frame
+  pixel) and `units`: captures are in device pixels unless `--points`.
+  `--region X,Y,W,H` and `--window [BUFFER]` crop to frame pixels (the
+  space `window-pixel-edges` and mouse posns use) or to a window's body.
+- `pixel X Y` reads one color. Captures are converted from the display's
+  color profile back to sRGB, so a color Emacs drew reads back within a
+  few units; `assert pixel` takes a `tolerance` for that.
+- In scenarios: `{"screenshot": "a.png", "window": true}`,
+  `{"assert": {"pixel": {"x": 5, "y": 5, "color": "#123456",
+  "tolerance": 16, "window": true}}}`, and image snapshots with
+  `"region"`/`"window"`, `"tolerance"` (per channel) and `"max_diff"`
+  (pixels, or a fraction when < 1); a mismatch writes
+  `<name>.actual.png` and a `<name>.diff.png` with differing pixels in red.
+- Cropping, `--points`, `pixel` and tolerant comparison need Pillow:
+  `pip install 'elate[image]'` (or `uvx --from 'elate[image]' elate`).
+
+### Native popup menus and dialogs
+
+On a GUI frame a native menu (`x-popup-menu`: `popup-menu`,
+`context-menu-mode`, `mouse-buffer-menu`, `C-down-mouse-3`) or dialog
+(`x-popup-dialog`, `yes-or-no-p`/`y-or-n-p` invoked by the mouse,
+`message-box`) runs its own event loop that nothing outside Emacs can
+drive. Sessions intercept them: the code that opened one waits, `popups`
+and `menu` show it, and `menu choose ITEM` or `menu dismiss` answers it.
+The caller gets exactly what the real menu would have returned: the
+chosen item's value, and on dismissal nil for a menu opened by a mouse
+event, a quit otherwise.
+
+```sh
+elate -s g eval '(context-menu-mode 1)'
+elate -s g send-events 'down-mouse-3@1,0'   # opens it asynchronously
+elate -s g menu                             # kind, title, indexed items
+elate -s g menu choose Paste                # an index, the full label
+                                            # ("Select > All"), or a unique last part
+```
+
+Open menus with asynchronous delivery (`keys --events`, `send-events`,
+`mouse` with events delivery). A menu opened while an elate request is
+still running (macro-delivered `keys`/`mouse`, `eval`) could never be
+answered, so it fails at once with that hint; a second menu opened while
+one is pending fails too. An unanswered menu is dismissed after 60s
+(`elate-native-menu-timeout`). In scenarios: `{"menu": "choose", "item":
+"Paste"}` / `{"menu": "dismiss"}`. TTY menus are not intercepted (raw keys
+drive them); set `elate-intercept-native-menus` to t to intercept those
+too, or nil for the real menus everywhere.
+
+### Focus
+
+A sandboxed frame never has real window-system focus. `elate focus in|out`
+(and `send-events focus-in`) inject the event Emacs gets from the window
+system: it runs `after-focus-change-function` and sets the frame's
+`last-focus-update` parameter. `(frame-focus-state)` reads C-level state
+that elisp cannot set, so it keeps reporting the real state unless the
+focus command gets `--set-focus-state`, which makes it agree with the
+injected events.
+
 ### GUI sessions under a tiling window manager
 
 A tiling window manager (AeroSpace, yabai, Amethyst, …) manages every new

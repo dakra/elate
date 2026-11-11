@@ -179,10 +179,10 @@ open for you to inspect (`state` shows prompt + candidates) and answer.
   drives it, so code gated on focus (paste-on-focus, focus-dimming, a
   click-to-refocus mode) sees an unfocused frame and behaves differently.
   Don't fight it with window managers: inject focus with `focus in` /
-  `send-events 'focus-in' …` (ordered with clicks/keys), and add
-  `--set-focus-state` when the code reads `(frame-focus-state)` — that
-  C-owned state cannot be moved from elisp, so the flag shims it. Worked
-  example: the focus-vs-click recipe in RECIPES.md.
+  `send-events 'focus-in' …` (ordered with clicks/keys) — that runs
+  `after-focus-change-function` and sets `last-focus-update`; add
+  `--set-focus-state` when the code reads `(frame-focus-state)` (C-owned,
+  shimmed). Worked example: the focus-vs-click recipe in RECIPES.md.
 - If a semantic `keys` call times out, the sequence probably left Emacs
   reading input: retry with `--events`, or recover with `interrupt`.
 - After an eval/keys timeout where Emacs stays busy (`info` shows
@@ -422,10 +422,12 @@ header-line|tab-line|left-fringe|…|outside`, `--mode-line`), takes pixel
 offsets (`--dx/--dy` from the glyph, `--x/--y` raw text-area pixels — pair
 with `lines` for row heights), and `drag --steps N` emits real
 `mouse-movement` events so drag maps run; `--to-buffer`/`--to-area` end a
-drag in another window or part. Results carry the resolved posn. GUI differences: no `--raw` channel;
-`type` is capped at 10,000 chars; macOS PNG capture needs the Screen
-Recording permission (elate preflights and reports instead of prompting).
-On Linux/CI add `--headless` for a private Xvfb.
+drag in another window or part. Results carry the resolved posn. GUI: no `--raw`;
+`type` caps at 10,000 chars; macOS capture needs Screen Recording; Linux/CI
+`--headless`. `start --monitor NAME|N --position X,Y --background` keeps
+frames out of your way. `screenshot --window [BUF] | --region X,Y,W,H
+[--points]`, `pixel X Y`, and snapshot `tolerance` need `elate[image]`;
+a native context menu/dialog waits for `elate menu choose ITEM|dismiss`.
 
 Three GUI-level commands reach *below* the command loop, where
 `special-event-map` code (drag-and-drop in particular) lives:
@@ -459,7 +461,7 @@ images** instead of PNG files to read. If `elate_*` MCP tools are already
 available in your session (someone registered the server — the plugin is
 CLI-first and does not register it for you), use them directly — do **not**
 register a duplicate; otherwise register it with
-`claude mcp add elate -- uvx elate mcp`. The 37 `elate_*` tools cover the core surface (`attach`, `resize`,
+`claude mcp add elate -- uvx elate mcp`. The 39 `elate_*` tools cover the core surface (`attach`, `resize`,
 `prune`, `stderr`, `export-script`, `snap`, `matrix`, `install`, and `update` stay CLI-only); `prune`
 aliases `purge` and `stderr` aliases `logs`. Sessions are shared
 between both (same names, same sandboxes), so you can mix.

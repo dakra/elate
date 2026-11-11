@@ -89,7 +89,7 @@ MAX_STEP_TIMEOUT = 600.0
 _SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
 
 VERBS = ("keys", "type", "eval", "wait", "mouse", "focus", "send_events",
-         "dnd", "test", "lint", "screenshot", "resize", "assert")
+         "dnd", "menu", "test", "lint", "screenshot", "resize", "assert")
 
 # Keys allowed on every step besides the verb itself.
 #   "optional": a failing step does not fail the run and does not stop it
@@ -124,9 +124,10 @@ _STEP_OPTIONS: dict[str, set[str]] = {
     "send_events": {"buffer", "frame", "set_focus_state", "timeout"},
     "dnd": {"buffer", "pos", "line", "col", "x", "y", "action", "hover",
             "hover_ms", "timeout", "allow_rejected"},
+    "menu": {"item", "timeout"},
     "test": {"load_files", "timeout", "allow_unexpected"},
     "lint": {"timeout", "allow_findings"},
-    "screenshot": {"ansi"},
+    "screenshot": {"ansi", "region", "window", "points"},
     "resize": set(),
     "assert": set(),
 }
@@ -152,20 +153,39 @@ _ASSERT_KINDS: dict[str, set[str]] = {
     "lint_clean": set(),
     "eval": {"timeout", "buffer"},
     "snapshot": set(),  # options live inside the value object, not as siblings
+    "pixel": set(),  # {"x", "y", "color", "tolerance", "window"} inside the value
 }
 
 _SNAPSHOT_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _SNAPSHOT_OF = ("screen", "faces", "state")
-_SNAPSHOT_KEYS = {"name", "of", "buffer", "from", "to", "ansi"}
+_SNAPSHOT_KEYS = {"name", "of", "buffer", "from", "to", "ansi", "region",
+                  "window", "tolerance", "max_diff"}
+_PIXEL_KEYS = {"x", "y", "color", "tolerance", "window"}
+_REGION_RE = re.compile(r"^\s*-?\d+\s*,\s*-?\d+\s*,\s*\d+\s*,\s*\d+\s*$")
+
+
+def _check_crop(obj: dict[str, Any], where: str) -> None:
+    """"region" ("X,Y,W,H" frame pixels) and "window" (true or a buffer)."""
+    region = obj.get("region")
+    if region is not None and not (isinstance(region, str)
+                                   and _REGION_RE.match(region)):
+        raise ElateError(f'{where}: "region" must be "X,Y,W,H" in frame '
+                         f"pixels, got {region!r}")
+    window = obj.get("window")
+    if window is not None and not isinstance(window, (bool, str)):
+        raise ElateError(f'{where}: "window" must be true or a buffer name')
+    if region is not None and window not in (None, False):
+        raise ElateError(f'{where}: "region" and "window" are exclusive')
 
 _SESSION_KEYS = {"ui", "size", "config", "init_file", "load", "require",
                  "eval",
                  "eval_file", "profile", "home_seed", "env",
-                 "emacs", "headless", "allow_init_error"}
+                 "emacs", "headless", "allow_init_error", "monitor",
+                 "position", "background"}
 
 _DEFAULT_TIMEOUTS = {"keys": 15.0, "eval": 15.0, "wait": 10.0,
                      "mouse": 15.0, "focus": 15.0, "send_events": 15.0,
-                     "dnd": 15.0, "test": 60.0, "lint": 60.0}
+                     "dnd": 15.0, "menu": 10.0, "test": 60.0, "lint": 60.0}
 
 
 # ---------------------------------------------------------------------------
@@ -605,8 +625,19 @@ def _validate_session_config(cfg: Any) -> None:
     if cfg.get("ui", "tty") not in ("tty", "gui"):
         raise ElateError(f"session ui must be 'tty' or 'gui', got {cfg.get('ui')!r}")
     _check_size(cfg.get("size", "120x36"), "session size")
-    for key in ("headless", "allow_init_error"):
+    for key in ("headless", "allow_init_error", "background"):
         _check_bool(cfg, key, "session config")
+    monitor = cfg.get("monitor")
+    if monitor is not None and (isinstance(monitor, bool) or not isinstance(
+            monitor, (str, int)) or (isinstance(monitor, int) and monitor < 0)
+            or (isinstance(monitor, str) and not monitor.strip())):
+        raise ElateError('session "monitor" must be a name or an index >= 0')
+    position = cfg.get("position")
+    if position is not None and not (
+            isinstance(position, list) and len(position) == 2
+            and all(isinstance(v, int) and not isinstance(v, bool)
+                    for v in position)):
+        raise ElateError('session "position" must be [x, y] integers')
     if cfg.get("config", "minimal") not in S.sandbox.CONFIG_MODES:
         raise ElateError(
             f"unknown session config mode {cfg.get('config')!r} "
@@ -828,6 +859,19 @@ def _validate_step(step: Any, index: int) -> None:
             raise ElateError(
                 f'{where}: "screenshot" takes an output path or null (inline text)')
         _check_bool(step, "ansi", where)
+        _check_bool(step, "points", where)
+        _check_crop(step, where)
+    if verb == "menu":
+        if val not in ("choose", "dismiss"):
+            raise ElateError(f'{where}: "menu" must be "choose" or "dismiss", '
+                             f"got {val!r}")
+        item = step.get("item")
+        if val == "choose" and not (isinstance(item, str) or (
+                isinstance(item, int) and not isinstance(item, bool))):
+            raise ElateError(f'{where}: "menu": "choose" needs an "item" '
+                             "(index or label)")
+        if val == "dismiss" and "item" in step:
+            raise ElateError(f'{where}: "menu": "dismiss" takes no "item"')
     if verb == "resize":
         _check_size(val, f'{where}: "resize" size')
     if verb == "assert":
@@ -889,6 +933,30 @@ def _validate_assert(spec: Any, where: str) -> None:
         raise ElateError(f'{where}: assert "lint_clean" takes true or false')
     if kind == "snapshot":
         _validate_snapshot(val, where)
+    if kind == "pixel":
+        _validate_pixel(val, where)
+
+
+def _validate_pixel(val: Any, where: str) -> None:
+    w = f"{where} (assert pixel)"
+    if not isinstance(val, dict):
+        raise ElateError(f'{w}: takes an object {{"x", "y", "color"}}')
+    unknown = set(val) - _PIXEL_KEYS
+    if unknown:
+        raise ElateError(f"{w}: unknown key(s) {sorted(unknown)}; known: "
+                         f"{sorted(_PIXEL_KEYS)}")
+    for key in ("x", "y"):
+        v = val.get(key)
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ElateError(f'{w}: "{key}" must be an integer')
+    color = val.get("color")
+    if not (isinstance(color, str)
+            and re.match(r"^#?[0-9A-Fa-f]{6}$", color)):
+        raise ElateError(f'{w}: "color" must be "#rrggbb"')
+    _check_number(val, "tolerance", w, minimum=0, maximum=255)
+    window = val.get("window")
+    if window is not None and not isinstance(window, (bool, str)):
+        raise ElateError(f'{w}: "window" must be true or a buffer name')
 
 
 def _validate_snapshot(val: Any, where: str) -> None:
@@ -921,6 +989,15 @@ def _validate_snapshot(val: Any, where: str) -> None:
     if of != "screen" and "ansi" in obj:
         raise ElateError(
             f'{where}: snapshot "ansi" applies only to of="screen"')
+    if of != "screen" and ({"region", "window", "tolerance", "max_diff"}
+                           & set(obj)):
+        raise ElateError(
+            f'{where}: snapshot "region"/"window"/"tolerance"/"max_diff" '
+            'apply only to of="screen" (GUI)')
+    _check_crop(obj, f"{where} (assert snapshot)")
+    _check_number(obj, "tolerance", f"{where} (assert snapshot)",
+                  minimum=0, maximum=255)
+    _check_number(obj, "max_diff", f"{where} (assert snapshot)", minimum=0)
     if "buffer" in obj and not isinstance(obj["buffer"], str):
         raise ElateError(f'{where}: snapshot "buffer" must be a string')
     if "ansi" in obj and not isinstance(obj["ansi"], bool):
@@ -1351,6 +1428,9 @@ def _start_for(script: dict[str, Any], base: Path,
         rows=int(m.group(2)),
         ui=cfg.get("ui", "tty"),
         headless=bool(cfg.get("headless")),
+        monitor=cfg.get("monitor"),
+        position=tuple(cfg["position"]) if cfg.get("position") else None,
+        background=cfg.get("background"),
     )
 
 
@@ -1658,6 +1738,10 @@ def _exec_step(sess: S.Session, step: dict[str, Any], verb: str,
     if verb == "screenshot":
         return _screenshot_step(sess, step, base)
 
+    if verb == "menu":
+        return S.native_menu(sess, step["menu"], step.get("item"),
+                             timeout=_step_timeout(step, verb, defaults))
+
     if verb == "resize":
         m = _SIZE_RE.match(step["resize"])
         assert m is not None  # validated
@@ -1676,12 +1760,21 @@ def _screenshot_step(sess: S.Session, step: dict[str, Any],
 
         if ansi:
             raise ElateError('"ansi" applies to TTY text screenshots only')
+        from . import image
+
         if out:
             path = Path(_resolve(out, base))
         else:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             path = sess.dir / "log" / f"screenshot-{stamp}.png"
-        result = shot.capture_gui(sess, path)
+        window = step.get("window")
+        result = image.gui_screenshot(
+            sess, path,
+            region=image.parse_region(step["region"]) if step.get("region")
+            else None,
+            window=bool(window), buffer=window if isinstance(window, str)
+            else None,
+            points=bool(step.get("points")))
         sess.log("screenshot", output=result["path"], via="script")
         return result
     if sess.raw().pane_info() is None:
@@ -1845,6 +1938,24 @@ def _eval_assert(sess: S.Session, spec: dict[str, Any],
     if kind == "snapshot":
         return _eval_snapshot(sess, val, ctx)
 
+    if kind == "pixel":
+        from . import image
+        if sess.ui != "gui":
+            raise _StepFailure('assert "pixel" needs a GUI session')
+        window = val.get("window")
+        got = image.pixel(sess, val["x"], val["y"],
+                          buffer=window if isinstance(window, str) else None,
+                          window=bool(window))
+        want = image.parse_color(val["color"])
+        tolerance = int(val.get("tolerance", 0))
+        off = max(abs(a - b) for a, b in zip(got["rgba"][:3], want))
+        if off > tolerance:
+            raise _StepFailure(
+                f"pixel {val['x']},{val['y']} is {got['rgb']}, expected "
+                f"{val['color']} (channel difference {off} > tolerance "
+                f"{tolerance})", {"pixel": got})
+        return {"pixel": got, "difference": off}
+
     # kind == "eval": passes when the form evaluates without error to non-nil
     defaults = ctx.get("_defaults") or {}
     timeout = float(spec.get("timeout", defaults.get("timeout", 10.0))) \
@@ -1916,11 +2027,20 @@ def _capture_snapshot(sess: S.Session, of: str,
     """
     if of == "screen":
         if sess.ui == "gui":
-            from . import screenshot as shot
+            from . import image
             path = sess.dir / "log" / "snapshot-capture.png"
             path.parent.mkdir(parents=True, exist_ok=True)
-            shot.capture_gui(sess, path)
+            window = spec.get("window")
+            image.gui_screenshot(
+                sess, path,
+                region=image.parse_region(spec["region"])
+                if spec.get("region") else None,
+                window=bool(window),
+                buffer=window if isinstance(window, str) else None)
             return path.read_bytes(), ".png"
+        if {"region", "window", "tolerance", "max_diff"} & set(spec):
+            raise _StepFailure('snapshot "region"/"window"/"tolerance"/'
+                               '"max_diff" need a GUI session')
         if sess.raw().pane_info() is None:
             raise _StepFailure("no tmux pane left to snapshot")
         screen = sess.raw().capture_pane(ansi=bool(spec.get("ansi")))
@@ -1964,18 +2084,45 @@ def _eval_snapshot(sess: S.Session, val: Any,
 
     if path.suffix == ".png":
         golden = path.read_bytes()
+        diff_path = path.with_name(path.stem + ".diff.png")
         if golden == payload:
+            diff_path.unlink(missing_ok=True)
             return {"snapshot": name, "of": of, "status": "match"}
         actual_path = path.with_name(path.stem + ".actual.png")
         try:
             actual_path.write_bytes(payload)
         except OSError:
             actual_path = None
+        details: dict[str, Any] = {
+            "snapshot": name, "golden_bytes": len(golden),
+            "actual_bytes": len(payload),
+            "actual_written": str(actual_path) if actual_path else None}
+        tolerant = "tolerance" in spec or "max_diff" in spec
+        if actual_path is not None:
+            from . import image
+            try:
+                verdict = image.compare(
+                    actual_path, path, tolerance=int(spec.get("tolerance", 0)),
+                    max_diff=float(spec.get("max_diff", 0)),
+                    diff_out=diff_path)
+            except ElateError:
+                if tolerant:
+                    raise  # tolerance needs Pillow: say so
+                verdict = None
+            except Exception as exc:  # noqa: BLE001 - e.g. an unreadable golden
+                raise _StepFailure(
+                    f"snapshot {name!r}: cannot compare images: {exc}",
+                    details) from None
+            if verdict is not None:
+                if verdict["match"]:
+                    actual_path.unlink(missing_ok=True)
+                    diff_path.unlink(missing_ok=True)
+                    return {"snapshot": name, "of": of, "status": "match",
+                            "differing_pixels": verdict["differing_pixels"]}
+                details.update({k: v for k, v in verdict.items()
+                                if k != "match"})
         raise _StepFailure(
-            f"snapshot {name!r} (of {of}) differs from golden",
-            {"snapshot": name, "golden_bytes": len(golden),
-             "actual_bytes": len(payload),
-             "actual_written": str(actual_path) if actual_path else None})
+            f"snapshot {name!r} (of {of}) differs from golden", details)
 
     golden = path.read_text(encoding="utf-8")
     if golden == payload:

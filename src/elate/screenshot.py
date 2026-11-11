@@ -48,13 +48,17 @@ def png_dimensions(path: Path) -> tuple[int, int]:
     return width, height
 
 
-def capture_gui(sess: "Session", out_path: Path) -> dict[str, Any]:
+def capture_gui(sess: "Session", out_path: Path,
+                size_hint: tuple[float, float] | None = None) -> dict[str, Any]:
     """Capture the session's Emacs window as PNG into OUT_PATH.
 
-    Returns {"path", "width", "height", "format": "png"}.
+    SIZE_HINT (the wanted frame's outer width/height in points) picks the
+    matching window when Emacs has several (macOS; X11 captures the
+    selected frame's window). Returns {"path", "width", "height",
+    "format": "png"}.
     """
     if sys.platform == "darwin":
-        _capture_macos(sess, out_path)
+        _capture_macos(sess, out_path, size_hint)
     elif sys.platform.startswith("linux"):
         _capture_x11(sess, out_path)
     else:
@@ -142,8 +146,10 @@ def _blocker_message(reason: str) -> str:
             "(this is not a permission problem)")
 
 
-def macos_window_id(pid: int) -> int | None:
-    """CGWindowID of the largest on-screen window owned by PID, or None."""
+def macos_window_id(pid: int,
+                    size_hint: tuple[float, float] | None = None) -> int | None:
+    """CGWindowID of PID's on-screen window closest to SIZE_HINT, else its
+    largest one, or None."""
     try:
         import Quartz
     except ImportError as exc:
@@ -163,20 +169,24 @@ def macos_window_id(pid: int) -> int | None:
         if win.get("kCGWindowLayer", 0) != 0:  # skip menus/tooltips/etc.
             continue
         bounds = win.get("kCGWindowBounds") or {}
-        area = float(bounds.get("Width", 0)) * float(bounds.get("Height", 0))
+        w, h = float(bounds.get("Width", 0)), float(bounds.get("Height", 0))
+        # Larger is better: the largest window, or the one nearest the hint.
+        score = (-abs(w - size_hint[0]) - abs(h - size_hint[1])
+                 if size_hint else w * h)
         number = win.get("kCGWindowNumber")
-        if number is not None and (best is None or area > best[0]):
-            best = (area, int(number))
+        if number is not None and (best is None or score > best[0]):
+            best = (score, int(number))
     return best[1] if best else None
 
 
-def _capture_macos(sess: "Session", out_path: Path) -> None:
+def _capture_macos(sess: "Session", out_path: Path,
+                   size_hint: tuple[float, float] | None = None) -> None:
     if screen_recording_allowed() is False:
         raise ScreenshotError(f"cannot capture the screen: {PERMISSION_HINT}",
                               reason="permission")
     if not sess.emacs_pid:
         raise ElateError(f"session {sess.name!r} has no recorded Emacs pid")
-    window_id = macos_window_id(sess.emacs_pid)
+    window_id = macos_window_id(sess.emacs_pid, size_hint)
     if window_id is None:
         # A locked screen / asleep display also hides every on-screen
         # window, so check that before blaming the frame.

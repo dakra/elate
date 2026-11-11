@@ -28,6 +28,9 @@ dependencies = [
 # client; keep it out of the base install (the feature is Linux/X11-only).
 [project.optional-dependencies]
 dnd = ["python-xlib>=0.33"]
+# Region/window screenshots, pixel probes, and tolerant image comparison
+# (`screenshot --region/--window/--points`, `pixel`, image snapshots).
+image = ["Pillow>=10"]
 
 [project.urls]
 Homepage = "https://github.com/dakra/elate"
@@ -79,7 +82,7 @@ only-include = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "Pillow>=10"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

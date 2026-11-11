@@ -69,6 +69,11 @@ Most recent first; each is (:name :version :dir :warnings).")
   "Absolute path of this session's sandbox directory.
 Set via --eval / generated init.el before this file is loaded.")
 
+(defvar elate--in-request nil
+  "Non-nil while a server request (an elate RPC) is being handled.
+A native menu opened then cannot be answered: answering needs another
+request, which is only served once this one returns.")
+
 (defun elate--call-sans-debugger (fn &rest args)
   "Call FN on ARGS with the interactive error debugger disabled.
 Installed as around-advice on server.el's request-handling entry
@@ -81,7 +86,8 @@ processing and permanently wedge the semantic channel.  RPC backtrace
 capture is unaffected: `elate-rpc' re-binds `debug-on-error' around
 its own handlers."
   (let ((debug-on-error nil)
-        (debug-on-quit nil))
+        (debug-on-quit nil)
+        (elate--in-request t))
     (apply fn args)))
 
 (defun elate-agent-init ()
@@ -103,6 +109,12 @@ its own handlers."
                 server-execute-continuation))
     (when (fboundp fn)
       (advice-add fn :around #'elate--call-sans-debugger)))
+  ;; Native menus/dialogs would block the session in their own event loop.
+  (advice-add 'x-popup-menu :around #'elate--intercept-x-popup-menu)
+  (advice-add 'x-popup-dialog :around #'elate--intercept-x-popup-dialog)
+  (advice-add 'yes-or-no-p :around #'elate--intercept-yes-or-no-p)
+  (advice-add 'message-box :around #'elate--intercept-message-box)
+  (elate--route-menu-keys)
   (server-start))
 
 (defun elate--record-init-error (err)
@@ -3585,9 +3597,12 @@ silent truncation."
      (buffer-substring-no-properties (point-min) (point-max))
      elate--max-popup-text)))
 
+(defvar elate--native-menu)        ; defined with the menu interception below
+
 (defun elate--popups (with-text)
   "Currently visible popups as a list of {:kind :buffer :text} plists.
-Detects which-key (Emacs 30+), transient (Emacs 31), hydra's lv
+Detects an intercepted native menu or dialog, which-key (Emacs 30+),
+transient (Emacs 31), hydra's lv
 window, corfu's child frame, company's pseudo tooltip,
 completion-preview's overlay, and any other visible child frame
 \(posframe & friends).  Mechanisms that are not installed simply do
@@ -3601,6 +3616,19 @@ when WITH-TEXT is nil (the cheap \"are there popups?\" probe used by
                                  (and buffer (list :buffer buffer))
                                  (and with-text (list :text (or text ""))))
                          found))))
+        ;; an intercepted native menu or dialog (see `elate menu')
+        (when elate--native-menu
+          (funcall add (concat "native-" (plist-get elate--native-menu :kind))
+                   nil
+                   (and with-text
+                        (let ((index -1))
+                          (mapconcat
+                           (lambda (item)
+                             (setq index (1+ index))
+                             (format "%d: %s%s" index (plist-get item :label)
+                                     (if (plist-get item :enabled) ""
+                                       " (disabled)")))
+                           (plist-get elate--native-menu :items) "\n")))))
         ;; which-key (ships with Emacs 30+)
         (ignore-errors
           (let* ((buf (bound-and-true-p which-key--buffer))
@@ -3669,6 +3697,372 @@ when WITH-TEXT is nil (the cheap \"are there popups?\" probe used by
 (defun elate--rpc-popups ()
   "Capture currently visible popups, with their text."
   (list :popups (vconcat (elate--popups t))))
+
+;;;; Frame placement and display facts
+
+(defun elate--find-monitor (monitor)
+  "The `display-monitor-attributes-list' entry named by MONITOR.
+MONITOR is an index (0 = the first monitor Emacs lists) or a name,
+matched exactly, else as a unique case-insensitive substring."
+  (let* ((monitors (display-monitor-attributes-list))
+         (names (mapcar (lambda (m) (or (alist-get 'name m) "?")) monitors)))
+    (cond
+     ((integerp monitor)
+      (or (nth monitor monitors)
+          (error "elate: no monitor %d; monitors: %s" monitor
+                 (string-join names ", "))))
+     (t
+      (or (seq-find (lambda (m) (equal (alist-get 'name m) monitor)) monitors)
+          (let ((hits (seq-filter
+                       (lambda (m)
+                         (string-match-p (regexp-quote (downcase monitor))
+                                         (downcase (or (alist-get 'name m) ""))))
+                       monitors)))
+            (cond ((= (length hits) 1) (car hits))
+                  (hits (error "elate: monitor %S is ambiguous; monitors: %s"
+                               monitor (string-join names ", ")))))
+          (error "elate: no monitor %S; monitors: %s" monitor
+                 (string-join names ", ")))))))
+
+(defun elate-place-initial-frame (monitor x y)
+  "Open the initial frame at X,Y within MONITOR's work area.
+MONITOR is an index or name (see `elate--find-monitor'), nil for the
+first monitor.  Sets `initial-frame-alist', so the frame appears there
+instead of moving after it is shown."
+  (let* ((mon (if monitor (elate--find-monitor monitor)
+                (car (display-monitor-attributes-list))))
+         (area (or (alist-get 'workarea mon) (alist-get 'geometry mon)
+                   '(0 0 0 0))))
+    ;; (+ N) keeps a negative coordinate absolute; a bare negative left/top
+    ;; would count from the right/bottom edge.
+    (setq initial-frame-alist
+          (append (list (cons 'left (list '+ (+ (nth 0 area) (or x 0))))
+                        (cons 'top (list '+ (+ (nth 1 area) (or y 0)))))
+                  initial-frame-alist))))
+
+(defun elate--rpc-display-info ()
+  "The selected frame's monitor and scale factor."
+  (let ((frame (selected-frame)))
+    (if (not (display-graphic-p frame))
+        (list :graphic :false)
+      (list :graphic t
+            :monitor (elate--jnull (frame-monitor-attribute 'name frame))
+            :monitor-geometry (vconcat (frame-monitor-attribute 'geometry frame))
+            :scale-factor (if (fboundp 'frame-scale-factor)
+                              (frame-scale-factor frame)
+                            1.0)
+            :position (let ((pos (frame-position frame)))
+                        (vector (car pos) (cdr pos)))
+            :monitors (vconcat
+                       (mapcar (lambda (m)
+                                 (list :name (elate--jnull (alist-get 'name m))
+                                       :geometry (vconcat (alist-get 'geometry m))))
+                               (display-monitor-attributes-list frame)))))))
+
+;;; Native popup menus and dialogs -------------------------------------
+
+(defvar elate-intercept-native-menus 'graphic
+  "Which native menus and dialogs a session intercepts.
+`graphic' (the default): those shown on a graphic frame, whose native
+event loop nothing outside Emacs can drive -- a TTY menu reads the
+keyboard, so raw keys still drive it.  t: on every frame.  nil: none.
+An intercepted menu is recorded -- `elate menu' / `elate popups' show
+it -- and the call waits for `elate menu choose ITEM' or `elate menu
+dismiss' (or `elate-native-menu-timeout'), then returns what the real
+menu would have returned for that choice.")
+
+(defvar elate-native-menu-timeout 60
+  "Seconds an intercepted menu waits for an answer before it is dismissed.")
+
+(defvar elate--native-menu nil
+  "The intercepted menu awaiting an answer, or nil.
+A plist: :kind (\"menu\" or \"dialog\"), :title, :items (a list of
+plists :label :enabled :value), :position, and once answered :answer
+\(an item plist or `dismiss').")
+
+(defun elate--position-frame (position)
+  "The frame an `x-popup-menu' POSITION refers to: an event, ((X Y)
+WINDOW-OR-FRAME), a window, a frame, or t/nil (the selected frame)."
+  (let ((where (cond ((and (consp position) (consp (car position)))
+                      (cadr position))
+                     ((and (consp position) (symbolp (car position)))
+                      (posn-window (event-start position)))
+                     (t position))))
+    (cond ((framep where) where)
+          ((windowp where) (window-frame where))
+          (t (selected-frame)))))
+
+(defun elate--intercepting-p (&optional position)
+  "Non-nil when a native menu at POSITION's frame is to be intercepted."
+  (pcase elate-intercept-native-menus
+    ('nil nil)
+    ('graphic (display-graphic-p (elate--position-frame position)))
+    (_ t)))
+
+(defun elate--menu-item-label (name)
+  "The label string of a menu item NAME (a string or an expression)."
+  (cond ((stringp name) name)
+        (t (let ((value (ignore-errors (eval name t))))
+             (if (stringp value) value (format "%S" name))))))
+
+(defun elate--menu-props-get (props key default)
+  "The evaluated KEY property of menu-item PROPS, DEFAULT when absent."
+  (let ((cell (plist-member props key)))
+    (if cell (ignore-errors (eval (cadr cell) t)) default)))
+
+(defun elate--keymap-menu-items (keymap path labels enabled)
+  "Selectable items of menu KEYMAP, depth first.
+PATH is the list of events leading to KEYMAP, LABELS their labels, and
+ENABLED whether the enclosing submenu is enabled.  Each item is a plist
+:label (\"Parent > Item\" for submenu entries) :enabled :value, where
+:value is the event list `x-popup-menu' returns for it."
+  (let ((items nil) (seen nil))
+    (map-keymap
+     (lambda (event binding)
+       ;; A parent keymap's binding shadowed by the child is not shown.
+       (unless (memq event seen)
+         (push event seen)
+         (let (name def props)
+           (pcase binding
+             (`(menu-item ,n ,d . ,p) (setq name n def d props p))
+             (`(,(and (pred stringp) n) ,(and (pred stringp) _help) . ,d)
+              (setq name n def d))
+             (`(,(and (pred stringp) n) . ,d) (setq name n def d))
+             (_ nil))
+           (when (and name (elate--menu-props-get props :visible t))
+             (let ((filter (plist-get props :filter)))
+               (when filter
+                 (setq def (ignore-errors (funcall filter def)))))
+             (let ((label (elate--menu-item-label name)))
+               (unless (string-prefix-p "--" label)
+                 (let* ((here (append path (list event)))
+                        (shown (append labels (list label)))
+                        (on (and enabled
+                                 (elate--menu-props-get props :enable t)
+                                 t))
+                        (submenu (cond ((keymapp def) def)
+                                       ((and (symbolp def) (fboundp def)
+                                             (keymapp (indirect-function def)))
+                                        (indirect-function def)))))
+                   (setq items
+                         (append items
+                                 (if submenu
+                                     (elate--keymap-menu-items
+                                      submenu here shown on)
+                                   (list (list :label (string-join shown " > ")
+                                               :enabled on
+                                               :value here))))))))))))
+     keymap)
+    items))
+
+(defun elate--pane-menu-items (panes)
+  "Selectable items of the pane-form menu PANES: ((TITLE ITEM...)...)."
+  (let ((items nil))
+    (dolist (pane panes)
+      (when (consp pane)
+        (let ((pane-title (car pane)))
+          (dolist (item (cdr pane))
+            (when (consp item)
+              (setq items
+                    (append items
+                            (list (list :label (if (and (stringp pane-title)
+                                                        (> (length panes) 1)
+                                                        (not (string-empty-p
+                                                              pane-title)))
+                                                   (concat pane-title " > "
+                                                           (car item))
+                                                 (car item))
+                                        :enabled t
+                                        :value (cdr item))))))))))
+    items))
+
+(defun elate--native-menu-spec (menu)
+  "(TITLE . ITEMS) for MENU in any form `x-popup-menu' accepts."
+  (cond
+   ((keymapp menu)
+    (cons (or (keymap-prompt menu) "")
+          (elate--keymap-menu-items menu nil nil t)))
+   ((and (consp menu) (keymapp (car menu)))
+    ;; A list of keymaps: their items in order.
+    (cons (or (keymap-prompt (car menu)) "")
+          (apply #'append (mapcar (lambda (m)
+                                    (elate--keymap-menu-items m nil nil t))
+                                  menu))))
+   ((consp menu)
+    (cons (if (stringp (car menu)) (car menu) "")
+          (elate--pane-menu-items (cdr menu))))
+   (t (cons "" nil))))
+
+(defun elate--native-dialog-spec (contents)
+  "(TITLE . ITEMS) for `x-popup-dialog' CONTENTS: (TITLE ITEM...)."
+  (cons (if (stringp (car-safe contents)) (car contents) "")
+        (let (items)
+          (dolist (item (cdr-safe contents) (nreverse items))
+            (when (consp item)
+              (push (list :label (car item) :enabled t :value (cdr item))
+                    items))))))
+
+(defun elate--mouse-position-p (position)
+  "Non-nil when POSITION counts as a mouse click for `x-popup-menu'.
+Mirrors menu.c: any event (a list headed by a symbol) except a menu,
+tab or tool bar one; a dismissed menu then returns nil instead of
+quitting."
+  (and (consp position)
+       (not (consp (car position)))
+       (not (memq (car position) '(menu-bar tab-bar tool-bar)))
+       (not (eq (car-safe (cdr-safe position)) 'tab-bar))))
+
+(defun elate--await-native-menu (kind spec position)
+  "Record the menu SPEC of KIND and wait for an answer; return its value."
+  (when elate--in-request
+    (error (concat "elate: a native %s opened during an elate request "
+                   "(macro-delivered keys/mouse, or eval) cannot be "
+                   "answered -- open it with asynchronous delivery: keys "
+                   "--events, mouse with delivery events, or send-events")
+           kind))
+  (when elate--native-menu
+    (error "elate: a native %s opened while another one is pending" kind))
+  (setq elate--native-menu (list :kind kind :title (car spec)
+                                 :items (cdr spec) :position position))
+  (unwind-protect
+      (let ((deadline (+ (float-time) elate-native-menu-timeout))
+            (inhibit-quit nil))
+        (while (and (not (plist-member elate--native-menu :answer))
+                    (< (float-time) deadline))
+          ;; Serve the server connections that will answer, without
+          ;; consuming keyboard input.
+          (accept-process-output nil 0.05))
+        (let ((answer (plist-get elate--native-menu :answer)))
+          (cond
+           ((and answer (not (eq answer 'dismiss)))
+            (plist-get answer :value))
+           ;; A dismissed menu: nil for a mouse-invoked menu, else a quit,
+           ;; as the real one does.
+           ((and (equal kind "menu") (elate--mouse-position-p position)) nil)
+           (t (signal 'quit nil)))))
+    (setq elate--native-menu nil)))
+
+(defun elate--intercept-x-popup-menu (orig position menu)
+  "Around advice for `x-popup-menu': see `elate-intercept-native-menus'."
+  (if (or (null position) (not (elate--intercepting-p position)))
+      (funcall orig position menu)
+    (elate--await-native-menu "menu" (elate--native-menu-spec menu) position)))
+
+(defun elate--intercept-x-popup-dialog (orig position contents &optional header)
+  "Around advice for `x-popup-dialog': see `elate-intercept-native-menus'."
+  (if (not (elate--intercepting-p position))
+      (funcall orig position contents header)
+    (elate--await-native-menu "dialog" (elate--native-dialog-spec contents)
+                              position)))
+
+(defun elate--intercept-yes-or-no-p (orig prompt &rest args)
+  "Around advice for `yes-or-no-p', whose dialog is popped up from C."
+  (if (and (use-dialog-box-p) (display-popup-menus-p)
+           (elate--intercepting-p))
+      (elate--await-native-menu
+       "dialog" (elate--native-dialog-spec
+                 (list (substitute-command-keys
+                        (if (stringp prompt) prompt (format "%s" prompt)))
+                       '("Yes" . t) '("No" . nil)))
+       last-nonmenu-event)
+    (apply orig prompt args)))
+
+(defun elate--intercept-message-box (orig format-string &rest args)
+  "Around advice for `message-box', whose dialog is popped up from C."
+  (if (and use-dialog-box (display-popup-menus-p) (elate--intercepting-p)
+           format-string)
+      (let ((text (apply #'format-message format-string args)))
+        (elate--await-native-menu
+         "dialog" (elate--native-dialog-spec (list text '("OK" . t)))
+         last-nonmenu-event)
+        text)
+    (apply orig format-string args)))
+
+(defun elate--popup-binding-command (binding)
+  "A command popping BINDING (a menu keymap or filtered menu-item) via Lisp.
+Emacs's key reader pops a menu bound directly to a mouse key from C, past
+any advice; the same menu shown through `popup-menu' is interceptable."
+  (lambda (event)
+    (interactive "e")
+    (let ((map (pcase binding
+                 (`(menu-item ,_ ,def . ,props)
+                  (let ((filter (plist-get props :filter)))
+                    (if filter (funcall filter def) def)))
+                 (_ binding))))
+      (when (keymapp map)
+        (popup-menu map event)))))
+
+(defun elate--route-menu-keys ()
+  "Route the stock mouse menus Emacs pops from C through `popup-menu'."
+  (when (boundp 'context-menu-mode-map)
+    (dolist (key '([down-mouse-3] [C-down-mouse-1]))
+      (let ((binding (lookup-key context-menu-mode-map key)))
+        (when (and binding (not (functionp binding)))
+          (define-key context-menu-mode-map key
+                      (elate--popup-binding-command binding))))))
+  (let ((binding (lookup-key global-map [C-down-mouse-3])))
+    (when (and binding (not (functionp binding)))
+      (define-key global-map [C-down-mouse-3]
+                  (elate--popup-binding-command binding)))))
+
+(defun elate--native-menu-public ()
+  "The pending native menu as a reply plist, or nil."
+  (when elate--native-menu
+    (let ((index -1))
+      (list :kind (plist-get elate--native-menu :kind)
+            :title (plist-get elate--native-menu :title)
+            :items (vconcat
+                    (mapcar (lambda (item)
+                              (setq index (1+ index))
+                              (list :index index
+                                    :label (plist-get item :label)
+                                    :enabled (if (plist-get item :enabled)
+                                                 t :false)))
+                            (plist-get elate--native-menu :items)))))))
+
+(defun elate--native-menu-find (item)
+  "The pending menu item named by ITEM: an index, or a label (exact, else
+the unique item whose last path component matches)."
+  (let ((items (plist-get elate--native-menu :items)))
+    (cond
+     ((integerp item)
+      (or (and (>= item 0) (nth item items))
+          (error "elate: menu has %d item(s); no index %d" (length items) item)))
+     ((stringp item)
+      (or (seq-find (lambda (i) (equal (plist-get i :label) item)) items)
+          (let ((tail (seq-filter
+                       (lambda (i)
+                         (string-suffix-p (concat " > " item)
+                                          (plist-get i :label)))
+                       items)))
+            (cond ((= (length tail) 1) (car tail))
+                  (tail (error "elate: menu item %S is ambiguous: %s" item
+                               (mapconcat (lambda (i) (plist-get i :label))
+                                          tail ", ")))))
+          (error "elate: no menu item %S; items: %s" item
+                 (mapconcat (lambda (i) (plist-get i :label)) items ", "))))
+     (t (error "elate: menu item must be an index or a label, got %S" item)))))
+
+(defun elate--rpc-native-menu (action &optional item)
+  "Show, choose from, or dismiss the intercepted native menu.
+ACTION is \"show\", \"choose\" (ITEM: index or label), or \"dismiss\"."
+  (pcase action
+    ("show" (list :menu (or (elate--native-menu-public) :null)))
+    ((or "choose" "dismiss")
+     (unless elate--native-menu
+       (error "elate: no native menu or dialog is open"))
+     (let ((shown (elate--native-menu-public)))
+       (if (equal action "dismiss")
+           (setq elate--native-menu
+                 (plist-put elate--native-menu :answer 'dismiss))
+         (let ((chosen (elate--native-menu-find item)))
+           (unless (plist-get chosen :enabled)
+             (error "elate: menu item %S is disabled" (plist-get chosen :label)))
+           (setq elate--native-menu
+                 (plist-put elate--native-menu :answer chosen))
+           (setq shown (plist-put shown :chosen (plist-get chosen :label)))))
+       (list :menu shown :action action)))
+    (_ (error "elate: unknown menu action %S" action))))
 
 (provide 'elate-agent)
 ;;; elate-agent.el ends here

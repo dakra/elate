@@ -393,3 +393,31 @@ def start_xvfb(session_dir: Path, screen: str = "1280x800x24") -> tuple[int, str
     while time.monotonic() < deadline and not socket.exists():
         time.sleep(0.05)
     return proc.pid, f":{number}"
+
+
+def frontmost_app_pid() -> int | None:
+    """Pid of the frontmost application (macOS), or None. Never raises."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import AppKit
+
+        app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        return int(app.processIdentifier()) if app is not None else None
+    except Exception:  # noqa: BLE001 - best effort
+        return None
+
+
+def activate_app(pid: int) -> bool:
+    """Bring the application PID back to the front (macOS). Never raises."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        import AppKit
+
+        app = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+        if app is None:
+            return False
+        return bool(app.activateWithOptions_(0))
+    except Exception:  # noqa: BLE001 - best effort
+        return False

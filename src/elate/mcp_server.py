@@ -173,6 +173,18 @@ def elate_start(
     headless: Annotated[bool, Field(description=(
         "GUI only: run under a private Xvfb display (Linux/CI). Not "
         "available on macOS."))] = False,
+    monitor: Annotated[str | None, Field(description=(
+        "GUI only: open the frame on this monitor -- an index ('0' = first) "
+        "or a name (exact, else a unique substring). elate_info lists the "
+        "monitors under screen.monitors."))] = None,
+    position: Annotated[list[int] | None, Field(
+        min_length=2, max_length=2, description=(
+            "GUI only: [x, y] pixels from the top-left of the monitor's "
+            "work area."))] = None,
+    background: Annotated[bool | None, Field(description=(
+        "GUI only (macOS): give the focus back to the app that had it once "
+        "the frame is up. Default: on when $ELATE_GUI_BACKGROUND is "
+        "set."))] = None,
     emacs_path: Annotated[str | None, Field(description=(
         "Emacs binary to use (default: 'emacs' on PATH). Use for version-"
         "matrix testing."))] = None,
@@ -286,6 +298,9 @@ def elate_start(
             rows=int(m.group(2)),
             ui=ui,
             headless=headless,
+            monitor=monitor,
+            position=tuple(position) if position else None,
+            background=background,
             replace=replace,
             owner=owner,
             ttl=ttl,
@@ -1738,6 +1753,18 @@ def elate_screenshot(
     ansi: Annotated[bool, Field(description=(
         "TTY only: include ANSI color escape sequences (verify "
         "faces/themes rendered in the terminal)."))] = False,
+    region: Annotated[str | None, Field(description=(
+        "GUI only: crop to 'X,Y,W,H' in frame pixels (logical pixels from "
+        "the frame's top-left, as window-pixel-edges reports). Needs the "
+        "elate[image] extra."))] = None,
+    window: Annotated[bool, Field(description=(
+        "GUI only: crop to the body of the window showing 'buffer' (else "
+        "the selected window). Needs elate[image]."))] = False,
+    buffer: Annotated[str | None, Field(description=(
+        "With window: the buffer whose window to crop to."))] = None,
+    points: Annotated[bool, Field(description=(
+        "GUI only: scale the PNG to points instead of device pixels "
+        "(a Retina capture is 2x). Needs elate[image]."))] = False,
 ) -> str | list[str | Image]:
     """Capture the rendered screen (what a human would see).
 
@@ -1746,8 +1773,9 @@ def elate_screenshot(
     pane is kept for post-mortem capture), making this the right tool to
     inspect a session that died. GUI sessions: a PNG of the Emacs window,
     returned as actual image content alongside a JSON text block with
-    the saved path and pixel dimensions; needs a live session, and on
-    macOS the Screen Recording permission (a missing permission comes
+    the saved path, pixel dimensions, "scale" (device pixels per frame
+    pixel) and "units"; region/window crop it. Needs a live session, and
+    on macOS the Screen Recording permission (a missing permission comes
     back as an actionable error). For structured facts prefer
     elate_state; use the screenshot to check actual rendering, faces,
     layout glitches, or a wedged Emacs.
@@ -1758,17 +1786,23 @@ def elate_screenshot(
         if sess.ui == "gui":
             import datetime as _dt
 
-            from . import screenshot as shot
+            from . import image
 
             if ansi:
                 raise ElateError("ansi applies to TTY text screenshots only")
             sess.require_alive()
             stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             out = sess.dir / "log" / f"screenshot-{stamp}.png"
-            result = shot.capture_gui(sess, out)
+            result = image.gui_screenshot(
+                sess, out,
+                region=image.parse_region(region) if region else None,
+                window=window, buffer=buffer, points=points)
             sess.log("screenshot", via="mcp", output=result["path"],
                      width=result["width"], height=result["height"])
             return [_ok(result), Image(path=result["path"])]
+        if region or window or buffer or points:
+            raise ElateError("region/window/buffer/points apply to GUI "
+                             "screenshots only")
         if sess.raw().pane_info() is None:
             raise ElateError(
                 f"session {session!r} has no tmux pane left to capture "
@@ -1777,6 +1811,72 @@ def elate_screenshot(
         screen = sess.raw().capture_pane(ansi=ansi)
         sess.log("screenshot", ansi=ansi, via="mcp")
         return _ok({"screen": screen, "ansi": ansi})
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_MUTATING)
+@_threaded
+def elate_menu(
+    session: Annotated[str, Field(description="Session name.")],
+    action: Annotated[Literal["show", "choose", "dismiss"], Field(description=(
+        "'show': the pending native menu/dialog (or null). 'choose': pick "
+        "'item'. 'dismiss': close it without a choice."))] = "show",
+    item: Annotated[str | int | None, Field(description=(
+        "For choose: the item's index, full label ('Edit > Copy'), or its "
+        "last label component when unique."))] = None,
+    timeout: Annotated[float, Field(gt=0, le=600, description=(
+        "choose/dismiss: seconds to wait for a menu to open."))] = 10.0,
+) -> str:
+    """Drive a native popup menu (x-popup-menu) or dialog (x-popup-dialog).
+
+    These run their own event loop that nothing outside Emacs can drive,
+    so the session intercepts them on GUI frames: the code that opened one
+    waits until you choose an item or dismiss it, then gets exactly what
+    the real menu would have returned. Open the menu with asynchronous
+    delivery (elate_keys delivery='events', elate_send_events for a
+    click); one opened during a macro-delivered key or an eval fails at
+    once, since it could never be answered.
+    """
+    sess = None
+    try:
+        if action != "choose" and item is not None:
+            raise ElateError(f"menu {action} takes no item")
+        sess = _load(session)
+        return _ok(S.native_menu(sess, action, item, timeout=timeout))
+    except Exception as exc:
+        return _fail(exc, sess)
+
+
+@server.tool(annotations=_READONLY)
+@_threaded
+def elate_pixel(
+    session: Annotated[str, Field(description="Session name (GUI).")],
+    x: Annotated[int, Field(description="X in frame pixels.")],
+    y: Annotated[int, Field(description="Y in frame pixels.")],
+    window: Annotated[bool, Field(description=(
+        "Make x/y relative to the body of the window showing 'buffer' "
+        "(else the selected window)."))] = False,
+    buffer: Annotated[str | None, Field(description=(
+        "With window: the buffer whose window x/y refer to."))] = None,
+) -> str:
+    """Read the color of one pixel of a GUI frame ("rgb": "#rrggbb").
+
+    Coordinates are frame pixels (logical, from the frame's top-left). The
+    capture is converted to sRGB, so a drawn color reads back within a few
+    units. Needs the elate[image] extra.
+    """
+    sess = None
+    try:
+        from . import image
+
+        sess = _load(session)
+        if sess.ui != "gui":
+            raise ElateError("pixel needs a GUI session")
+        data = image.pixel(sess, x, y, buffer=buffer,
+                           window=window or buffer is not None)
+        sess.log("pixel", x=x, y=y, rgb=data["rgb"], via="mcp")
+        return _ok(data)
     except Exception as exc:
         return _fail(exc, sess)
 

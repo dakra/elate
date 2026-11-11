@@ -91,6 +91,24 @@ def _add_policy_args(sp: argparse.ArgumentParser) -> None:
                          ".elate.json at or above the scenario's directory)")
 
 
+def _parse_xy(value: str) -> tuple[int, int]:
+    """'X,Y' integers."""
+    parts = value.split(",")
+    try:
+        x, y = (int(p.strip()) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected X,Y integers, got {value!r}") from None
+    return x, y
+
+
+def _monitor_arg(value: str | None) -> str | int | None:
+    """--monitor: an index when numeric, else a name."""
+    if value is None:
+        return None
+    return int(value) if value.strip().isdigit() else value
+
+
 def _parse_duration(value: str) -> float:
     """A duration like '30s', '15m', '2h', '1d', or a bare number, in seconds."""
     m = re.match(r"^(\d+(?:\.\d+)?)([smhd]?)$", value.strip())
@@ -176,6 +194,21 @@ def build_parser() -> argparse.ArgumentParser:
                          "default) or gui (windowed Emacs; PNG screenshots)")
     sp.add_argument("--headless", action="store_true",
                     help="GUI only: run under a private Xvfb (Linux/CI)")
+    sp.add_argument("--monitor", metavar="NAME|INDEX",
+                    help="GUI only: open the frame on this monitor -- an "
+                         "index into Emacs's monitor list (0 = first) or a "
+                         "name (exact, else a unique substring); `info` "
+                         "lists them under screen.monitors")
+    sp.add_argument("--position", metavar="X,Y", type=_parse_xy,
+                    help="GUI only: open the frame at X,Y pixels from the "
+                         "top-left of the monitor's work area (default 0,0 "
+                         "with --monitor) -- e.g. a corner out of your way; "
+                         "write a negative X as --position=-20,30")
+    sp.add_argument("--background", action="store_true", default=None,
+                    help="GUI only (macOS): hand the focus back to the app "
+                         "that had it once the frame is up, so a run does "
+                         "not interrupt your typing (default: on when "
+                         "$ELATE_GUI_BACKGROUND is set)")
     sp.add_argument("--emacs", metavar="PATH", help="emacs binary to use")
     sp.add_argument("--config", choices=list(S.sandbox.CONFIG_MODES), default="minimal",
                     help="sandbox config mode (default: minimal; "
@@ -1018,6 +1051,57 @@ def build_parser() -> argparse.ArgumentParser:
                          "./elate-<session>-<time>.png)")
     sp.add_argument("--ansi", action="store_true",
                     help="tty only: include ANSI color escapes")
+    sp.add_argument("--region", metavar="X,Y,W,H",
+                    help="gui only: crop to this rectangle in frame pixels "
+                         "(logical pixels from the frame's top-left, the "
+                         "space window-pixel-edges uses); needs elate[image]")
+    sp.add_argument("--window", nargs="?", const="", metavar="BUFFER",
+                    help="gui only: crop to the body of the window showing "
+                         "BUFFER (default: the selected window); needs "
+                         "elate[image]")
+    sp.add_argument("--points", action="store_true",
+                    help="gui only: scale the PNG to points (logical pixels) "
+                         "instead of device pixels -- on a Retina display "
+                         "the capture is 2x; needs elate[image]")
+
+    sp = sub.add_parser(
+        "menu",
+        help="show, choose from, or dismiss a native popup menu or dialog",
+        description="Native menus (x-popup-menu: context menus, "
+                    "popup-menu, mouse-buffer-menu) and dialogs "
+                    "(x-popup-dialog) run their own event loop that nothing "
+                    "outside Emacs can drive, so the session intercepts "
+                    "them: the code that opened one waits until you choose "
+                    "an item or dismiss it, then gets exactly what the real "
+                    "menu would have returned. GUI frames only (TTY menus "
+                    "read raw keys). Open the menu with asynchronous "
+                    "delivery (keys --events, send-events, mouse with events "
+                    "delivery): one opened during a macro-delivered key or "
+                    "an eval fails at once, since it could never be "
+                    "answered. `popups` lists a pending one too.")
+    sp.add_argument("action", nargs="?", default="show",
+                    choices=("show", "choose", "dismiss"))
+    sp.add_argument("item", nargs="?",
+                    help="for choose: the item's index, its full label "
+                         "('Edit > Copy'), or its last label component when "
+                         "unique")
+    sp.add_argument("--timeout", type=float, default=10.0,
+                    help="choose/dismiss: seconds to wait for a menu to "
+                         "open (default 10)")
+
+    sp = sub.add_parser(
+        "pixel",
+        help="read the color of one frame pixel (gui only)",
+        description="Capture the frame and report the color at X,Y in frame "
+                    "pixels (logical pixels from the frame's top-left), or "
+                    "with --window relative to a window's body, converted to "
+                    "sRGB (expect a few units of rounding). Needs "
+                    "elate[image].")
+    sp.add_argument("x", type=int)
+    sp.add_argument("y", type=int)
+    sp.add_argument("--window", nargs="?", const="", metavar="BUFFER",
+                    help="coordinates relative to the body of the window "
+                         "showing BUFFER (default: the selected window)")
 
     sp = sub.add_parser(
         "logs", aliases=["stderr"],
@@ -1360,6 +1444,9 @@ def cmd_start(args: argparse.Namespace) -> Result:
         rows=rows,
         ui=args.ui,
         headless=args.headless,
+        monitor=_monitor_arg(args.monitor),
+        position=args.position,
+        background=args.background,
         replace=args.replace,
         owner=args.owner,
         ttl=args.ttl,
@@ -1580,6 +1667,38 @@ def cmd_info(args: argparse.Namespace) -> Result:
         human += "\nprocesses:\n" + "\n".join(
             f"  {p['pid']:>7}  {p['command']}" for p in info["processes"])
     return info, human, 0
+
+
+def cmd_menu(args: argparse.Namespace) -> Result:
+    if args.action != "choose" and args.item is not None:
+        raise UsageError(f"menu {args.action} takes no item")
+    sess = _require_session(args)
+    data = S.native_menu(sess, args.action, args.item, timeout=args.timeout)
+    menu = data.get("menu")
+    if not menu:
+        return data, "no native menu or dialog is open", 0
+    lines = [f"{menu['kind']}: {menu.get('title') or '(untitled)'}"]
+    for it in menu.get("items") or []:
+        lines.append(f"  {it['index']}: {it['label']}"
+                     + ("" if it.get("enabled") else "  (disabled)"))
+    if args.action == "choose":
+        lines.insert(0, f"chose {menu.get('chosen')!r}")
+    elif args.action == "dismiss":
+        lines.insert(0, "dismissed")
+    return data, "\n".join(lines), 0
+
+
+def cmd_pixel(args: argparse.Namespace) -> Result:
+    from . import image
+
+    sess = _require_session(args)
+    if sess.ui != "gui":
+        raise ElateError("pixel needs a GUI session")
+    data = image.pixel(sess, args.x, args.y,
+                       buffer=args.window or None,
+                       window=args.window is not None)
+    sess.log("pixel", x=args.x, y=args.y, rgb=data["rgb"])
+    return data, f"{data['rgb']} at {args.x},{args.y}", 0
 
 
 def cmd_ps(args: argparse.Namespace) -> Result:
@@ -2492,18 +2611,29 @@ def cmd_screenshot(args: argparse.Namespace) -> Result:
         from . import screenshot as shot
         from datetime import datetime
 
+        from . import image
+
         if args.ansi:
             raise ElateError("--ansi applies to TTY text screenshots only")
         sess.require_alive()
         # Microseconds included so two shots within a second never overwrite.
         out = args.output or (
             f"elate-{sess.name}-{datetime.now():%Y%m%d-%H%M%S-%f}.png")
-        result = shot.capture_gui(sess, Path(out).expanduser().resolve())
+        result = image.gui_screenshot(
+            sess, Path(out).expanduser().resolve(),
+            region=image.parse_region(args.region) if args.region else None,
+            window=args.window is not None, buffer=args.window or None,
+            points=args.points)
         sess.log("screenshot", output=result["path"],
                  width=result["width"], height=result["height"])
         human = (f"screenshot written to {result['path']} "
-                 f"({result['width']}x{result['height']})")
+                 f"({result['width']}x{result['height']}"
+                 + (f", {result['units']}" if result.get("units") else "")
+                 + ")")
         return result, human, 0
+    if args.region or args.window is not None or args.points:
+        raise ElateError("--region/--window/--points apply to GUI "
+                         "screenshots only")
     if sess.raw().pane_info() is None:
         raise ElateError(
             f"session {sess.name!r} has no tmux pane left to capture "
@@ -3568,6 +3698,8 @@ _COMMANDS = {
     "prune": cmd_purge,  # alias
     "info": cmd_info,
     "ps": cmd_ps,
+    "pixel": cmd_pixel,
+    "menu": cmd_menu,
     "path": cmd_path,
     "logs": cmd_logs,
     "stderr": cmd_logs,  # alias

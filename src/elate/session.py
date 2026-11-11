@@ -68,6 +68,9 @@ class Session:
     creator_identity: str | None = None  # ps start-time+comm of that process
     ttl: float | None = None  # opt-in idle TTL (secs); expired sessions get reaped
     headless: bool = False  # gui sessions: running under our own Xvfb
+    monitor: str | int | None = None  # gui: --monitor the frame opened on
+    position: list[int] | None = None  # gui: --position within that monitor
+    background: bool = False  # gui (macOS): hand focus back after boot
     display: str | None = None  # gui sessions: X11 DISPLAY (Linux)
     xvfb_pid: int | None = None  # gui sessions: Xvfb we own (Linux headless)
     xvfb_identity: str | None = None  # ps start-time+comm of that Xvfb
@@ -589,6 +592,9 @@ def start_session(
     replace: bool = False,
     owner: str | None = None,
     ttl: float | None = None,
+    monitor: str | int | None = None,
+    position: tuple[int, int] | None = None,
+    background: bool | None = None,
 ) -> Session:
     if ttl is not None and ttl < 30:
         raise ElateError(
@@ -610,6 +616,19 @@ def start_session(
         raise ElateError(f"unknown ui {ui!r} (use 'tty' or 'gui')")
     if headless and ui != "gui":
         raise ElateError("--headless requires --ui gui")
+    if (monitor is not None or position is not None or background) \
+            and ui != "gui":
+        raise ElateError("--monitor/--position/--background require --ui gui")
+    if isinstance(monitor, str):
+        if not monitor.strip():
+            raise ElateError("--monitor needs a name or an index")
+        if monitor.strip().isdigit():
+            monitor = int(monitor)
+    if isinstance(monitor, int) and monitor < 0:
+        raise ElateError(f"--monitor index must be >= 0, got {monitor}")
+    if background is None:
+        background = ui == "gui" and os.environ.get(
+            "ELATE_GUI_BACKGROUND", "") not in ("", "0")
     session_dir = sessions_root() / name
 
     if (session_dir / "session.json").is_file():
@@ -657,6 +676,8 @@ def start_session(
             ui=ui,
             cols=cols,
             rows=rows,
+            monitor=monitor,
+            position=position,
         )
         if ui == "tty":
             # tmux options must be in place before the pane is created, so
@@ -694,6 +715,9 @@ def start_session(
         owner=owner,
         ttl=ttl,
         creator_pid=creator_pid(),
+        monitor=monitor,
+        position=list(position) if position is not None else None,
+        background=bool(background),
     )
     sess.creator_identity = gui.proc_identity(sess.creator_pid)
     sess.save()
@@ -775,6 +799,7 @@ def _boot_gui(sess: Session, emacs_args: list[str]) -> None:
             sess.xvfb_pid, sess.display = gui.start_xvfb(sess.dir, screen=screen)
             sess.xvfb_identity = gui.proc_identity(sess.xvfb_pid)
             sess.save()
+        front = _focus_owner() if sess.background else None
         proc = gui.spawn_emacs(
             sess.emacs, emacs_args,
             sandbox.environment(sess.dir, sess.env, name=sess.name),
@@ -806,6 +831,11 @@ def _boot_gui(sess: Session, emacs_args: list[str]) -> None:
 
         _wait_for_agent(sess, alive)
         info = sess.semantic().rpc("emacs-info", timeout=10.0)
+        if front is not None:
+            # --background: the new frame may take the focus (on macOS
+            # Emacs activates itself while it starts up); give it back.
+            _restore_focus(sess, front, {proc.pid,
+                                         int(info.get("pid") or 0)})
     except ElateError as exc:
         sess.status = "failed"
         sess.save()
@@ -828,6 +858,40 @@ def _boot_gui(sess: Session, emacs_args: list[str]) -> None:
     # the pid, so the spawn-time comm would mismatch forever after.
     sess.emacs_identity = gui.proc_identity(pid) or sess.emacs_identity
     sess.emacs_version = info.get("version")
+
+
+def _focus_owner() -> int | None:
+    """The frontmost app to hand focus back to, unless it is a session's
+    own Emacs (a parallel run's frame must not become the "previous" app)."""
+    pid = gui.frontmost_app_pid()
+    if pid is None:
+        return None
+    for entry in list_sessions(creators=False):
+        if entry.get("status") != "running" or entry.get("ui") != "gui":
+            continue
+        try:
+            if load_session(entry["name"]).emacs_pid == pid:
+                return None
+        except ElateError:
+            continue
+    return pid
+
+
+def _restore_focus(sess: Session, front: int, ours: set[int]) -> None:
+    """Re-activate FRONT whenever one of OURS takes the focus, for ~1.5s."""
+    deadline = time.monotonic() + 1.5
+    restored = False
+    settled = 0
+    while time.monotonic() < deadline and settled < 3:
+        now = gui.frontmost_app_pid()
+        if now in ours:
+            restored = gui.activate_app(front) or restored
+            settled = 0
+        else:
+            settled += 1
+        time.sleep(0.1)
+    sess.log("background", previous=front, restored=restored,
+             frontmost=gui.frontmost_app_pid())
 
 
 def _wait_for_agent(sess: Session, alive, timeout: float = STARTUP_TIMEOUT) -> None:
@@ -1322,6 +1386,8 @@ def session_info(name: str) -> dict[str, Any]:
         "init_error": sess.init_error(),
         **({"headless": True, "display": sess.display}
            if sess.ui == "gui" and sess.headless else {}),
+        **({"screen": _display_info(sess)}
+           if sess.ui == "gui" and alive and not busy else {}),
         **({"package_user_dir": str(sess.dir / "elpa"),
             "installed": sess.clean_install_info()}
            if sess.config == "clean-install" else {}),
@@ -1335,6 +1401,54 @@ def session_info(name: str) -> dict[str, Any]:
     info["processes"] = [p.as_dict()
                          for p in session_processes(sess, table=table)]
     return info
+
+
+def native_menu(sess: Session, action: str = "show",
+                item: str | int | None = None,
+                timeout: float = 10.0) -> dict[str, Any]:
+    """Show, choose from, or dismiss an intercepted native menu/dialog.
+
+    choose/dismiss first wait up to TIMEOUT for a menu to be pending: the
+    key or click that opens one is usually delivered asynchronously
+    (events), so it may not have run yet. ITEM is an index or a label.
+    """
+    if action not in ("show", "choose", "dismiss"):
+        raise UsageError(f"menu action must be show/choose/dismiss, got "
+                         f"{action!r}")
+    if action == "choose" and item is None:
+        raise UsageError("menu choose needs an item (index or label)")
+    sess.log("menu", action=action, item=item)
+    sem = sess.semantic()
+    if action == "show":
+        return sem.rpc("native-menu", "show", timeout=timeout)
+
+    def pending() -> dict[str, Any] | None:
+        data = sem.rpc("native-menu", "show", timeout=5.0)
+        return data if data.get("menu") else None
+
+    _wait_loop(sess, timeout, "a native menu or dialog", pending)
+    if isinstance(item, str) and item.strip().isdigit():
+        item = int(item)
+    args = [action] + ([item] if action == "choose" else [])
+    result = sem.rpc("native-menu", *args, timeout=timeout)
+
+    def closed() -> dict[str, Any] | None:
+        data = sem.rpc("native-menu", "show", timeout=5.0)
+        return None if data.get("menu") else data
+
+    # The answer is read by the menu's caller on its next poll; return only
+    # once it has resumed, so a following step sees the menu's effect.
+    _wait_loop(sess, timeout, "the answered menu to close", closed)
+    return result
+
+
+def _display_info(sess: Session) -> dict[str, Any] | None:
+    """The GUI frame's monitor and scale factor (best effort)."""
+    try:
+        data = sess.semantic().rpc("display-info", timeout=3.0)
+    except (EvalTimeout, TransportError, RpcError):
+        return None
+    return {k.replace("-", "_"): v for k, v in data.items()}
 
 
 def session_ps(name: str) -> dict[str, Any]:

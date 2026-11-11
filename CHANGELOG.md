@@ -82,6 +82,33 @@ matrix while building a browser-in-a-buffer package.
 - `run -` reads the scenario from stdin — with `-s NAME`, a one-call batch
   of steps against a live session.
 
+### GUI and visuals
+
+- **Native popup menus and dialogs on GUI frames are scriptable**:
+  `x-popup-menu`/`x-popup-dialog`, the stock mouse menus Emacs pops from
+  C (`context-menu-mode`, `C-down-mouse-3`), and mouse-invoked
+  `yes-or-no-p`/`message-box` dialogs are intercepted; `elate menu` (MCP
+  `elate_menu`, scenario `{"menu": "choose", "item": ...}`) shows,
+  chooses from, or dismisses them, and the caller gets what the real menu
+  would have returned. `popups` lists a pending one. A menu opened during
+  an elate request (macro-delivered keys, eval) fails at once instead of
+  blocking.
+- **Region and window screenshots**: `screenshot --region X,Y,W,H`,
+  `--window [BUFFER]`, `--points`; every GUI screenshot reports `scale`
+  and `units`. **`elate pixel X Y`** (MCP `elate_pixel`) reads a color,
+  converted from the display's color profile to sRGB.
+- Scenarios: `assert pixel` with a tolerance, crop options on
+  `screenshot` steps, and image snapshots with `region`/`window`,
+  `tolerance` and `max_diff`; a mismatch writes a `.diff.png`. PNG
+  goldens compare by pixels, not bytes. These need the new
+  `elate[image]` extra (Pillow).
+- **`start --monitor NAME|INDEX --position X,Y`** (MCP `monitor`,
+  `position`; scenario session keys) open a GUI frame on a chosen monitor
+  and spot; `--background` / `$ELATE_GUI_BACKGROUND` hands the focus back
+  after boot (macOS). `info` reports `screen`: monitor, scale factor,
+  position, all monitors.
+- Docs state what injected focus does and does not change.
+
 ## 0.16.0
 
 Mouse and display-geometry round, from agents regression-testing a

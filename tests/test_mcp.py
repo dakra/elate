@@ -42,6 +42,8 @@ EXPECTED_TOOLS = {
     "elate_list", "elate_info",
     "elate_path",
     "elate_ps",
+    "elate_pixel",
+    "elate_menu",
     "elate_keys", "elate_type", "elate_send_process", "elate_mouse",
     "elate_focus", "elate_send_events",
     "elate_eval", "elate_state", "elate_screenshot",

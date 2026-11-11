@@ -56,6 +56,8 @@ terminal (i.e. for programmatic use); `--json` / `--human` force either.
 - [`elate describe`](#elate-describe)
 - [`elate mcp`](#elate-mcp)
 - [`elate screenshot`](#elate-screenshot)
+- [`elate menu`](#elate-menu)
+- [`elate pixel`](#elate-pixel)
 - [`elate logs`](#elate-logs)
 - [`elate stderr`](#elate-stderr)
 - [`elate wait`](#elate-wait)
@@ -75,6 +77,9 @@ start a new sandboxed session
 - `--replace` -- if a session of this name is already running, stop and recreate it (dead/stopped sessions of that name are always replaced)
 - `--ui {tty,gui}` (default: tty) -- session UI: tty (tmux-hosted terminal Emacs, default) or gui (windowed Emacs; PNG screenshots)
 - `--headless` -- GUI only: run under a private Xvfb (Linux/CI)
+- `--monitor NAME|INDEX` -- GUI only: open the frame on this monitor -- an index into Emacs's monitor list (0 = first) or a name (exact, else a unique substring); `info` lists them under screen.monitors
+- `--position X,Y` -- GUI only: open the frame at X,Y pixels from the top-left of the monitor's work area (default 0,0 with --monitor) -- e.g. a corner out of your way; write a negative X as --position=-20,30
+- `--background` -- GUI only (macOS): hand the focus back to the app that had it once the frame is up, so a run does not interrupt your typing (default: on when $ELATE_GUI_BACKGROUND is set)
 - `--emacs PATH` -- emacs binary to use
 - `--config {minimal,bare,init-file,clean-install}` (default: minimal) -- sandbox config mode (default: minimal; clean-install installs the --load package(s) for real via package-install-file)
 - `--init-file PATH` -- user init file (implies --config init-file)
@@ -467,6 +472,29 @@ capture the screen: text for tty sessions, PNG for gui sessions
 
 - `-o, --output FILE` -- output file (tty default: stdout; gui default: ./elate-<session>-<time>.png)
 - `--ansi` -- tty only: include ANSI color escapes
+- `--region X,Y,W,H` -- gui only: crop to this rectangle in frame pixels (logical pixels from the frame's top-left, the space window-pixel-edges uses); needs elate[image]
+- `--window BUFFER` -- gui only: crop to the body of the window showing BUFFER (default: the selected window); needs elate[image]
+- `--points` -- gui only: scale the PNG to points (logical pixels) instead of device pixels -- on a Retina display the capture is 2x; needs elate[image]
+
+## elate menu
+
+show, choose from, or dismiss a native popup menu or dialog
+
+Native menus (x-popup-menu: context menus, popup-menu, mouse-buffer-menu) and dialogs (x-popup-dialog) run their own event loop that nothing outside Emacs can drive, so the session intercepts them: the code that opened one waits until you choose an item or dismiss it, then gets exactly what the real menu would have returned. GUI frames only (TTY menus read raw keys). Open the menu with asynchronous delivery (keys --events, send-events, mouse with events delivery): one opened during a macro-delivered key or an eval fails at once, since it could never be answered. `popups` lists a pending one too.
+
+- `[{show,choose,dismiss}]` (default: show)
+- `[item]` -- for choose: the item's index, its full label ('Edit > Copy'), or its last label component when unique
+- `--timeout TIMEOUT` (default: 10) -- choose/dismiss: seconds to wait for a menu to open (default 10)
+
+## elate pixel
+
+read the color of one frame pixel (gui only)
+
+Capture the frame and report the color at X,Y in frame pixels (logical pixels from the frame's top-left), or with --window relative to a window's body, converted to sRGB (expect a few units of rounding). Needs elate[image].
+
+- `x`
+- `y`
+- `--window BUFFER` -- coordinates relative to the body of the window showing BUFFER (default: the selected window)
 
 ## elate logs
 

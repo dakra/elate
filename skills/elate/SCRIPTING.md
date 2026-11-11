@@ -154,6 +154,9 @@ from any cwd.
 | `env` | object (string→string) | — | extra process env vars (e.g. `{"SHELL": "/bin/zsh"}`); cannot override `HOME`/`XDG_*` |
 | `emacs` | string path | — | binary override (also: `run --emacs`, `matrix`) |
 | `headless` | bool | false | GUI under a private Xvfb (Linux) |
+| `monitor` | string name \| int index | — | GUI: open the frame on this monitor (see `elate info` → `screen.monitors`) |
+| `position` | `[x, y]` ints | — | GUI: frame position within the monitor's work area |
+| `background` | bool | `$ELATE_GUI_BACKGROUND` | GUI (macOS): hand the focus back after the frame is up |
 | `allow_init_error` | bool | false | see init_error contract below |
 
 **init_error contract**: a fresh session whose startup `load`/`eval`
@@ -236,9 +239,10 @@ Timeouts are numbers in `(0, 600]` seconds.
 | `focus` | `"in"` \| `"out"` | `frame` (string); `set_focus_state` (bool); `timeout` (15) |
 | `send_events` | non-empty list of event tokens | `buffer`; `frame` (string); `set_focus_state` (bool); `timeout` (15). Tokens: `focus-in`/`focus-out`, `down-mouse-N`/`mouse-N`/`up-mouse-N`/`drag-mouse-N`/`double-mouse-N`/`wheel-up`/`wheel-down`/`mouse-movement` (N=1–3, optional `@LINE,COL` [1-based line, 0-based col] or `#POS`; a `drag-mouse-N` starts at the batch's latest `down-mouse` location), `key:KBD`. Focus tokens are auto-split into separate drained batches (a focus event only fires at the head of a command-loop turn). |
 | `dnd` | URI string, or non-empty list of URIs | `buffer`; `pos`/`line` (int >= 1); `col` (int >= 0); `x`/`y` (root-absolute pixels, pair only); `action`: `"copy"`(default)/`"move"`; `hover` (bool: Enter+Position only, no drop); `hover_ms` (int 0–10000, 500); `allow_rejected` (bool); `timeout` (15). Real XDND from an external X client — X11 GUI sessions only, needs the `elate[dnd]` extra. |
+| `menu` | `"choose"` \| `"dismiss"` | `item` (choose: index, full label `"Edit > Copy"`, or a unique last label component); `timeout` (10: how long to wait for a native menu/dialog to open). Answers an intercepted native menu or dialog on a GUI frame; open it with asynchronous delivery (`keys` `"delivery": "events"`, `send_events`) — one opened during a macro-delivered key fails at once. |
 | `test` | ERT selector string (`"t"` = all) | `load_files` (list of paths); `timeout` (60); `allow_unexpected` (bool) |
 | `lint` | non-empty list of file paths | `timeout` (60); `allow_findings` (bool) |
-| `screenshot` | output path, or `null` to embed text | `ansi` (bool, TTY only) |
+| `screenshot` | output path, or `null` to embed text | `ansi` (bool, TTY only); GUI only, need `elate[image]`: `region` (`"X,Y,W,H"` frame pixels), `window` (`true` = the selected window's body, or a buffer name), `points` (bool: scale to points instead of device pixels) |
 | `resize` | `"COLSxROWS"` (min `10x4`) | — |
 | `assert` | assertion object (below) | — |
 
@@ -266,6 +270,7 @@ Failure semantics:
 | `lint_clean` | `true`/`false`, checked against the **last `lint` step** | — |
 | `eval` | elisp form; passes when it evaluates without error to non-`nil` (the catch-all) | `timeout` (10); `buffer` (name; default: the selected window's buffer) |
 | `snapshot` | a name string, or `{"name", "of"}` — compare the current render against a committed golden (see below) | — |
+| `pixel` | `{"x", "y", "color": "#rrggbb"}` plus `tolerance` (max per-channel difference, 0–255, default 0) and `window` (`true` or a buffer: x/y relative to that window's body) — GUI only, needs `elate[image]`; captures are converted to sRGB, so a tolerance of ~4 absorbs rounding | — |
 
 `tests`/`lint_clean` need a preceding `test`/`lint` step in the same run.
 
@@ -313,6 +318,16 @@ across Emacs versions with `matrix`.
 - GUI `of: screen` PNG goldens are brittle (fonts/AA/HiDPI/Xvfb) — prefer
   `faces`/`state` for GUI sessions.
 
+
+GUI image snapshots take crop and tolerance options:
+`{"assert": {"snapshot": {"name": "hints", "window": true, "tolerance": 8,
+"max_diff": 0.002}}}` — `region` (`"X,Y,W,H"`) or `window` (`true` or a
+buffer) crops; `tolerance` is the per-channel difference a pixel may have;
+`max_diff` is how many pixels may differ (a count, or a fraction when
+< 1). PNG goldens compare by pixels (with `elate[image]`), so a
+re-encoded but identical image matches; a mismatch writes
+`<name>@<ver>.actual.png` and `<name>@<ver>.diff.png` (differing pixels in
+red) next to the golden.
 ## Running
 
 ```sh
