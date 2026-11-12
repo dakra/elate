@@ -114,6 +114,18 @@ matrix while building a browser-in-a-buffer package.
   position, all monitors.
 - Docs state what injected focus does and does not change.
 
+### Agent Skill
+
+- **SKILL.md is the core plus a map**: the loop, the traps that bite
+  first, and a "Find the right tool" table from situations to features and
+  the topic file that covers each. Details live in new topic files
+  `INPUT.md` (key delivery, mouse, `send-process`, focus, recovery),
+  `INSPECT.md` (waits, eval, JSON output, rendering checks, `trace`,
+  tests), `GUI.md` (capture, placement, region/pixel checks, native menus,
+  drag-and-drop), and `SESSIONS.md` (startup, sandboxes, several agents),
+  next to `SCRIPTING.md`, `RECIPES.md`, and `REFERENCE.md`. AGENTS.md and
+  the `emacs-tester` agent point at the same files.
+
 ## 0.16.0
 
 Mouse and display-geometry round, from agents regression-testing a

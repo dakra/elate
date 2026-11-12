@@ -19,12 +19,17 @@ sandboxed Emacs sessions with the `elate` CLI — run as `uvx elate …`
 (PyPI; no install step) or `uv run elate …` inside a checkout of the
 elate repo itself.
 
-The full elate skill is preloaded into your context; follow it. Deeper
+The full elate skill is preloaded into your context; follow it, and check
+its "Find the right tool" table before improvising a workaround. Deeper
 material, read on demand:
 
-- ${CLAUDE_PLUGIN_ROOT}/skills/elate/REFERENCE.md — every command, option, default
+- ${CLAUDE_PLUGIN_ROOT}/skills/elate/INPUT.md — key delivery modes, mouse, `send-process`, focus, wedged Emacs / debugger
+- ${CLAUDE_PLUGIN_ROOT}/skills/elate/INSPECT.md — waits, eval details, JSON output, rendering checks, `trace`, ERT/lint/profile
+- ${CLAUDE_PLUGIN_ROOT}/skills/elate/GUI.md — GUI capture, placement, region/pixel checks, native menus, pointer, drag-and-drop
+- ${CLAUDE_PLUGIN_ROOT}/skills/elate/SESSIONS.md — startup options, fixtures, sandboxes, several agents on one machine
+- ${CLAUDE_PLUGIN_ROOT}/skills/elate/SCRIPTING.md — scenario files (JSON or `.eld`), assertions, templates, `run`/`matrix`, CI
 - ${CLAUDE_PLUGIN_ROOT}/skills/elate/RECIPES.md — worked examples (transient, font-lock, dired, clean-install)
-- ${CLAUDE_PLUGIN_ROOT}/skills/elate/SCRIPTING.md — scenario JSON, assertions, `run`/`matrix`, CI
+- ${CLAUDE_PLUGIN_ROOT}/skills/elate/REFERENCE.md — every command, option, default
 
 Non-negotiable working rules (the mistakes that cost the most):
 
@@ -34,9 +39,9 @@ Non-negotiable working rules (the mistakes that cost the most):
   happened without observing it. When confused, run `state` first.
 - Key delivery: semantic `keys 'M-x foo RET'` by default; a sequence
   that opens a minibuffer prompt and leaves it open needs `--events`;
-  unwedging a stuck Emacs needs `keys C-g --raw` (TTY only).
-- Eval forms do not run in the selected window's buffer — wrap
-  buffer-mutating forms in `(with-current-buffer …)`.
+  unwedging a stuck Emacs needs `interrupt`.
+- Eval forms run in the selected window's buffer; target another with
+  `--buffer NAME` or `(with-current-buffer …)`.
 - Verify rendering structurally (`buffer --props`, `faces-at`,
   `popups`), not by eyeballing screenshots.
 - `test`/`lint`/`profile`/`bench` verdicts depend on session history:
@@ -51,7 +56,8 @@ Non-negotiable working rules (the mistakes that cost the most):
   you verified and let the caller apply it.
 
 Cleanup duty (always, even after failures): `elate stop NAME` for every
-session you started; check with `elate list`. Stopped sandboxes are
+session you started; check with `elate list`. Never stop a session whose
+`creator_state` is `other` — it belongs to another live agent. Stopped sandboxes are
 inert; `elate purge NAME…` (or `--all`) deletes them when transcripts
 are no longer needed.
 

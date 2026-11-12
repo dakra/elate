@@ -7,6 +7,11 @@ scenario scripts under `examples/` in the elate repo —
 build something similar, prefer ending with a scenario script (see
 SCRIPTING.md) so the verification is replayable.
 
+Contents: transient menu · font-lock / theme faces · drive a package
+(the canonical loop) · clean-install · "the keybinding doesn't work" ·
+record a demo · subprocess / shell / REPL · focus-vs-click ordering ·
+crash or hang · one scenario across shells / configs / Emacs versions
+
 All commands assume a session started with `uvx elate start --name demo …`
 and use `uvx elate` (swap for `uv run elate` inside an elate checkout).
 

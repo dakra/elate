@@ -1049,8 +1049,10 @@ with it).
 `skills/elate/` is an Agent Skill that teaches an AI harness to drive the
 elate CLI well (the act → wait → observe loop, key-delivery decision tree,
 fresh-session rules, scenario scripts) at near-zero ambient token cost:
-`SKILL.md` plus progressively-disclosed `REFERENCE.md` (generated from the
-CLI — CI fails on drift), `RECIPES.md`, and `SCRIPTING.md`. The same SKILL.md
+`SKILL.md` (the loop, the first traps, and a situation → tool map) plus
+progressively-disclosed topic files — `INPUT.md`, `INSPECT.md`, `GUI.md`,
+`SESSIONS.md`, `SCRIPTING.md`, `RECIPES.md`, and `REFERENCE.md` (generated
+from the CLI — CI fails on drift). The same SKILL.md
 format is read by Claude Code, Codex CLI, opencode, pi, and Antigravity.
 
 `elate install` puts it in place for you — it ships inside the package, so a

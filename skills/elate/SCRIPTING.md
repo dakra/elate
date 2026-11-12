@@ -1,5 +1,41 @@
 # elate scenario scripts
 
+Contents: from a session to a regression test · format and failure
+handling · `.eld` s-expression scenarios ·
+templates, `use`, `include` · project config `.elate.json` · `requires`
+→ SKIP · the `session` block · `params`/`{{var}}` templating and
+variants · steps · assertions · golden snapshots · running (retries,
+timeout scale, stdin) · version matrix · transcript export · CI
+
+## From a session to a regression test
+
+Everything you did in a session is in its transcript. Turn it into a
+replayable script:
+
+```sh
+uvx elate -s s export-script --clean -o scenario.json  # --clean strips transient temp paths
+# edit: observations were exported as skipped assertion stubs — fill them in
+uvx elate run scenario.json                     # fresh session, steps, exit 0/1
+uvx elate run scenario.json --keep-going --format junit   # every check + a CI report
+uvx elate matrix scenario.json --emacs emacs30,emacs31 --param shell=/bin/bash,/bin/zsh
+```
+`elate run` boots a fresh session per run and exits 0/1 — the CI entry
+point; by default it stops at the first failure (embedding a state
+snapshot) and purges its sandbox on success (failed runs are kept —
+`purge --glob 'run-*'` sweeps them). For a regression matrix that reports
+what does **not** work: `--keep-going` runs every step; a step marked
+`"expect": "fail"` reports `xfail` (a known break that never gates, and
+flips to a run-failing `xpass` if it starts passing); a `{"group": "dw"}`
+marker names verdicts (`dw: PASS · u: XFAIL`); `--format junit`/`tap`
+emits CI-ready output; and `{{var}}` + `--set` / `matrix --param` drive
+one scenario across many shells/configs. When several variables must move
+together (a shell + its aliases + its setup snippet), declare a
+`"variants"` block of named binding sets: `matrix` runs every variant by
+default, `run --variant NAME` picks one. `--keep`/`--keep-on-failure`
+keep the session for inspection.
+
+## The format
+
 A scenario script is a **JSON** file (deliberately not YAML: zero extra
 dependency, every other elate surface already speaks JSON), or the same
 structure as an s-expression `.eld` file (below), describing a
@@ -368,7 +404,6 @@ across Emacs versions with `matrix`.
 - GUI `of: screen` PNG goldens are brittle (fonts/AA/HiDPI/Xvfb) — prefer
   `faces`/`state` for GUI sessions.
 
-
 GUI image snapshots take crop and tolerance options:
 `{"assert": {"snapshot": {"name": "hints", "window": true, "tolerance": 8,
 "max_diff": 0.002}}}` — `region` (`"X,Y,W,H"`) or `window` (`true` or a
@@ -378,6 +413,7 @@ buffer) crops; `tolerance` is the per-channel difference a pixel may have;
 re-encoded but identical image matches; a mismatch writes
 `<name>@<ver>.actual.png` and `<name>@<ver>.diff.png` (differing pixels in
 red) next to the golden.
+
 ## Running
 
 ```sh

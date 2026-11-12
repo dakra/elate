@@ -135,7 +135,14 @@ def test_skill_body_under_500_lines():
 def test_skill_supporting_files_exist():
     _, body = _frontmatter()
     referenced = set(re.findall(r"\b([A-Z][A-Z_-]+\.md)\b", body))
-    assert {"REFERENCE.md", "RECIPES.md", "SCRIPTING.md"} <= referenced
+    # Every topic file is linked from SKILL.md (one level deep): a file
+    # nothing points at is never read.
+    topic_files = {p.name for p in SKILL_DIR.glob("*.md")} - {"SKILL.md"}
+    assert topic_files <= referenced, (
+        f"SKILL.md does not reference {sorted(topic_files - referenced)}")
+    linked = set(re.findall(r"\]\(([A-Z][A-Z_-]+\.md)\)", body))
+    assert topic_files <= linked, (
+        f"SKILL.md does not link {sorted(topic_files - linked)}")
     for name in referenced:
         if name == "SKILL.md":
             continue
