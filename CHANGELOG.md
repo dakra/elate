@@ -1,9 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.17.0
 
-From an agent that drove elate through a 55-run scenario × variant GUI
-matrix while building a browser-in-a-buffer package.
+Feedback round from an agent that drove elate through a 55-run scenario
+× variant GUI matrix while building a browser-in-a-buffer package:
+daemons that outlived a stopped session, a failing init that still
+reported success, another agent's live sessions shown as leftovers,
+elisp escaped inside JSON strings, the same setup copied into every
+scenario, a shell loop instead of a matrix, context menus that blocked
+the session, colors that could only be eyeballed, and 55 windows opening
+on the user's desktop. Each round was reviewed by a separate agent, and
+the skill was reorganized around a situation → feature map so the new
+features are found.
 
 ### Safety and teardown
 
@@ -113,6 +121,9 @@ matrix while building a browser-in-a-buffer package.
   after boot (macOS). `info` reports `screen`: monitor, scale factor,
   position, all monitors.
 - Docs state what injected focus does and does not change.
+- **`pointer warp` to a target on no display** (a frame a tiling window
+  manager parked off-screen) fails at once with an error naming the
+  off-screen frame, instead of a warp the window system clamps.
 
 ### Agent Skill
 
