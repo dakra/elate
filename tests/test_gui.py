@@ -1071,15 +1071,33 @@ def test_window_info_gui(gui_sess: S.Session) -> None:
     assert ol <= wl and wr <= orr and ot <= wt and wb <= ob
 
 
+def _on_one_monitor(edges: list[int], monitors: list[dict[str, Any]]) -> bool:
+    """EDGES (left top right bottom) lie wholly inside one monitor."""
+    left, top, right, bottom = edges
+    for monitor in monitors:
+        mx, my, mw, mh = monitor["geometry"]
+        if mx <= left and my <= top and right <= mx + mw and bottom <= my + mh:
+            return True
+    return False
+
+
 def test_pointer_warp_query_roundtrip(gui_sess: S.Session) -> None:
     sem = gui_sess.semantic()
     frame = S.window_info(gui_sess)["frames"][0]
     if sys.platform == "darwin" and min(frame["outer-edges"][:2]) < 0:
         # macOS declines warps to displays at negative global coordinates
-        # (the agent now signals instead of no-opping); where the frame
-        # opens depends on the desktop's monitor arrangement.
+        # (the agent signals instead of no-opping); where the frame opens
+        # depends on the desktop's monitor arrangement.
         pytest.skip("frame sits on a display at negative global "
                     "coordinates; macOS cannot warp the pointer there")
+    if not _on_one_monitor(frame["outer-edges"],
+                           sem.rpc("display-info")["monitors"]):
+        # A tiling window manager (AeroSpace) parks frames of hidden
+        # workspaces in a screen corner, mostly off every display; the
+        # pointer cannot be warped there.
+        pytest.skip(f"frame {frame['outer-edges']} lies off every display "
+                    "(a window manager parked it); the pointer cannot "
+                    "reach it")
     before = S.pointer_action(gui_sess, "query")
     time.sleep(0.4)
     now = S.pointer_action(gui_sess, "query")
@@ -1128,6 +1146,11 @@ def test_pointer_warp_invisible_position_errors(gui_sess: S.Session) -> None:
     try:
         with pytest.raises(RpcError, match="not visible"):
             S.pointer_action(gui_sess, "warp", buffer="*scratch*", line=200)
+        # A target on no monitor fails before any warp, saying so.
+        right = max(m["geometry"][0] + m["geometry"][2]
+                    for m in sem.rpc("display-info")["monitors"])
+        with pytest.raises(RpcError, match="lies on no display"):
+            S.pointer_action(gui_sess, "warp", x=right + 500, y=10)
     finally:
         reset_scratch(gui_sess)
 

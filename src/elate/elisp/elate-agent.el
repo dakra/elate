@@ -1607,15 +1607,25 @@ order: a foreign window covering the frame is invisible here."
                               (format "%s" (posn-area posn))
                             :null))))))
 
+(defun elate--point-on-display-p (x y)
+  "Non-nil when root-absolute pixel X,Y lies on one of the monitors."
+  (seq-some (lambda (monitor)
+              (pcase (alist-get 'geometry monitor)
+                (`(,mx ,my ,mw ,mh)
+                 (and (<= mx x) (< x (+ mx mw)) (<= my y) (< y (+ my mh))))))
+            (display-monitor-attributes-list)))
+
 (defun elate--pointer-warp (payload)
   "Warp the system pointer per PAYLOAD (an alist), then report back.
 PAYLOAD carries either root-absolute x + y, or a buffer location
 \(buffer, and pos or line + col; buffer defaults to the selected
 window's).  Buffer targets land in the middle of the glyph cell so the
 point is unambiguously inside it.  The reply is a fresh
-`elate--pointer-query'; a warp the window system ignored (macOS
-declines targets on displays at negative global coordinates) signals
-instead of reporting the stale position as success."
+`elate--pointer-query'.  A target on no monitor (e.g. a frame a window
+manager parked off-screen) signals before warping, and a warp the window
+system ignored (macOS declines targets on displays at negative global
+coordinates) signals instead of reporting the stale position as
+success."
   (let* ((x (alist-get 'x payload))
          (y (alist-get 'y payload))
          (target
@@ -1639,6 +1649,12 @@ instead of reporting the stale position as success."
                                   pos win))))
               (cons (+ (car pp) (/ (frame-char-width frame) 2))
                     (+ (cdr pp) (/ (frame-char-height frame) 2)))))))
+    (unless (elate--point-on-display-p (car target) (cdr target))
+      (error (concat "elate: the pointer target (%d, %d) lies on no display "
+                     "-- the frame is off-screen (a window manager may have "
+                     "moved it; `elate window-info' shows its edges and "
+                     "`elate info' the monitors)")
+             (car target) (cdr target)))
     ;; Warp, then confirm it took. Retried a few times: a human moving
     ;; the physical mouse overrides a warp instantly, so a transient
     ;; mismatch gets another chance before it is declared a refusal.
